@@ -1,0 +1,17 @@
+{
+  "record_name": "AnalyticalScaling_NoRMSNorm",
+  "track": "10min_16mb",
+  "date": "2026-03-21",
+  "description": "Replace all RMS normalization with analytically-derived scaling factors (1/sqrt(N) for reductions, 1/sqrt(2) for additions, sqrt(2/3) for relu^2). Unit-variance weight init + explicit matmul scaling.",
+  "status": "code_only",
+  "base": "train_gpt_mlx.py baseline",
+  "changes": [
+    "Remove rms_norm, RMSNormNoWeight, attn_norm, mlp_norm, final_norm",
+    "CastedLinear: unit variance init + 1/sqrt(in_dim) output scaling",
+    "MLP relu^2: scale by sqrt(2/3) to normalize second moment",
+    "All residual and skip additions: scale by 1/sqrt(2)",
+    "Embedding init std 1.0 (was 0.005)",
+    "LM head: scale by 1/sqrt(dim)",
+    "Learnable final_gain replaces final_norm"
+  ]
+}

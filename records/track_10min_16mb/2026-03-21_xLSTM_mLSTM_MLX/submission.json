@@ -1,0 +1,8 @@
+{
+  "author": "Mirco",
+  "name": "xLSTM mLSTM (pure MLX)",
+  "blurb": "xLSTM experiment: replaces transformer self-attention with mLSTM (matrix LSTM, Beck et al. 2024) implemented in pure MLX. 6 mLSTM blocks at dim=512, 4 heads, SiLU-gated FFN. Uses parallel form (materialized S×S gating matrix) for training. Not yet trained — code-only snapshot for experimentation.",
+  "date": "2026-03-21T00:00:00Z",
+  "val_loss": null,
+  "val_bpb": null,
+}

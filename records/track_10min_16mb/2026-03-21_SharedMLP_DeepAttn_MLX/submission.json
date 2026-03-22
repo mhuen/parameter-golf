@@ -1,0 +1,8 @@
+{
+  "author": "Mirco",
+  "name": "Shared-MLP Deep Attention (MLX)",
+  "blurb": "ALBERT-style shared MLP across all 16 transformer layers — each layer has unique attention but shares a single 3x-expanded MLP. Saves ~9M params vs per-layer MLPs, enabling 16 layers (vs 9 baseline) within similar budget. 14.7M params, ~9.8 MB compressed.",
+  "date": "2026-03-21T00:00:00Z",
+  "val_loss": null,
+  "val_bpb": null
+}

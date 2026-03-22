@@ -1,0 +1,111 @@
+{
+  "model": "Opus[1m]",
+  "permissions": {
+    "defaultMode": "default",
+    "allow": [
+      "Read(**/*)",
+      "Bash(npm run:*)",
+      "Bash(uv:*)",
+      "Bash(python -m:*)",
+      "Bash(pytest:*)",
+      "Bash(ruff:*)",
+      "Bash(pyright:*)",
+      "Bash(eslint:*)",
+      "Bash(prettier:*)",
+      "Bash(tsc:*)",
+      "Bash(git commit:*)",
+      "Bash(git pull:*)",
+      "Bash(git push:*)",
+      "Bash(kubectl get:*)",
+      "Bash(kubectl describe:*)",
+      "Bash(python3 .claude/skills/**/*)",
+      "Bash(bash .claude/skills/**/*)",
+      "Bash(sh .claude/skills/**/*)"
+    ],
+    "deny": [
+      "Read(./.env*)",
+      "Read(**/secrets/**/*)",
+      "Read(**/*secret*)",
+      "Read(**/*.key)",
+      "Read(**/*key.json)",
+      "Read(**/*key.pem)",
+      "Read(**/*key.env)",
+      "Read(**/node_modules/**/*)",
+      "Read(**/__pycache__/**/*)",
+      "Read(**/.venv/**/*)",
+      "Write(./.env*)",
+      "Write(**/secrets/**/*)",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Bash(git reset --hard)",
+      "Bash(kubectl apply)",
+      "Bash(helm install)",
+      "Bash(helm uninstall)"
+    ],
+    "ask": ["Bash(git push:*)"]
+  },
+  "env": {
+    "PYTHONPATH": ".",
+    "NODE_ENV": "development",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "Opus"
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write(**.py)|Edit(**.py)|MultiEdit(**.py)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "ruff format \"$file\""
+          },
+          {
+            "type": "command",
+            "command": "ruff check --fix \"$file\""
+          }
+        ]
+      },
+      {
+        "matcher": "Write(**.ts)|Edit(**.ts)|MultiEdit(**.ts)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx prettier --write \"$file\""
+          },
+          {
+            "type": "command",
+            "command": "npx eslint --fix \"$file\""
+          }
+        ]
+      },
+      {
+        "matcher": "Write(**.tsx)|Edit(**.tsx)|MultiEdit(**.tsx)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx prettier --write \"$file\""
+          },
+          {
+            "type": "command",
+            "command": "npx eslint --fix \"$file\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash(git commit*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pre-commit run --all-files"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "pyright-lsp@claude-plugins-official": true
+  }
+}

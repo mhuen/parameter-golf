@@ -1,0 +1,8 @@
+{
+  "author": "Mirco",
+  "name": "Universal Transformer (MLX)",
+  "blurb": "Full weight sharing: a single transformer block (attention + SwiGLU MLP) applied 24 times with per-layer scalars. dim=1024, 16 heads, 8 KV heads, SwiGLU 3x. ~13.7M params, ~9.2 MB compressed.",
+  "date": "2026-03-21T00:00:00Z",
+  "val_loss": null,
+  "val_bpb": null
+}

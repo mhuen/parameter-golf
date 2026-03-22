@@ -47,6 +47,7 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
@@ -204,12 +205,14 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    if max_tokens > 0:
+        tokens = tokens[: max_tokens + 1]
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
@@ -811,7 +814,7 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )

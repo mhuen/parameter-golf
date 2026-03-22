@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+xLSTM training script for the parameter-golf challenge, using pure MLX.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Implements the mLSTM (matrix LSTM) architecture from the xLSTM paper
+(Beck et al., 2024) in pure MLX — no CUDA/Triton kernels needed.
+Architecture follows the xLSTMLarge pattern: embedding → mLSTM blocks
+(pre-norm mLSTM + pre-norm SiLU-gated FFN with residual connections) →
+final norm → tied LM head.
+
+The mLSTM replaces self-attention with a gated linear recurrence that uses
+query/key/value projections plus scalar input/forget gates per head. During
+training we use the parallel form (materializing an S×S gating matrix),
+which is efficient for the sequence lengths used here (≤1024).
+
+Training infrastructure (data loading, tokenizer, quantization, optimizer)
+is adapted from train_gpt_mlx.py.
 """
 from __future__ import annotations
 
@@ -35,11 +47,11 @@ COMPUTE_DTYPE = mx.bfloat16
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# Default xLSTM baseline:
+# - 6 mLSTM blocks at width 512
+# - 4 heads, qk_dim_factor=0.5, v_dim_factor=1.0
+# - SiLU-gated FFN with 2x expansion
 # - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 class Hyperparameters:
     # Data / tokenizer.
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -47,42 +59,36 @@ class Hyperparameters:
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. These defaults now mirror train_gpt.py on a single process.
+    # Training loop.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
     train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
-    # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
-    # memory pressure without changing the effective optimizer batch.
     mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    # Force MLX to materialize the graph after every sub-batch, preventing lazy
-    # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
-    # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model (defaults match the current baseline setup).
+    # Model — xLSTM architecture.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 6))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 4))
+    qk_dim_factor: float = float(os.environ.get("QK_DIM_FACTOR", 0.5))
+    v_dim_factor: float = float(os.environ.get("V_DIM_FACTOR", 1.0))
+    ffn_mult: float = float(os.environ.get("FFN_MULT", 2.0))
+    gate_soft_cap: float = float(os.environ.get("GATE_SOFT_CAP", 15.0))
+    logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
-    logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
-    qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Optimizer. We keep the same per-group defaults as train_gpt.py.
+    # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -125,7 +131,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "norm,igate_preact.bias,fgate_preact.bias",
     ).split(",")
     if pattern
 )
@@ -175,12 +181,11 @@ def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
-    # Background on Muon: https://kellerjordan.github.io/posts/muon/
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.astype(mx.float32)
-    x = x / (mx.sqrt(mx.sum(x * x)) + eps)
+    norm = mx.sqrt(mx.sum(x * x))
+    # Guard: if gradient is all-zero / near-zero, return zeros to avoid 0/0
+    x = mx.where(norm > eps, x / (norm + eps), mx.zeros_like(x))
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
@@ -212,14 +217,8 @@ def load_data_shard(path: Path) -> np.ndarray:
 # TOKEN STREAMING / BATCHING
 # ==============================================================================
 
-
 class TokenStream:
-    def __init__(
-        self,
-        pattern: str,
-        log_fn: Callable[[str], None] | None = None,
-        dataset_name: str = "",
-    ):
+    def __init__(self, pattern: str, log_fn: Callable[[str], None] | None = None, dataset_name: str = ""):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
@@ -235,10 +234,7 @@ class TokenStream:
         if self.file_idx == 0:
             self.epoch += 1
             if self.log_fn is not None:
-                self.log_fn(
-                    f"WARNING: starting epoch:{self.epoch} "
-                    f"dataset:{self.dataset_name} train_shards:{len(self.files)}"
-                )
+                self.log_fn(f"WARNING: starting epoch:{self.epoch} dataset:{self.dataset_name} train_shards:{len(self.files)}")
         self.tokens = load_data_shard(self.files[self.file_idx])
         self.pos = 0
 
@@ -256,12 +252,7 @@ class TokenStream:
 
 
 class TokenLoader:
-    def __init__(
-        self,
-        pattern: str,
-        log_fn: Callable[[str], None] | None = None,
-        dataset_name: str = "",
-    ):
+    def __init__(self, pattern: str, log_fn: Callable[[str], None] | None = None, dataset_name: str = ""):
         self.stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
 
     def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
@@ -275,139 +266,225 @@ class TokenLoader:
 
 
 # ==============================================================================
-# MODEL BLOCKS
+# xLSTM MODEL BLOCKS (mLSTM — pure MLX)
 # ==============================================================================
+# The mLSTM (matrix LSTM) from Beck et al. 2024 replaces scalar memory with a
+# matrix memory C that stores key-value outer products, gated by scalar input
+# and forget gates per head.
+#
+# Recurrence (per head):
+#   C_t = f_t * C_{t-1} + i_t * (v_t ⊗ k_t)
+#   n_t = f_t * n_{t-1} + i_t * k_t
+#   h_t = C_t @ q_t / max(|n_t^T @ q_t|, 1)
+#
+# Parallel form for training (materializes S×S gating matrix):
+#   log_D[t,s] = cumsum(log_f)[t] - cumsum(log_f)[s] + log_i[s]   (s ≤ t)
+#   D = exp(log_D) * causal_mask
+#   attn = D * (q @ k^T / sqrt(d_qk))
+#   h = attn @ v / max(|rowsum(attn)|, 1)
+
+def soft_cap(x: mx.array, cap: float) -> mx.array:
+    return cap * mx.tanh(x / cap)
+
+
+def log_sigmoid(x: mx.array) -> mx.array:
+    # Numerically stable log(sigmoid(x)) = -softplus(-x)
+    # Use piecewise formula to avoid overflow in exp()
+    return mx.where(
+        x >= 0,
+        -mx.log(1.0 + mx.exp(-x)),
+        x - mx.log(1.0 + mx.exp(x)),
+    )
+
 
 class CastedLinear(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = False):
         super().__init__()
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
+        if bias:
+            self.bias = mx.zeros((out_dim,), dtype=mx.float32)
+        else:
+            self.bias = None
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+        y = x @ self.weight.astype(x.dtype).T
+        if self.bias is not None:
+            y = y + self.bias.astype(y.dtype)
+        return y
 
 
-class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
-    def __call__(self, x: mx.array) -> mx.array:
-        return rms_norm(x)
-
-
-class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+class RMSNormWeighted(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.weight = mx.ones((dim,), dtype=mx.float32)
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        normed = rms_norm(x, self.eps)
+        return normed * self.weight.astype(normed.dtype)
+
+
+class MultiHeadNorm(nn.Module):
+    """RMS normalization applied per head, with learnable weight."""
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6):
+        super().__init__()
         self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim)
-        self.c_k = CastedLinear(dim, kv_dim)
-        self.c_v = CastedLinear(dim, kv_dim)
-        self.proj = CastedLinear(dim, dim)
-        self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
-        self.scale = self.head_dim ** -0.5
+        self.head_dim = head_dim
+        self.weight = mx.ones((num_heads * head_dim,), dtype=mx.float32)
+        self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
-        q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
-        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
-        y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        # x: [B, NH, S, DH]
+        B, NH, S, DH = x.shape
+        x_fp = x.astype(mx.float32)
+        x_normed = x_fp * mx.rsqrt(mx.mean(x_fp * x_fp, axis=-1, keepdims=True) + self.eps)
+        # Reshape to [B, S, NH*DH], apply weight, then back
+        x_normed = x_normed.transpose(0, 2, 1, 3).reshape(B, S, NH * DH)
+        x_normed = x_normed * self.weight.astype(x_normed.dtype)
+        return x_normed.astype(x.dtype)
 
 
-class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+class mLSTMLayer(nn.Module):
+    """Pure MLX implementation of the mLSTM layer from xLSTM (Beck et al. 2024).
+
+    Uses the parallel form during training: materializes an [S, S] gating matrix
+    that combines forget/input gates with query-key similarities, then applies it
+    to values — similar to causal linear attention with learned decay.
+    """
+    def __init__(self, dim: int, num_heads: int, qk_dim_factor: float, v_dim_factor: float,
+                 gate_soft_cap: float, eps: float = 1e-6):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.num_heads = num_heads
+        self.qk_dim = int(dim * qk_dim_factor)
+        self.v_dim = int(dim * v_dim_factor)
+        self.head_qk_dim = self.qk_dim // num_heads
+        self.head_v_dim = self.v_dim // num_heads
+        self.gate_soft_cap = gate_soft_cap
+        self.eps = eps
+        self.scale = self.head_qk_dim ** -0.5
+
+        # Projections: q, k, v, output gate, input gate, forget gate
+        self.c_q = CastedLinear(dim, self.qk_dim)
+        self.c_k = CastedLinear(dim, self.qk_dim)
+        self.c_v = CastedLinear(dim, self.v_dim)
+        self.c_ogate = CastedLinear(dim, self.v_dim)
+        self.igate_preact = CastedLinear(dim, num_heads, bias=True)
+        self.fgate_preact = CastedLinear(dim, num_heads, bias=True)
+
+        # Multi-head normalization and output projection
+        self.multihead_norm = MultiHeadNorm(num_heads, self.head_v_dim, eps=eps)
+        self.out_proj = CastedLinear(self.v_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        B, S, D = x.shape
+        NH = self.num_heads
+
+        # Project to q, k, v and gates
+        q = self.c_q(x).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)  # [B, NH, S, d_qk]
+        k = self.c_k(x).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x).reshape(B, S, NH, self.head_v_dim).transpose(0, 2, 1, 3)    # [B, NH, S, d_v]
+        o_preact = self.c_ogate(x)  # [B, S, v_dim]
+
+        # Scalar gates per head (soft-capped)
+        i_pre = soft_cap(self.igate_preact(x), self.gate_soft_cap)  # [B, S, NH]
+        f_pre = soft_cap(self.fgate_preact(x), self.gate_soft_cap)  # [B, S, NH]
+        i_pre = i_pre.transpose(0, 2, 1)  # [B, NH, S]
+        f_pre = f_pre.transpose(0, 2, 1)
+
+        # Log-space gates for numerical stability
+        log_f = log_sigmoid(f_pre)  # [B, NH, S]
+        log_i = log_sigmoid(i_pre)  # [B, NH, S]
+
+        # Cumulative log forget gate
+        log_f_cumsum = mx.cumsum(log_f, axis=-1)  # [B, NH, S]
+
+        # Gating matrix in log space: log_D[t,s] = cumsum_f[t] - cumsum_f[s] + log_i[s]
+        # Shape: [B, NH, S, S] — this is the key "parallel form" computation
+        log_D = (log_f_cumsum[:, :, :, None]       # [B, NH, S, 1]  (target positions)
+                 - log_f_cumsum[:, :, None, :]      # [B, NH, 1, S]  (source positions)
+                 + log_i[:, :, None, :])            # [B, NH, 1, S]  (input gate at source)
+
+        # Causal mask: only attend to past and present
+        causal = mx.tril(mx.ones((S, S), dtype=mx.bool_))
+        log_D = mx.where(causal, log_D, mx.array(-1e9))
+        # Clamp to prevent exp() overflow in bfloat16 (max representable ~ 3.4e38, exp(88) ~ 1.6e38)
+        log_D = mx.clip(log_D, a_min=None, a_max=80.0)
+        D = mx.exp(log_D)  # [B, NH, S, S]
+
+        # Query-key similarity scaled by sqrt(d_qk)
+        qk = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # [B, NH, S, S]
+
+        # Gated attention: combine data-dependent gating with content-based similarity
+        attn = D * qk  # [B, NH, S, S]
+
+        # Weighted sum of values
+        h = attn @ v  # [B, NH, S, d_v]
+
+        # Normalizer: max(|sum of gated attention weights per row|, 1)
+        normalizer = mx.maximum(mx.abs(attn.sum(axis=-1, keepdims=True)), mx.array(1.0))
+        h = h / normalizer
+
+        # Multi-head norm → sigmoid output gate → project out
+        h_norm = self.multihead_norm(h)  # [B, S, v_dim]
+        h_out = mx.sigmoid(o_preact) * h_norm
+        return self.out_proj(h_out)
 
 
-class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+class FFN(nn.Module):
+    """SiLU-gated feedforward (SwiGLU-style), matching xLSTMLarge."""
+    def __init__(self, dim: int, ffn_mult: float):
         super().__init__()
-        self.attn_norm = RMSNormNoWeight()
-        self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        hidden = int(dim * ffn_mult)
+        # Round up to multiple of 64 for efficiency
+        hidden = ((hidden + 63) // 64) * 64
+        self.gate_proj = CastedLinear(dim, hidden)
+        self.up_proj = CastedLinear(dim, hidden)
+        self.down_proj = CastedLinear(hidden, dim)
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class mLSTMBlock(nn.Module):
+    """Single xLSTM block: pre-norm mLSTM + pre-norm FFN, both with residual connections."""
+    def __init__(self, dim: int, num_heads: int, qk_dim_factor: float, v_dim_factor: float,
+                 ffn_mult: float, gate_soft_cap: float):
+        super().__init__()
+        self.norm_mlstm = RMSNormWeighted(dim)
+        self.mlstm = mLSTMLayer(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
+        self.norm_ffn = RMSNormWeighted(dim)
+        self.ffn = FFN(dim, ffn_mult)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = x + self.mlstm(self.norm_mlstm(x))
+        x = x + self.ffn(self.norm_ffn(x))
         return x
 
 
-class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+class xLSTM(nn.Module):
+    """xLSTM language model: embedding → mLSTM blocks → final norm → tied LM head."""
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int,
+                 qk_dim_factor: float, v_dim_factor: float, ffn_mult: float,
+                 gate_soft_cap: float, logit_softcap: float, logit_chunk_tokens: int,
+                 tied_embed_init_std: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.logit_chunk_tokens = logit_chunk_tokens
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            mLSTMBlock(dim, num_heads, qk_dim_factor, v_dim_factor, ffn_mult, gate_soft_cap)
+            for _ in range(num_layers)
         ]
-        self.final_norm = RMSNormNoWeight()
+        self.final_norm = RMSNormWeighted(dim)
 
+        # Zero-init output projections (like the GPT baseline)
         for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            b.mlstm.out_proj.weight = mx.zeros_like(b.mlstm.out_proj.weight)
+            b.ffn.down_proj.weight = mx.zeros_like(b.ffn.down_proj.weight)
+
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -417,47 +494,31 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-        skips: list[mx.array] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        for block in self.blocks:
+            x = block(x)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self.softcap(x @ self.tok_emb.weight.astype(x.dtype).T)
             return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
+            logits = self.softcap(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
+
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
 # ==============================================================================
 class Muon:
-    # Muon applies SGD-momentum to matrix gradients, then orthogonalizes the result before the
-    # parameter update.
     def __init__(self, keys: list[str], params: dict[str, mx.array], args: Hyperparameters):
         self.keys = keys
         self.args = args
@@ -484,23 +545,18 @@ class Muon:
 
 
 class SplitOptimizers:
-    # - embeddings: Adam with the tied-embedding LR
-    # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
-    # This preserves the high-level optimization behavior even though MLX internals differ.
-    def __init__(self, model: GPT, args: Hyperparameters):
+    def __init__(self, model: xLSTM, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
         self.matrix_keys = [
-            k
-            for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            k for k, p in params.items()
+            if k.startswith("blocks.") and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
-            k
-            for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            k for k, p in params.items()
+            if k not in {self.embed_key} and k not in set(self.matrix_keys)
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -517,7 +573,7 @@ class SplitOptimizers:
             bias_correction=True,
         )
 
-    def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
+    def step(self, model: xLSTM, grads_tree: dict, step: int, lr_mul: float) -> None:
         params = dict(tree_flatten(model.parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
@@ -539,13 +595,10 @@ class SplitOptimizers:
 
         model.update(tree_unflatten(list(updated.items())))
 
+
 # ==============================================================================
-# QUANTIZATION (INT8 + ZLIB)
+# QUANTIZATION (INT8 + ZLIB) — identical to train_gpt_mlx.py
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
-# - exact passthrough for non-floats
 
 MX_DTYPE_FROM_NAME = {
     "float32": mx.float32,
@@ -576,15 +629,11 @@ def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str
 def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
         clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
         q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
         return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
-
-    # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
     q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
@@ -611,15 +660,11 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             passthrough[name] = np.ascontiguousarray(np.array(arr))
             stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
             continue
-
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_array(name, arr, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += int(kept.nbytes)
             continue
-
         stats["num_float_tensors"] += 1
         q, s = quantize_float_array(arr)
         if s.ndim > 0:
@@ -651,13 +696,11 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
         if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
             out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
     for name, arr in quant_obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_arr = np.array(arr, copy=True)
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -691,9 +734,6 @@ def build_sentencepiece_luts(
 
 
 def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
-    # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
-    # decode bytes with the exact tokenizer that produced the shards. The manifest
-    # lets the training script fail fast on accidental dataset/tokenizer mismatches.
     dataset_dir = Path(data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     if len(dataset_dir.parents) < 2:
@@ -701,17 +741,14 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     manifest_path = dataset_dir.parents[1] / "manifest.json"
     if not manifest_path.is_file():
         return dataset_dir.name, actual_train_files, None
-
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
     if dataset_entry is None:
         return dataset_dir.name, actual_train_files, None
-
     tokenizer_name = dataset_entry.get("tokenizer_name")
     tokenizer_entry = (
         next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
-        if tokenizer_name
-        else None
+        if tokenizer_name else None
     )
     expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
     if expected_name and Path(tokenizer_path).name != expected_name:
@@ -731,7 +768,6 @@ def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> n
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
     if max_tokens > 0:
         tokens = tokens[: max_tokens + 1]
@@ -757,7 +793,7 @@ def loss_and_grad_chunked(
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
         if args.mlx_eager_eval:
-            mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
+            mx.eval(loss_value, grad_accum)
     return loss_value, tree_unflatten(list(grad_accum.items()))
 
 
@@ -770,9 +806,6 @@ def eval_val(
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
     if val_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -816,9 +849,10 @@ def eval_val(
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
 
-# -----------------------------
+
+# ==============================================================================
 # TRAINING
-# -----------------------------
+# ==============================================================================
 
 def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     if max_norm <= 0:
@@ -837,9 +871,6 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
 
 
 def main() -> None:
-    # ==============================================================================
-    # TOKENIZER + VALIDATION METRIC SETUP
-    # ==============================================================================
     args = Hyperparameters()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -860,56 +891,39 @@ def main() -> None:
     log("=" * 100, console=False)
 
     if not args.tie_embeddings:
-        raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
+        raise NotImplementedError("train_xlstm_mlx.py only supports tied embeddings")
     if not args.tokenizer_path.endswith(".model"):
         raise ValueError(f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}")
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
-        raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
-        )
+        raise ValueError(f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}")
     dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
-        args.data_path,
-        args.tokenizer_path,
+        args.data_path, args.tokenizer_path,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size)
 
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size
-    )
-
-    # ==============================================================================
-    # TRAINING SETUP
-    # ==============================================================================
+    # ==================================================================
+    # MODEL + OPTIMIZER SETUP
+    # ==================================================================
     mx.random.seed(args.seed)
-
     train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
-    # ==============================================================================
-    # MODEL + OPTIMIZER SETUP
-    # ==============================================================================
-    model = GPT(
+    model = xLSTM(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         dim=args.model_dim,
         num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        logit_chunk_tokens=args.logit_chunk_tokens,
+        qk_dim_factor=args.qk_dim_factor,
+        v_dim_factor=args.v_dim_factor,
+        ffn_mult=args.ffn_mult,
+        gate_soft_cap=args.gate_soft_cap,
         logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
+        logit_chunk_tokens=args.logit_chunk_tokens,
         tied_embed_init_std=args.tied_embed_init_std,
-        qk_gain_init=args.qk_gain_init,
     )
     opt = SplitOptimizers(model, args)
 
-    # ==============================================================================
-    # COMPILED TRAIN / EVAL FUNCTIONS (MLX)
-    # ==============================================================================
-    # The crucial MLX detail is capture scope: this model contains non-trainable arrays too (for example
-    # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
-    # Compiling the model-bound functions and capturing the full model state fixes that while still
-    # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
     compiled_loss_and_grad = mx.compile(
         nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
@@ -917,9 +931,9 @@ def main() -> None:
         outputs=model.state,
     )
 
-    # Print config once so logs are self-describing.
     n_params = sum(int(np.prod(p.shape)) for _, p in tree_flatten(model.parameters()))
     log(f"run_id:{args.run_id}")
+    log(f"model:xLSTM (mLSTM, pure MLX)")
     log(f"mlx_version:{mx.__version__}")
     log(f"train_loader:shards pattern={args.train_files}")
     log(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.size - 1}")
@@ -936,7 +950,9 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"dim:{args.model_dim} heads:{args.num_heads} "
+        f"qk_dim_factor:{args.qk_dim_factor} v_dim_factor:{args.v_dim_factor} "
+        f"ffn_mult:{args.ffn_mult} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
@@ -954,20 +970,11 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
-    log(
-        f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
-    )
 
-    # ==============================================================================
+    # ==================================================================
     # TRAINING LOOP
-    # ==============================================================================
+    # ==================================================================
     if args.warmup_steps > 0:
-        # Warmup should only prime MLX compile/allocation paths. Updating parameters here forces us
-        # to snapshot and restore model/optimizer state, which is expensive on unified-memory Macs.
-        # Instead we run the real train shapes, force the loss/grads to materialize, and then reset
-        # the loader so measured training still starts from the true init and token window.
         for warmup_step in range(args.warmup_steps):
             accum: dict[str, mx.array] | None = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
@@ -980,7 +987,6 @@ def main() -> None:
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
-        # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
         val_batch_tokens = args.val_batch_size // args.grad_accum_steps
         if val_batch_tokens < args.train_seq_len:
             raise ValueError(
@@ -1007,14 +1013,9 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
-            # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
-                args,
-                compiled_loss,
-                val_tokens,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
+                args, compiled_loss, val_tokens,
+                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
                 log_fn=log,
             )
             if step % 25 == 0 or last_step:
@@ -1039,32 +1040,44 @@ def main() -> None:
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
             if args.mlx_eager_eval:
-                mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
+                mx.eval(train_loss, accum)
 
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
-        opt.step(model, grads, step=step, lr_mul=lr_mul)
+
+        # Skip optimizer step if loss or any gradient is NaN
+        nan_in_loss = math.isnan(train_loss_value)
+        nan_in_grads = any(bool(mx.any(mx.isnan(g)).item()) for g in accum.values())
+        step_skipped = nan_in_loss or nan_in_grads
+        if step_skipped:
+            nan_sources = []
+            if nan_in_loss:
+                nan_sources.append("loss")
+            if nan_in_grads:
+                bad_keys = [k for k, g in accum.items() if bool(mx.any(mx.isnan(g)).item())]
+                nan_sources.append(f"grads({','.join(bad_keys[:5])})")
+            log(f"NaN detected at step {step}, skipping update: {' + '.join(nan_sources)}")
+        else:
+            opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
-        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
+        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None or step_skipped):
+            skip_tag = " [SKIPPED_NAN]" if step_skipped else ""
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}{skip_tag}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step
 
-    # ==============================================================================
+    # ==================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
-    # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
+    # ==================================================================
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
@@ -1090,12 +1103,8 @@ def main() -> None:
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)

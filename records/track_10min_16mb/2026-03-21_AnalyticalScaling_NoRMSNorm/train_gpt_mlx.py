@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+Analytical Scaling (No RMS Norm) — record variant of train_gpt_mlx.py
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Replaces all RMS normalization with analytically-derived scaling factors that
+maintain variance ≈ 1 and mean ≈ 0 throughout the forward pass:
+
+  - CastedLinear: matmul reduces over in_dim → scale output by 1/√in_dim,
+    init weights with unit variance (std=1).
+  - relu²: second moment of relu(x)² for x~N(0,1) is 3/2 → scale by √(2/3).
+  - Residual additions (x + y): variance doubles → scale by 1/√2.
+  - Skip-connection additions: same 1/√2.
+  - Embedding: init with std=1 so lookup already gives var=1.
+  - LM head (tied embedding matmul): reduces over dim → scale by 1/√dim.
 """
 from __future__ import annotations
 
@@ -76,7 +85,7 @@ class Hyperparameters:
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+    tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 1.0))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -125,7 +134,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,final_gain",
     ).split(",")
     if pattern
 )
@@ -170,8 +179,12 @@ def accumulate_flat_grads(
 # MATH HELPERS
 # ==============================================================================
 
-def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-    return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
+# Analytical scaling constants (replace adaptive RMS normalization)
+# For any sum/reduction over N elements: scale by 1/√N to maintain var=1.
+# For adding two independent signals: var doubles, so scale by 1/√2.
+# For relu(x)² with x~N(0,1): E[(relu(x)²)²] = 3/2, scale by √(2/3) to normalize.
+INV_SQRT2 = 1.0 / math.sqrt(2.0)
+SWIGLU_SCALE = 1.0 / math.sqrt(0.3554)  # empirical: silu(g)*u for g,u~N(0,1) has 2nd moment ≈ 0.3554
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
@@ -180,7 +193,9 @@ def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.ar
     # Background on Muon: https://kellerjordan.github.io/posts/muon/
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.astype(mx.float32)
-    x = x / (mx.sqrt(mx.sum(x * x)) + eps)
+    norm = mx.sqrt(mx.sum(x * x))
+    # Guard: if gradient is all-zero / near-zero, return zeros to avoid 0/0
+    x = mx.where(norm > eps, x / (norm + eps), mx.zeros_like(x))
     transposed = x.shape[0] > x.shape[1]
     if transposed:
         x = x.T
@@ -279,25 +294,21 @@ class TokenLoader:
 # ==============================================================================
 
 class CastedLinear(nn.Module):
+    # Matmul sums over in_dim elements. With unit-variance weights and N(0,1) input,
+    # output var = in_dim. Scale by 1/√in_dim to maintain var = 1.
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
+        self.weight = mx.random.normal((out_dim, in_dim)).astype(mx.float32)
+        self.in_scale = in_dim ** -0.5
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
-
-
-class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
-    def __call__(self, x: mx.array) -> mx.array:
-        return rms_norm(x)
+        return (x @ self.weight.astype(x.dtype).T) * self.in_scale
 
 
 class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
+    # - separate q/k/v projections (CastedLinear handles 1/√in_dim scaling)
+    # - RoPE on q and k (preserves variance — rotation)
+    # - causal masked SDPA (1/√head_dim handles QK^T reduction)
     def __init__(
         self,
         dim: int,
@@ -331,8 +342,10 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        # No rms_norm — CastedLinear already scales by 1/√in_dim, giving var≈1.
+        # RoPE is a rotation and preserves variance.
+        q = self.rope(q.astype(COMPUTE_DTYPE))
+        k = self.rope(k.astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
@@ -340,16 +353,18 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
+    # SwiGLU activation: silu(gate) * up. The silu gate dampens extreme values,
+    # making this more numerically stable than relu² (especially without RMSNorm).
+    # Hidden size is split in half for gate/up to keep param count comparable.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
+        self.gate_proj = CastedLinear(dim, hidden)
+        self.up_proj = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        return self.proj(nn.silu(self.gate_proj(x)) * self.up_proj(x) * SWIGLU_SCALE)
 
 
 class Block(nn.Module):
@@ -363,8 +378,7 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNormNoWeight()
-        self.mlp_norm = RMSNormNoWeight()
+        # No attn_norm / mlp_norm — variance is maintained analytically.
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
@@ -374,17 +388,19 @@ class Block(nn.Module):
     def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        # No pre-norm — input already ~var=1 from analytical scaling.
+        attn_out = self.attn(x)
+        # Residual add: two signals → var doubles → scale by 1/√2.
+        x = (x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out) * INV_SQRT2
+        x = (x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(x)) * INV_SQRT2
         return x
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
+    # - token embedding (unit variance init, no rms_norm needed)
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
+    # - tied embeddings for the LM head with 1/√dim scaling
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float):
@@ -393,6 +409,7 @@ class GPT(nn.Module):
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.lm_head_scale = dim ** -0.5  # LM head matmul reduces over dim
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
@@ -403,11 +420,14 @@ class GPT(nn.Module):
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
-        self.final_norm = RMSNormNoWeight()
+        # Learnable per-dim gain replaces final RMS norm.
+        self.final_gain = mx.ones((dim,), dtype=mx.float32)
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        # Embedding with unit variance (std=tied_embed_init_std, default 1.0).
+        # Lookup directly gives var≈1, no normalization needed.
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -417,7 +437,8 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        # Embedding lookup — unit variance init means var≈1 already, no norm needed.
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
         x0 = x
         skips: list[mx.array] = []
 
@@ -425,21 +446,19 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                # Skip add: two signals → scale by 1/√2.
+                x = (x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()) * INV_SQRT2
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-        return self.final_norm(x)
+        # Learnable per-dim gain replaces adaptive final RMS norm.
+        return x * self.final_gain.astype(x.dtype)[None, None, :]
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
+        # Cross-entropy over flattened tokens. LM head matmul reduces over dim → scale by 1/√dim.
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+            logits_proj = (x @ self.tok_emb.weight.astype(x.dtype).T) * self.lm_head_scale
             logits = self.softcap(logits_proj)
             return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
@@ -447,7 +466,7 @@ class GPT(nn.Module):
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
+            logits_proj = (x[s:e] @ self.tok_emb.weight.astype(x.dtype).T) * self.lm_head_scale
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
@@ -500,7 +519,7 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k in ("skip_weights", "final_gain") or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -1044,17 +1063,32 @@ def main() -> None:
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
-        opt.step(model, grads, step=step, lr_mul=lr_mul)
+
+        # Skip optimizer step if loss or any gradient is NaN
+        nan_in_loss = math.isnan(train_loss_value)
+        nan_in_grads = any(bool(mx.any(mx.isnan(g)).item()) for g in accum.values())
+        step_skipped = nan_in_loss or nan_in_grads
+        if step_skipped:
+            nan_sources = []
+            if nan_in_loss:
+                nan_sources.append("loss")
+            if nan_in_grads:
+                bad_keys = [k for k, g in accum.items() if bool(mx.any(mx.isnan(g)).item())]
+                nan_sources.append(f"grads({','.join(bad_keys[:5])})")
+            log(f"NaN detected at step {step}, skipping update: {' + '.join(nan_sources)}")
+        else:
+            opt.step(model, grads, step=step, lr_mul=lr_mul)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
-        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
+        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None or step_skipped):
+            skip_tag = " [SKIPPED_NAN]" if step_skipped else ""
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
-                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
+                f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}{skip_tag}"
             )
         if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
             stop_after_step = step

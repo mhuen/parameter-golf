@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
+Universal Transformer GPT — MLX implementation.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Key idea: a single transformer block (attention + MLP) is applied N times, with only
+per-layer scalars (attn_scale, mlp_scale, resid_mix) being unique per application.
+This is the extreme of ALBERT-style weight sharing: both attention and MLP are shared.
+
+The massive parameter savings allow a wider model (dim=1024, 16 heads, 8 KV heads)
+with 2.7x the depth (24 layers) and SwiGLU MLP, staying well under the 16MB budget.
+
+Each "layer" applies the same shared attention and MLP weights but with its own
+residual mixing scalars, so the model can learn different residual stream dynamics
+at each depth despite using identical transformations.
 """
+
 from __future__ import annotations
 
 import glob
@@ -32,49 +42,50 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 COMPUTE_DTYPE = mx.bfloat16
 
+
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# Universal Transformer config:
+# - 24 applications of a single shared block at width 1024
+# - 16 attention heads with 8 KV heads (GQA) and SwiGLU MLP (3x expansion)
 # - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# - ~13.7M params, ~9.2 MB compressed
 class Hyperparameters:
     # Data / tokenizer.
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path: str = os.environ.get(
+        "TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model"
+    )
     run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed: int = int(os.environ.get("SEED", 1337))
 
-    # Training loop. These defaults now mirror train_gpt.py on a single process.
+    # Training loop.
     iterations: int = int(os.environ.get("ITERATIONS", 20_000))
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
-    # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
-    train_seq_len: int = int(os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024)))
-    # Chunk each logical MLX microbatch into smaller sub-batches to reduce peak
-    # memory pressure without changing the effective optimizer batch.
-    mlx_max_microbatch_tokens: int = int(os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192))
-    # Force MLX to materialize the graph after every sub-batch, preventing lazy
-    # graph buildup across accumulation steps. Keeps peak memory low on 16GB machines.
-    # Disable on 32GB+ unified memory for better throughput (MLX_EAGER_EVAL=0).
+    train_seq_len: int = int(
+        os.environ.get("TRAIN_SEQ_LEN", os.environ.get("TRAIN_MAX_SEQ_LEN", 1024))
+    )
+    mlx_max_microbatch_tokens: int = int(
+        os.environ.get("MLX_MAX_MICROBATCH_TOKENS", 8_192)
+    )
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model (defaults match the current baseline setup).
+    # Model — 24 applications of a shared block, width 1024, SwiGLU MLP.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 24))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 1024))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 16))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 8))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -82,7 +93,7 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Optimizer. We keep the same per-group defaults as train_gpt.py.
+    # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
     adam_eps: float = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -91,8 +102,12 @@ class Hyperparameters:
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start: float = float(
+        os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
+    )
+    muon_momentum_warmup_steps: int = int(
+        os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500)
+    )
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
@@ -114,11 +129,19 @@ class Hyperparameters:
             return 1.0
         if self.max_wallclock_seconds <= 0:
             warmdown_start = max(self.iterations - self.warmdown_iters, 0)
-            return max((self.iterations - step) / max(self.warmdown_iters, 1), 0.0) if warmdown_start <= step < self.iterations else 1.0
+            return (
+                max((self.iterations - step) / max(self.warmdown_iters, 1), 0.0)
+                if warmdown_start <= step < self.iterations
+                else 1.0
+            )
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = self.warmdown_iters * step_ms
         remaining_ms = max(1000.0 * self.max_wallclock_seconds - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        return (
+            remaining_ms / max(warmdown_ms, 1e-9)
+            if remaining_ms <= warmdown_ms
+            else 1.0
+        )
 
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
@@ -170,14 +193,12 @@ def accumulate_flat_grads(
 # MATH HELPERS
 # ==============================================================================
 
+
 def rms_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return (x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
 def zeropower_newtonschulz5(g: mx.array, steps: int, eps: float = 1e-7) -> mx.array:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
-    # Background on Muon: https://kellerjordan.github.io/posts/muon/
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.astype(mx.float32)
     x = x / (mx.sqrt(mx.sum(x * x)) + eps)
@@ -278,6 +299,7 @@ class TokenLoader:
 # MODEL BLOCKS
 # ==============================================================================
 
+
 class CastedLinear(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -288,16 +310,11 @@ class CastedLinear(nn.Module):
 
 
 class RMSNormNoWeight(nn.Module):
-    # MLX module wrapper around the functional RMSNorm helper so it composes nicely in blocks.
     def __call__(self, x: mx.array) -> mx.array:
         return rms_norm(x)
 
 
 class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
     def __init__(
         self,
         dim: int,
@@ -323,36 +340,53 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = (
+            self.c_q(x)
+            .reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.c_k(x)
+            .reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.c_v(x)
+            .reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)
+        )
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
-        y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
+        y = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask="causal"
+        )
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
-class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
+class SwiGLU(nn.Module):
+    """SwiGLU MLP: gate and up projections with SiLU gating, then down projection."""
+
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.gate = CastedLinear(dim, hidden)
+        self.up = CastedLinear(dim, hidden)
+        self.down = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        return self.down(nn.silu(self.gate(x)) * self.up(x))
 
 
-class Block(nn.Module):
+class SharedBlock(nn.Module):
+    """Shared transformer block: attention + MLP with norms. No per-layer scalars."""
+
     def __init__(
         self,
         dim: int,
@@ -365,51 +399,82 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init
+        )
+        self.mlp = SwiGLU(dim, mlp_mult)
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    def __call__(
+        self, x: mx.array, attn_scale: mx.array, mlp_scale: mx.array
+    ) -> mx.array:
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
+class LayerScalars(nn.Module):
+    """Per-layer scalars: attn_scale, mlp_scale, resid_mix."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.resid_mix = mx.array(
+            np.stack(
+                (np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))
+            )
+        )
+
+
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        logit_chunk_tokens: int,
+        logit_softcap: float,
+        rope_base: float,
+        tied_embed_init_std: float,
+        qk_gain_init: float,
+    ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+
+        # Single shared block (attention + MLP) applied at every layer.
+        self.shared_block = SharedBlock(
+            dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init
+        )
+
+        # Per-layer scalars (unique per application).
+        self.layer_scalars = [LayerScalars(dim) for _ in range(num_layers)]
+
         self.final_norm = RMSNormNoWeight()
 
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        # Zero-init output projections for residual-friendly start.
+        self.shared_block.attn.proj.weight = mx.zeros_like(
+            self.shared_block.attn.proj.weight
+        )
+        self.shared_block.mlp.down.weight = mx.zeros_like(
+            self.shared_block.mlp.down.weight
+        )
         self.tok_emb.weight = (
-            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
+            * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
     def softcap(self, logits: mx.array) -> mx.array:
@@ -422,26 +487,32 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            ls = self.layer_scalars[i]
+            mix = ls.resid_mix.astype(x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            x = self.shared_block(x, ls.attn_scale, ls.mlp_scale)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                x = (
+                    x
+                    + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                )
+            ls = self.layer_scalars[self.num_encoder_layers + i]
+            mix = ls.resid_mix.astype(x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+            x = self.shared_block(x, ls.attn_scale, ls.mlp_scale)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+            return nn.losses.cross_entropy(
+                logits.astype(mx.float32), y, reduction="mean"
+            )
 
         loss_sum = mx.array(0.0, dtype=mx.float32)
         n = int(x.shape[0])
@@ -449,24 +520,35 @@ class GPT(nn.Module):
             e = min(s + self.logit_chunk_tokens, n)
             logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
             logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
+            loss_sum = loss_sum + nn.losses.cross_entropy(
+                logits.astype(mx.float32), y[s:e], reduction="sum"
+            )
         return loss_sum / float(n)
+
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
 # ==============================================================================
 class Muon:
-    # Muon applies SGD-momentum to matrix gradients, then orthogonalizes the result before the
-    # parameter update.
-    def __init__(self, keys: list[str], params: dict[str, mx.array], args: Hyperparameters):
+    def __init__(
+        self, keys: list[str], params: dict[str, mx.array], args: Hyperparameters
+    ):
         self.keys = keys
         self.args = args
         self.buffers = {k: mx.zeros_like(params[k]) for k in keys}
 
-    def step(self, params: dict[str, mx.array], grads: dict[str, mx.array], step: int, lr_mul: float) -> dict[str, mx.array]:
+    def step(
+        self,
+        params: dict[str, mx.array],
+        grads: dict[str, mx.array],
+        step: int,
+        lr_mul: float,
+    ) -> dict[str, mx.array]:
         if self.args.muon_momentum_warmup_steps:
             t = min(step / self.args.muon_momentum_warmup_steps, 1.0)
-            momentum = (1.0 - t) * self.args.muon_momentum_warmup_start + t * self.args.muon_momentum
+            momentum = (
+                1.0 - t
+            ) * self.args.muon_momentum_warmup_start + t * self.args.muon_momentum
         else:
             momentum = self.args.muon_momentum
         lr = self.args.matrix_lr * lr_mul
@@ -484,10 +566,6 @@ class Muon:
 
 
 class SplitOptimizers:
-    # - embeddings: Adam with the tied-embedding LR
-    # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
-    # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
@@ -495,12 +573,22 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if k.startswith("shared_block.")
+            and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights"
+            or k.startswith("layer_scalars.")
+            or (
+                k.startswith("shared_block.")
+                and (
+                    p.ndim < 2
+                    or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                )
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -539,13 +627,10 @@ class SplitOptimizers:
 
         model.update(tree_unflatten(list(updated.items())))
 
+
 # ==============================================================================
 # QUANTIZATION (INT8 + ZLIB)
 # ==============================================================================
-# - per-row int8 for 2D float tensors
-# - per-tensor int8 for other float tensors
-# - fp16 passthrough for small float tensors
-# - exact passthrough for non-floats
 
 MX_DTYPE_FROM_NAME = {
     "float32": mx.float32,
@@ -564,34 +649,51 @@ def _np_float32(arr: mx.array) -> np.ndarray:
     return np.array(arr.astype(mx.float32), dtype=np.float32, copy=False)
 
 
-def keep_float_array(name: str, arr: mx.array, passthrough_orig_dtypes: dict[str, str]) -> np.ndarray:
+def keep_float_array(
+    name: str, arr: mx.array, passthrough_orig_dtypes: dict[str, str]
+) -> np.ndarray:
     if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return np.ascontiguousarray(_np_float32(arr))
     if arr.dtype in {mx.float32, mx.bfloat16}:
         passthrough_orig_dtypes[name] = str(arr.dtype).split(".")[-1]
-        return np.ascontiguousarray(np.array(arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False))
+        return np.ascontiguousarray(
+            np.array(
+                arr.astype(mx.float16), dtype=INT8_KEEP_FLOAT_STORE_DTYPE, copy=False
+            )
+        )
     return np.ascontiguousarray(np.array(arr, copy=True))
 
 
 def quantize_float_array(arr: mx.array) -> tuple[np.ndarray, np.ndarray]:
     f32 = _np_float32(arr)
     if f32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1) if f32.size else np.empty((f32.shape[0],), dtype=np.float32)
+        clip_abs = (
+            np.quantile(np.abs(f32), INT8_CLIP_Q, axis=1)
+            if f32.size
+            else np.empty((f32.shape[0],), dtype=np.float32)
+        )
         clipped = np.clip(f32, -clip_abs[:, None], clip_abs[:, None])
         scale = np.maximum(clip_abs / 127.0, 1.0 / 127.0).astype(np.float32, copy=False)
-        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(np.int8, copy=False)
-        return np.ascontiguousarray(q), np.ascontiguousarray(scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False))
+        q = np.clip(np.round(clipped / scale[:, None]), -127, 127).astype(
+            np.int8, copy=False
+        )
+        return np.ascontiguousarray(q), np.ascontiguousarray(
+            scale.astype(INT8_PER_ROW_SCALE_DTYPE, copy=False)
+        )
 
-    # Vectors / scalars use a simpler per-tensor scale.
-    clip_abs = float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
+    clip_abs = (
+        float(np.quantile(np.abs(f32).reshape(-1), INT8_CLIP_Q)) if f32.size else 0.0
+    )
     scale = np.array(clip_abs / 127.0 if clip_abs > 0.0 else 1.0, dtype=np.float32)
-    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(np.int8, copy=False)
+    q = np.clip(np.round(np.clip(f32, -clip_abs, clip_abs) / scale), -127, 127).astype(
+        np.int8, copy=False
+    )
     return np.ascontiguousarray(q), scale
 
 
-def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str, object], dict[str, int]]:
+def quantize_state_dict_int8(
+    flat_state: dict[str, mx.array],
+) -> tuple[dict[str, object], dict[str, int]]:
     quantized: dict[str, np.ndarray] = {}
     scales: dict[str, np.ndarray] = {}
     dtypes: dict[str, str] = {}
@@ -599,7 +701,14 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
     passthrough_orig_dtypes: dict[str, str] = {}
     qmeta: dict[str, dict[str, object]] = {}
     stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        (
+            "param_count",
+            "num_tensors",
+            "num_float_tensors",
+            "num_nonfloat_tensors",
+            "baseline_tensor_bytes",
+            "int8_payload_bytes",
+        ),
         0,
     )
     for name, arr in flat_state.items():
@@ -612,8 +721,6 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
             stats["int8_payload_bytes"] += int(passthrough[name].nbytes)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
         if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_array(name, arr, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -651,13 +758,13 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
         dtype_name = quant_obj["dtypes"][name]
         scale = np.asarray(quant_obj["scales"][name], dtype=np.float32)
         if qmeta.get(name, {}).get("scheme") == "per_row" or scale.ndim > 0:
-            # Broadcast the saved row scale back across trailing dimensions.
-            out_arr = q_np.astype(np.float32) * scale.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+            out_arr = q_np.astype(np.float32) * scale.reshape(
+                (q_np.shape[0],) + (1,) * (q_np.ndim - 1)
+            )
         else:
             out_arr = q_np.astype(np.float32) * float(scale)
         out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[dtype_name])
     for name, arr in quant_obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_arr = np.array(arr, copy=True)
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -690,10 +797,9 @@ def build_sentencepiece_luts(
     return base_bytes_lut, has_leading_space_lut, is_boundary_token_lut
 
 
-def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tuple[str, int, int | None]:
-    # The shard directory and tokenizer are coupled: val_bpb is only meaningful if we
-    # decode bytes with the exact tokenizer that produced the shards. The manifest
-    # lets the training script fail fast on accidental dataset/tokenizer mismatches.
+def validate_dataset_tokenizer_pair(
+    data_path: str, tokenizer_path: str
+) -> tuple[str, int, int | None]:
     dataset_dir = Path(data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     if len(dataset_dir.parents) < 2:
@@ -703,19 +809,35 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
         return dataset_dir.name, actual_train_files, None
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    dataset_entry = next((x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name), None)
+    dataset_entry = next(
+        (x for x in manifest.get("datasets", []) if x.get("name") == dataset_dir.name),
+        None,
+    )
     if dataset_entry is None:
         return dataset_dir.name, actual_train_files, None
 
     tokenizer_name = dataset_entry.get("tokenizer_name")
     tokenizer_entry = (
-        next((x for x in manifest.get("tokenizers", []) if x.get("name") == tokenizer_name), None)
+        next(
+            (
+                x
+                for x in manifest.get("tokenizers", [])
+                if x.get("name") == tokenizer_name
+            ),
+            None,
+        )
         if tokenizer_name
         else None
     )
-    expected_name = Path((tokenizer_entry or {}).get("model_path") or (tokenizer_entry or {}).get("path") or "").name
+    expected_name = Path(
+        (tokenizer_entry or {}).get("model_path")
+        or (tokenizer_entry or {}).get("path")
+        or ""
+    ).name
     if expected_name and Path(tokenizer_path).name != expected_name:
-        raise ValueError(f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}")
+        raise ValueError(
+            f"{dataset_dir.name} expects tokenizer {expected_name}, got {Path(tokenizer_path).name}"
+        )
     expected_train_files = (dataset_entry.get("stats") or {}).get("files_train")
     if expected_train_files is not None:
         expected_train_files = int(expected_train_files)
@@ -727,12 +849,15 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> np.ndarray:
+def load_validation_tokens(
+    pattern: str, seq_len: int, max_tokens: int = 0
+) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
-    tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
+    tokens = np.ascontiguousarray(
+        np.concatenate([load_data_shard(file) for file in files], axis=0)
+    )
     if max_tokens > 0:
         tokens = tokens[: max_tokens + 1]
     usable = ((tokens.size - 1) // seq_len) * seq_len
@@ -746,7 +871,9 @@ def loss_and_grad_chunked(
     train_loader: TokenLoader,
     compiled_loss_and_grad,
 ) -> tuple[mx.array, dict]:
-    chunk_sizes = token_chunks(args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens)
+    chunk_sizes = token_chunks(
+        args.microbatch_tokens, args.train_seq_len, args.mlx_max_microbatch_tokens
+    )
     total_tokens = float(sum(chunk_sizes))
     loss_value = mx.array(0.0, dtype=mx.float32)
     grad_accum: dict[str, mx.array] | None = None
@@ -757,7 +884,7 @@ def loss_and_grad_chunked(
         loss_value = loss_value + loss.astype(mx.float32) * scale
         grad_accum = accumulate_flat_grads(grad_accum, grads, scale)
         if args.mlx_eager_eval:
-            mx.eval(loss_value, grad_accum)  # materialize each chunk to cap peak memory
+            mx.eval(loss_value, grad_accum)
     return loss_value, tree_unflatten(list(grad_accum.items()))
 
 
@@ -770,9 +897,6 @@ def eval_val(
     is_boundary_token_lut: np.ndarray,
     log_fn: Callable[[str], None] | None = None,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     val_batch_tokens = args.val_batch_size // args.grad_accum_steps
     if val_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -786,7 +910,9 @@ def eval_val(
     total_loss_sum = 0.0
     total_tokens = 0.0
     total_bytes = 0.0
-    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs), start=1):
+    for batch_idx, batch_seq_start in enumerate(
+        range(0, total_seqs, val_batch_seqs), start=1
+    ):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -807,8 +933,10 @@ def eval_val(
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
-        if log_fn is not None and total_batches > 1 and (
-            batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0
+        if (
+            log_fn is not None
+            and total_batches > 1
+            and (batch_idx == 1 or batch_idx == total_batches or batch_idx % 25 == 0)
         ):
             log_fn(f"val_progress:{batch_idx}/{total_batches}")
     val_loss = total_loss_sum / total_tokens
@@ -816,9 +944,11 @@ def eval_val(
     val_bpb = bits_per_token * (total_tokens / total_bytes)
     return val_loss, val_bpb
 
+
 # -----------------------------
 # TRAINING
 # -----------------------------
+
 
 def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     if max_norm <= 0:
@@ -860,22 +990,28 @@ def main() -> None:
     log("=" * 100, console=False)
 
     if not args.tie_embeddings:
-        raise NotImplementedError("train_gpt_mlx.py only supports tied embeddings")
+        raise NotImplementedError("This script only supports tied embeddings")
     if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}")
+        raise ValueError(
+            f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}"
+        )
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
-    dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
-        args.data_path,
-        args.tokenizer_path,
+    dataset_name, actual_train_files, expected_train_files = (
+        validate_dataset_tokenizer_pair(
+            args.data_path,
+            args.tokenizer_path,
+        )
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
+    val_tokens = load_validation_tokens(
+        args.val_files, args.train_seq_len, args.val_max_tokens
+    )
 
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size
+    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = (
+        build_sentencepiece_luts(sp, args.vocab_size)
     )
 
     # ==============================================================================
@@ -906,11 +1042,9 @@ def main() -> None:
     # ==============================================================================
     # COMPILED TRAIN / EVAL FUNCTIONS (MLX)
     # ==============================================================================
-    # The crucial MLX detail is capture scope: this model contains non-trainable arrays too (for example
-    # inside RoPE modules), so compiling only against trainable parameters throws "uncaptured inputs".
-    # Compiling the model-bound functions and capturing the full model state fixes that while still
-    # returning gradients only for trainable parameters via nn.value_and_grad(...).
-    compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    compiled_loss = mx.compile(
+        lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state
+    )
     compiled_loss_and_grad = mx.compile(
         nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
         inputs=model.state,
@@ -932,11 +1066,14 @@ def main() -> None:
             f"new epochs will arrive sooner than the full dataset"
         )
     else:
-        log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
+        log(
+            f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}"
+        )
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"mlp_mult:{args.mlp_mult} shared_block:True "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
@@ -952,11 +1089,13 @@ def main() -> None:
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
-    log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    log(
+        f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}"
+    )
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
+        f"linear_weight:{model.shared_block.attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
@@ -964,23 +1103,24 @@ def main() -> None:
     # TRAINING LOOP
     # ==============================================================================
     if args.warmup_steps > 0:
-        # Warmup should only prime MLX compile/allocation paths. Updating parameters here forces us
-        # to snapshot and restore model/optimizer state, which is expensive on unified-memory Macs.
-        # Instead we run the real train shapes, force the loss/grads to materialize, and then reset
-        # the loader so measured training still starts from the true init and token window.
         for warmup_step in range(args.warmup_steps):
             accum: dict[str, mx.array] | None = None
             warmup_loss = mx.array(0.0, dtype=mx.float32)
             grad_scale = 1.0 / args.grad_accum_steps
             for _ in range(args.grad_accum_steps):
-                warmup_loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+                warmup_loss, grads = loss_and_grad_chunked(
+                    args, train_loader, compiled_loss_and_grad
+                )
                 accum = accumulate_flat_grads(accum, grads, grad_scale)
             mx.eval(warmup_loss, accum)
             mx.synchronize()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+            if (
+                args.warmup_steps <= 20
+                or (warmup_step + 1) % 10 == 0
+                or warmup_step + 1 == args.warmup_steps
+            ):
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
-        # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
         val_batch_tokens = args.val_batch_size // args.grad_accum_steps
         if val_batch_tokens < args.train_seq_len:
             raise ValueError(
@@ -988,26 +1128,36 @@ def main() -> None:
                 f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
                 f"TRAIN_SEQ_LEN={args.train_seq_len}"
             )
-        warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
+        warm_val_seqs = min(
+            val_batch_tokens // args.train_seq_len,
+            (val_tokens.size - 1) // args.train_seq_len,
+        )
         warm_chunk = val_tokens[: warm_val_seqs * args.train_seq_len + 1]
-        x_val = mx.array(warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32)
+        x_val = mx.array(
+            warm_chunk[:-1].reshape(-1, args.train_seq_len), dtype=mx.int32
+        )
         y_val = mx.array(warm_chunk[1:].reshape(-1, args.train_seq_len), dtype=mx.int32)
         warm_val_loss = compiled_loss(x_val, y_val)
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        train_loader = TokenLoader(
+            args.train_files, log_fn=log, dataset_name=dataset_name
+        )
 
     train_time_ms = 0.0
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    max_wallclock_ms = (
+        1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    )
     stop_after_step: int | None = None
     t0 = time.perf_counter()
     step = 0
     while True:
-        last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
+        last_step = step == args.iterations or (
+            stop_after_step is not None and step >= stop_after_step
+        )
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
-            # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
                 args,
                 compiled_loss,
@@ -1025,7 +1175,9 @@ def main() -> None:
             t0 = time.perf_counter()
         if last_step:
             if stop_after_step is not None and step < args.iterations:
-                log(f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}")
+                log(
+                    f"stopping_early: wallclock_cap train_time:{train_time_ms:.0f}ms step:{step}/{args.iterations}"
+                )
             break
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
@@ -1035,11 +1187,13 @@ def main() -> None:
         train_loss = mx.array(0.0, dtype=mx.float32)
         grad_scale = 1.0 / args.grad_accum_steps
         for _ in range(args.grad_accum_steps):
-            loss, grads = loss_and_grad_chunked(args, train_loader, compiled_loss_and_grad)
+            loss, grads = loss_and_grad_chunked(
+                args, train_loader, compiled_loss_and_grad
+            )
             accum = accumulate_flat_grads(accum, grads, grad_scale)
             train_loss = train_loss + loss.astype(mx.float32) * grad_scale
             if args.mlx_eager_eval:
-                mx.eval(train_loss, accum)  # materialize each microbatch to cap peak memory
+                mx.eval(train_loss, accum)
 
         grads = tree_unflatten(list(accum.items()))
         grads = clip_grad_tree(grads, args.grad_clip_norm)
@@ -1051,20 +1205,25 @@ def main() -> None:
         approx_train_time_ms = train_time_ms + 1000.0 * (time.perf_counter() - t0)
         tok_s = args.train_batch_tokens / (step_ms / 1000.0)
         step += 1
-        if args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None):
+        if args.train_log_every > 0 and (
+            step <= 10
+            or step % args.train_log_every == 0
+            or stop_after_step is not None
+        ):
             log(
                 f"step:{step}/{args.iterations} train_loss:{train_loss_value:.4f} "
                 f"train_time:{approx_train_time_ms:.0f}ms step_avg:{approx_train_time_ms / step:.2f}ms tok_s:{tok_s:.0f}"
             )
-        if max_wallclock_ms is not None and stop_after_step is None and approx_train_time_ms >= max_wallclock_ms:
+        if (
+            max_wallclock_ms is not None
+            and stop_after_step is None
+            and approx_train_time_ms >= max_wallclock_ms
+        ):
             stop_after_step = step
 
     # ==============================================================================
     # FINAL SERIALIZATION + QUANTIZED ROUNDTRIP EVAL
     # ==============================================================================
-    # We always write a raw artifact and a quantized artifact, then validate the
-    # quantized roundtrip directly by loading the dequantized tensors back into the
-    # model and running one final validation pass.
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
     flat_state = {k: v for k, v in tree_flatten(model.state)}
     mx.savez(str(out_path), **flat_state)
@@ -1078,7 +1237,9 @@ def main() -> None:
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+    ratio = quant_stats["baseline_tensor_bytes"] / max(
+        quant_stats["int8_payload_bytes"], 1
+    )
     log(
         f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
         f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
@@ -1086,7 +1247,9 @@ def main() -> None:
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_flat = dequantize_state_dict_int8(
+        pickle.loads(zlib.decompress(quant_blob_disk))
+    )
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1099,8 +1262,12 @@ def main() -> None:
         log_fn=log,
     )
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log(
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms"
+    )
+    log(
+        f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
+    )
 
 
 if __name__ == "__main__":
