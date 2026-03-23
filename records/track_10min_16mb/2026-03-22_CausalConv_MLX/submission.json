@@ -1,0 +1,8 @@
+{
+  "author": "Mirco",
+  "name": "Causal Convolutional LM (MLX)",
+  "blurb": "Replaces transformer attention blocks with causal depthwise-separable 1D convolutions of increasing kernel sizes (3, 5, 7, 9, 13, 17, 21, 25, 31). Each block has a depthwise causal conv for spatial mixing + pointwise relu^2 MLP for channel mixing, both writing to the residual stream. Maintains encoder/decoder skip connections and x0 residual mixing from the baseline.",
+  "date": "2026-03-22T00:00:00Z",
+  "val_loss": null,
+  "val_bpb": null
+}
