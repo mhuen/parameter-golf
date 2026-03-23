@@ -1,26 +1,31 @@
 Universal Transformer experiment on the 10-minute record track.
 
-A single transformer block (attention + SwiGLU MLP) is applied 24 times. Only per-layer
-scalars (attn_scale, mlp_scale, resid_mix) are unique per application. This is the
-extreme end of ALBERT-style weight sharing.
+Transformer blocks (attention + SwiGLU MLP) are shared across groups of layers via
+a configurable BLOCK_PATTERN. Only per-layer scalars (attn_scale, mlp_scale, resid_mix)
+are unique per application. This is ALBERT-style weight sharing.
 
-Configuration:
-- Architecture: Universal Transformer (fully shared block) with SwiGLU MLP
-- Layout: `VOCAB_SIZE=1024 NUM_LAYERS=24 MODEL_DIM=1024 NUM_HEADS=16 NUM_KV_HEADS=8 MLP_MULT=3`
+Configuration (default):
+- Architecture: Universal Transformer with grouped block sharing, SwiGLU MLP
+- Layout: `VOCAB_SIZE=1024 NUM_LAYERS=21 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=2`
+- Block sharing: 7 shared blocks, 3 layers per block (`BLOCK_PATTERN=0,0,0,1,1,1,...,6,6,6`)
 - Tied output/input embeddings: `TIE_EMBEDDINGS=1`
-- Model params: `~13,742,096`
-- Estimated compressed size (int8+zlib): ~9.2 MB
+- Model params: `~17,087,544` (matches baseline budget)
 
 Key architecture details:
-- `SharedBlock`: single instance containing CausalSelfAttention + SwiGLU + norms
-- `LayerScalars`: 24 independent sets of (attn_scale, mlp_scale, resid_mix)
-- SwiGLU MLP: gate + up projections with SiLU gating, then down projection (3x expansion)
-- Encoder/decoder U-net skip connections (12 encoder + 12 decoder layers)
-- 2x wider than baseline (1024 vs 512) with 2.7x depth (24 vs 9)
+- `SharedBlock`: attention + SwiGLU + norms, shared across layers assigned to the same block
+- `LayerScalars`: 21 independent sets of (attn_scale, mlp_scale, resid_mix)
+- SwiGLU MLP: gate + up projections with SiLU gating, then down projection (2x expansion)
+- Encoder/decoder U-net skip connections (10 encoder + 11 decoder layers)
+- Same width as baseline (512) with 2.3x depth (21 vs 9) via weight sharing
+
+BLOCK_PATTERN examples:
+- `""` — single shared block for all layers (extreme ALBERT-style sharing)
+- `"0,0,0,1,1,1,..."` — grouped sharing, 3 layers per block (default)
+- `"0,1,2,...,20"` — no sharing, each layer has its own block
+- `"0,1,0,1,..."` — alternating/interleaved patterns
 
 Parameter budget comparison:
 - Baseline GPT (9 layers, per-layer everything): ~17.1M params
-- Shared-MLP (16 layers, shared MLP only): ~14.7M params
-- Universal (24 layers, fully shared block): ~13.7M params
+- Universal (21 layers, 7 shared blocks, 3 per block): ~17.1M params
 
 Status: Not yet trained — code-only snapshot for experimentation.

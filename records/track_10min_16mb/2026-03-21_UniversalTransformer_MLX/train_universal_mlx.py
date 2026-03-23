@@ -2,16 +2,17 @@
 """
 Universal Transformer GPT — MLX implementation.
 
-Key idea: a single transformer block (attention + MLP) is applied N times, with only
-per-layer scalars (attn_scale, mlp_scale, resid_mix) being unique per application.
-This is the extreme of ALBERT-style weight sharing: both attention and MLP are shared.
+Key idea: transformer blocks (attention + MLP) are shared across groups of layers,
+with only per-layer scalars (attn_scale, mlp_scale, resid_mix) being unique per
+application. This is ALBERT-style weight sharing.
 
-The massive parameter savings allow a wider model (dim=1024, 16 heads, 8 KV heads)
-with 2.7x the depth (24 layers) and SwiGLU MLP, staying well under the 16MB budget.
+Default config: 21 layers with 7 shared blocks (3 layers per block), dim=512,
+8 heads, 4 KV heads, SwiGLU MLP (2x expansion). This matches the baseline
+parameter budget (~17M params) while providing 2.3x more depth via weight sharing.
 
-Each "layer" applies the same shared attention and MLP weights but with its own
-residual mixing scalars, so the model can learn different residual stream dynamics
-at each depth despite using identical transformations.
+The BLOCK_PATTERN env var controls which layers share weights. Set to "" for a
+single shared block across all layers (extreme sharing), or specify per-layer
+block indices like "0,0,0,1,1,1,..." for grouped sharing.
 """
 
 from __future__ import annotations
@@ -47,10 +48,10 @@ COMPUTE_DTYPE = mx.bfloat16
 # HYPERPARAMETERS
 # ==============================================================================
 # Universal Transformer config:
-# - 24 applications of a single shared block at width 1024
-# - 16 attention heads with 8 KV heads (GQA) and SwiGLU MLP (3x expansion)
+# - 21 layers with 7 shared blocks (3 layers per block) at width 512
+# - 8 attention heads with 4 KV heads (GQA) and SwiGLU MLP (2x expansion)
 # - vocab size 1024, sequence length 1024, tied embeddings
-# - ~13.7M params, ~9.2 MB compressed
+# - ~17.1M params, matches baseline parameter budget
 class Hyperparameters:
     # Data / tokenizer.
     data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -79,19 +80,23 @@ class Hyperparameters:
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model — 24 applications of a shared block, width 1024, SwiGLU MLP.
+    # Model — 21 layers with 7 shared blocks (3 layers per block), width 512, SwiGLU MLP.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 24))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 1024))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 16))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 8))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 21))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
+    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # Block sharing pattern: comma-separated block indices per layer.
+    # E.g. "0,0,0,1,1,1" means layers 0-2 share block 0, layers 3-5 share block 1.
+    # Default "" means all layers share a single block (original behavior).
+    block_pattern: str = os.environ.get("BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6")
 
     # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -441,6 +446,7 @@ class GPT(nn.Module):
         rope_base: float,
         tied_embed_init_std: float,
         qk_gain_init: float,
+        block_pattern: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -455,10 +461,19 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
 
-        # Single shared block (attention + MLP) applied at every layer.
-        self.shared_block = SharedBlock(
-            dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init
-        )
+        # Block sharing: parse pattern to determine which block each layer uses.
+        if block_pattern.strip():
+            self.block_map = [int(x) for x in block_pattern.strip().split(",")]
+            if len(self.block_map) != num_layers:
+                raise ValueError(f"BLOCK_PATTERN has {len(self.block_map)} entries but NUM_LAYERS={num_layers}")
+        else:
+            self.block_map = [0] * num_layers  # all layers share a single block
+
+        num_blocks = max(self.block_map) + 1
+        self.shared_blocks = [
+            SharedBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            for _ in range(num_blocks)
+        ]
 
         # Per-layer scalars (unique per application).
         self.layer_scalars = [LayerScalars(dim) for _ in range(num_layers)]
@@ -466,12 +481,9 @@ class GPT(nn.Module):
         self.final_norm = RMSNormNoWeight()
 
         # Zero-init output projections for residual-friendly start.
-        self.shared_block.attn.proj.weight = mx.zeros_like(
-            self.shared_block.attn.proj.weight
-        )
-        self.shared_block.mlp.down.weight = mx.zeros_like(
-            self.shared_block.mlp.down.weight
-        )
+        for block in self.shared_blocks:
+            block.attn.proj.weight = mx.zeros_like(block.attn.proj.weight)
+            block.mlp.down.weight = mx.zeros_like(block.mlp.down.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
             * tied_embed_init_std
@@ -490,7 +502,7 @@ class GPT(nn.Module):
             ls = self.layer_scalars[i]
             mix = ls.resid_mix.astype(x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-            x = self.shared_block(x, ls.attn_scale, ls.mlp_scale)
+            x = self.shared_blocks[self.block_map[i]](x, ls.attn_scale, ls.mlp_scale)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
@@ -498,10 +510,11 @@ class GPT(nn.Module):
                     x
                     + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
                 )
-            ls = self.layer_scalars[self.num_encoder_layers + i]
+            layer_idx = self.num_encoder_layers + i
+            ls = self.layer_scalars[layer_idx]
             mix = ls.resid_mix.astype(x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-            x = self.shared_block(x, ls.attn_scale, ls.mlp_scale)
+            x = self.shared_blocks[self.block_map[layer_idx]](x, ls.attn_scale, ls.mlp_scale)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -573,7 +586,7 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("shared_block.")
+            if k.startswith("shared_blocks.")
             and p.ndim == 2
             and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
@@ -583,7 +596,7 @@ class SplitOptimizers:
             if k == "skip_weights"
             or k.startswith("layer_scalars.")
             or (
-                k.startswith("shared_block.")
+                k.startswith("shared_blocks.")
                 and (
                     p.ndim < 2
                     or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
@@ -1036,6 +1049,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        block_pattern=args.block_pattern,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1073,7 +1087,7 @@ def main() -> None:
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"mlp_mult:{args.mlp_mult} shared_block:True "
+        f"mlp_mult:{args.mlp_mult} num_blocks:{len(model.shared_blocks)} block_map:{model.block_map} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
@@ -1095,7 +1109,7 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.shared_block.attn.c_q.weight.dtype} "
+        f"linear_weight:{model.shared_blocks[0].attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
