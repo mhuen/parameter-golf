@@ -76,7 +76,7 @@ class Hyperparameters:
 
     # Model — xLSTM architecture.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 6))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 13))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 4))
     qk_dim_factor: float = float(os.environ.get("QK_DIM_FACTOR", 0.5))
@@ -476,41 +476,23 @@ class mLSTMLayer(nn.Module):
         return self.out_proj(h_out)
 
 
-class FFN(nn.Module):
-    """SiLU-gated feedforward (SwiGLU-style), matching xLSTMLarge."""
-    def __init__(self, dim: int, ffn_mult: float):
-        super().__init__()
-        hidden = int(dim * ffn_mult)
-        # Round up to multiple of 64 for efficiency
-        hidden = ((hidden + 63) // 64) * 64
-        self.gate_proj = CastedLinear(dim, hidden)
-        self.up_proj = CastedLinear(dim, hidden)
-        self.down_proj = CastedLinear(hidden, dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
 class mLSTMBlock(nn.Module):
-    """Single xLSTM block: pre-norm mLSTM + pre-norm FFN, both with residual connections."""
+    """Pre-norm mLSTM with residual connection (no separate FFN — the mLSTM layer's
+    internal up-proj/gate/down-proj provides channel mixing)."""
     def __init__(self, dim: int, num_heads: int, qk_dim_factor: float, v_dim_factor: float,
-                 ffn_mult: float, gate_soft_cap: float):
+                 gate_soft_cap: float):
         super().__init__()
-        self.norm_mlstm = RMSNormWeighted(dim)
+        self.norm = RMSNormWeighted(dim)
         self.mlstm = mLSTMLayer(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
-        self.norm_ffn = RMSNormWeighted(dim)
-        self.ffn = FFN(dim, ffn_mult)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x + self.mlstm(self.norm_mlstm(x))
-        x = x + self.ffn(self.norm_ffn(x))
-        return x
+        return x + self.mlstm(self.norm(x))
 
 
 class xLSTM(nn.Module):
     """xLSTM language model: embedding → mLSTM blocks → final norm → tied LM head."""
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int,
-                 qk_dim_factor: float, v_dim_factor: float, ffn_mult: float,
+                 qk_dim_factor: float, v_dim_factor: float,
                  gate_soft_cap: float, logit_softcap: float, logit_chunk_tokens: int,
                  tied_embed_init_std: float):
         super().__init__()
@@ -521,15 +503,14 @@ class xLSTM(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.blocks = [
-            mLSTMBlock(dim, num_heads, qk_dim_factor, v_dim_factor, ffn_mult, gate_soft_cap)
+            mLSTMBlock(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
             for _ in range(num_layers)
         ]
         self.final_norm = RMSNormWeighted(dim)
 
-        # Zero-init output projections (like the GPT baseline) + gate initialization
+        # Zero-init output projections + gate initialization
         for b in self.blocks:
             b.mlstm.out_proj.weight = mx.zeros_like(b.mlstm.out_proj.weight)
-            b.ffn.down_proj.weight = mx.zeros_like(b.ffn.down_proj.weight)
             # Forget gate: bias=linspace(3.0, 6.0), weight already zeros
             b.mlstm.fgate_preact.bias = mx.linspace(3.0, 6.0, num_heads)
             # Input gate: bias=normal(0, 0.1), weight already zeros
@@ -966,7 +947,6 @@ def main() -> None:
         num_heads=args.num_heads,
         qk_dim_factor=args.qk_dim_factor,
         v_dim_factor=args.v_dim_factor,
-        ffn_mult=args.ffn_mult,
         gate_soft_cap=args.gate_soft_cap,
         logit_softcap=args.logit_softcap,
         logit_chunk_tokens=args.logit_chunk_tokens,
@@ -1002,7 +982,6 @@ def main() -> None:
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} "
         f"qk_dim_factor:{args.qk_dim_factor} v_dim_factor:{args.v_dim_factor} "
-        f"ffn_mult:{args.ffn_mult} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(

@@ -57,7 +57,7 @@ class Hyperparameters:
 
     # Model — xLSTM architecture.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 6))
+    num_layers = int(os.environ.get("NUM_LAYERS", 13))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 4))
     qk_dim_factor = float(os.environ.get("QK_DIM_FACTOR", 0.5))
@@ -499,50 +499,32 @@ class mLSTMLayer(nn.Module):
         return self.out_proj(h_out)
 
 
-class FFN(nn.Module):
-    """SiLU-gated feedforward (SwiGLU-style)."""
-    def __init__(self, dim: int, ffn_mult: float):
-        super().__init__()
-        hidden = int(dim * ffn_mult)
-        hidden = ((hidden + 63) // 64) * 64  # round to multiple of 64
-        self.gate_proj = CastedLinear(dim, hidden, bias=False)
-        self.up_proj = CastedLinear(dim, hidden, bias=False)
-        self.down_proj = CastedLinear(hidden, dim, bias=False)
-        self.down_proj._zero_init = True
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
 class mLSTMBlock(nn.Module):
-    """Pre-norm mLSTM + pre-norm FFN, both with residual connections."""
-    def __init__(self, dim, num_heads, qk_dim_factor, v_dim_factor, ffn_mult, gate_soft_cap):
+    """Pre-norm mLSTM with residual connection (no separate FFN — the mLSTM layer's
+    internal up-proj/gate/down-proj provides channel mixing)."""
+    def __init__(self, dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap):
         super().__init__()
-        self.norm_mlstm = RMSNormWeighted(dim)
+        self.norm = RMSNormWeighted(dim)
         self.mlstm = mLSTMLayer(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
-        self.norm_ffn = RMSNormWeighted(dim)
-        self.ffn = FFN(dim, ffn_mult)
 
     def forward(self, x: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
-        n = self.norm_mlstm(x)
+        n = self.norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
-        x = x + self.mlstm(n, qd, vd)
-        x = x + self.ffn(self.norm_ffn(x))
-        return x
+        return x + self.mlstm(n, qd, vd)
 
 
 class xLSTM(nn.Module):
     """xLSTM language model: embedding → mLSTM blocks → final norm → tied LM head."""
     def __init__(self, vocab_size, num_layers, dim, num_heads, qk_dim_factor, v_dim_factor,
-                 ffn_mult, gate_soft_cap, logit_softcap, tied_embed_init_std):
+                 gate_soft_cap, logit_softcap, tied_embed_init_std):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([
-            mLSTMBlock(dim, num_heads, qk_dim_factor, v_dim_factor, ffn_mult, gate_soft_cap)
+            mLSTMBlock(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
             for _ in range(num_layers)
         ])
         self.final_norm = RMSNormWeighted(dim)
@@ -752,7 +734,7 @@ def main():
     base_model = xLSTM(
         vocab_size=args.vocab_size, num_layers=args.num_layers, dim=args.model_dim,
         num_heads=args.num_heads, qk_dim_factor=args.qk_dim_factor, v_dim_factor=args.v_dim_factor,
-        ffn_mult=args.ffn_mult, gate_soft_cap=args.gate_soft_cap, logit_softcap=args.logit_softcap,
+        gate_soft_cap=args.gate_soft_cap, logit_softcap=args.logit_softcap,
         tied_embed_init_std=args.tied_embed_init_std,
     ).to(device).bfloat16()
     for module in base_model.modules():
