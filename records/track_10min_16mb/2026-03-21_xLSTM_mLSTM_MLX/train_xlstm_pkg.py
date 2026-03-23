@@ -401,7 +401,7 @@ def main():
     global zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    # zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0")); world_size = int(os.environ.get("WORLD_SIZE", "1")); local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -442,11 +442,10 @@ def main():
     base_model = build_model(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
 
-    compiled_model = torch.compile(base_model, dynamic=False)
     if distributed:
-        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        model = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False)
     else:
-        model = compiled_model
+        model = base_model
 
     def train_forward(x, y):
         logits = model(x)
