@@ -490,7 +490,7 @@ class mLSTMLayer(nn.Module):
 
         # Normalizer: max(|sum of gated attention weights|, exp(-max_log_D)) + eps
         normalizer = torch.clamp(attn.sum(dim=-1, keepdim=True).abs(),
-                                 min=torch.exp(-max_log_D.clamp(max=80.0)))
+                                 min=torch.exp((-max_log_D).clamp(max=80.0)))
         h = h / (normalizer + self.eps)
 
         # Multi-head norm -> skip connection + SiLU(z) output gating -> project

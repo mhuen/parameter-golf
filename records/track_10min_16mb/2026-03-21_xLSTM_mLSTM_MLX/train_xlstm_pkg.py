@@ -69,10 +69,11 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     embed_init_std = float(os.environ.get("EMBED_INIT_STD", 0.005))
 
-    # Kernel backend.
-    chunkwise_kernel = os.environ.get("CHUNKWISE_KERNEL", "chunkwise--triton_xl_chunk")
-    sequence_kernel = os.environ.get("SEQUENCE_KERNEL", "native_sequence__triton")
-    step_kernel = os.environ.get("STEP_KERNEL", "triton")
+    # Kernel backend (native = pure PyTorch, no Triton; avoids LLVM bug).
+    # Triton alternatives: "chunkwise--triton_xl_chunk", "native_sequence__triton", "triton"
+    chunkwise_kernel = os.environ.get("CHUNKWISE_KERNEL", "chunkwise--native_autograd")
+    sequence_kernel = os.environ.get("SEQUENCE_KERNEL", "native_sequence__native")
+    step_kernel = os.environ.get("STEP_KERNEL", "native")
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -397,10 +398,10 @@ def restore_low_dim_params_to_fp32(module):
 # -----------------------------
 
 def main():
+    global zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    # NOTE: torch.compile is disabled — it triggers an LLVM SLPVectorizer assertion
-    # when combined with Triton kernels from mlstm_kernels.
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0")); world_size = int(os.environ.get("WORLD_SIZE", "1")); local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -441,20 +442,16 @@ def main():
     base_model = build_model(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
 
-    # No torch.compile on the model — mlstm_kernels already provides optimized
-    # Triton kernels, and torch.compile conflicts with them (LLVM assertion).
-    def forward_with_loss(model_fn, x, y):
-        logits = model_fn(x)
+    compiled_model = torch.compile(base_model, dynamic=False)
+    if distributed:
+        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+    else:
+        model = compiled_model
+
+    def train_forward(x, y):
+        logits = model(x)
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
                                y.reshape(-1), reduction="mean")
-
-    if distributed:
-        ddp_model = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False)
-        def train_forward(x, y):
-            return forward_with_loss(ddp_model, x, y)
-    else:
-        def train_forward(x, y):
-            return forward_with_loss(base_model, x, y)
 
     # Optimizer split: 2D backbone params (excluding control) → Muon, rest → Adam.
     # Separate embedding and lm_head since no weight tying.
@@ -504,7 +501,7 @@ def main():
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
-                if distributed: ddp_model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16): warmup_loss = train_forward(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -515,7 +512,7 @@ def main():
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True): opt.load_state_dict(state)
         zero_grad_all()
-        if distributed: ddp_model.require_backward_grad_sync = True
+        if distributed: model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # Eval forward uses non-DDP path
@@ -543,7 +540,7 @@ def main():
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            if distributed: ddp_model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16): loss = train_forward(x, y)
             train_loss += loss.detach(); (loss * grad_scale).backward()
