@@ -378,8 +378,27 @@ class MultiHeadNorm(nn.Module):
         return x_normed.to(dtype=x.dtype)
 
 
+class PerHeadGate(nn.Module):
+    """Per-head linear gate: each head has its own weight vector and scalar bias."""
+    def __init__(self, num_heads: int, head_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(num_heads, head_dim))
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, NH, S, D] -> [B, NH, S]
+        w = self.weight.to(x.dtype)
+        b = self.bias.to(x.dtype)
+        return (x * w[None, :, None, :]).sum(dim=-1) + b[None, :, None]
+
+
 class mLSTMLayer(nn.Module):
-    """mLSTM layer using the parallel form during training."""
+    """mLSTM layer matching the official xLSTM architecture (Beck et al. 2024).
+
+    Up-proj -> split(x_mlstm, z) -> causal conv1d + SiLU on x_mlstm ->
+    q,k from conv branch, v from raw -> parallel mLSTM cell ->
+    multihead norm -> skip + SiLU(z) gating -> down-proj.
+    """
     def __init__(self, dim: int, num_heads: int, qk_dim_factor: float, v_dim_factor: float,
                  gate_soft_cap: float, eps: float = 1e-6):
         super().__init__()
@@ -388,17 +407,30 @@ class mLSTMLayer(nn.Module):
         self.v_dim = int(dim * v_dim_factor)
         self.head_qk_dim = self.qk_dim // num_heads
         self.head_v_dim = self.v_dim // num_heads
-        self.gate_soft_cap = gate_soft_cap
         self.eps = eps
         self.scale = self.head_qk_dim ** -0.5
 
-        self.c_q = CastedLinear(dim, self.qk_dim, bias=False)
-        self.c_k = CastedLinear(dim, self.qk_dim, bias=False)
-        self.c_v = CastedLinear(dim, self.v_dim, bias=False)
-        self.c_ogate = CastedLinear(dim, self.v_dim, bias=False)
-        self.igate_preact = CastedLinear(dim, num_heads, bias=True)
-        self.fgate_preact = CastedLinear(dim, num_heads, bias=True)
+        # Up-projection: dim -> 2 * v_dim, split into x_mlstm and z
+        self.up_proj = CastedLinear(dim, 2 * self.v_dim, bias=False)
 
+        # Causal depthwise conv1d on x_mlstm branch (kernel=4, left-pad by 3)
+        self.conv1d = nn.Conv1d(self.v_dim, self.v_dim, kernel_size=4,
+                                padding=0, groups=self.v_dim, bias=True)
+
+        # Q, K from conv-activated branch; V from raw x_mlstm
+        self.c_q = CastedLinear(self.v_dim, self.qk_dim, bias=False)
+        self.c_k = CastedLinear(self.v_dim, self.qk_dim, bias=False)
+        self.c_v = CastedLinear(self.v_dim, self.v_dim, bias=False)
+
+        # Per-head gates from concatenated [q, k, v] per head
+        head_gate_dim = self.head_qk_dim * 2 + self.head_v_dim
+        self.igate_preact = PerHeadGate(num_heads, head_gate_dim)
+        self.fgate_preact = PerHeadGate(num_heads, head_gate_dim)
+
+        # Learnable skip connection
+        self.learnable_skip = nn.Parameter(torch.ones(1))
+
+        # Multi-head norm and down-projection
         self.multihead_norm = MultiHeadNorm(num_heads, self.head_v_dim, eps=eps)
         self.out_proj = CastedLinear(self.v_dim, dim, bias=False)
 
@@ -406,20 +438,30 @@ class mLSTMLayer(nn.Module):
         B, S, D = x.shape
         NH = self.num_heads
 
-        q = self.c_q(x) + (q_delta if q_delta is not None else 0)
+        # Up-project and split into x_mlstm and z (output gate branch)
+        up = self.up_proj(x)  # [B, S, 2 * v_dim]
+        x_mlstm, z = up[..., :self.v_dim], up[..., self.v_dim:]  # each [B, S, v_dim]
+
+        # Causal conv1d + SiLU on x_mlstm
+        x_conv = F.pad(x_mlstm.transpose(1, 2), (3, 0))  # [B, v_dim, S+3]
+        x_conv = self.conv1d(x_conv).transpose(1, 2)  # [B, S, v_dim]
+        x_conv_act = F.silu(x_conv)
+
+        # Q, K from conv-activated; V from raw x_mlstm
+        q = self.c_q(x_conv_act) + (q_delta if q_delta is not None else 0)
         q = q.reshape(B, S, NH, self.head_qk_dim).transpose(1, 2)  # [B, NH, S, d_qk]
-        k = self.c_k(x).reshape(B, S, NH, self.head_qk_dim).transpose(1, 2)
-        v = self.c_v(x) + (v_delta if v_delta is not None else 0)
-        v = v.reshape(B, S, NH, self.head_v_dim).transpose(1, 2)    # [B, NH, S, d_v]
-        o_preact = self.c_ogate(x)  # [B, S, v_dim]
+        k = self.c_k(x_conv_act).reshape(B, S, NH, self.head_qk_dim).transpose(1, 2)
+        v = self.c_v(x_mlstm) + (v_delta if v_delta is not None else 0)
+        v = v.reshape(B, S, NH, self.head_v_dim).transpose(1, 2)  # [B, NH, S, d_v]
 
-        # Scalar gates per head (soft-capped)
-        i_pre = soft_cap(self.igate_preact(x), self.gate_soft_cap).transpose(1, 2)  # [B, NH, S]
-        f_pre = soft_cap(self.fgate_preact(x), self.gate_soft_cap).transpose(1, 2)
+        # Per-head gates from concatenated [q, k, v]
+        gate_input = torch.cat([q, k, v], dim=-1)  # [B, NH, S, head_gate_dim]
+        i_pre = self.igate_preact(gate_input)  # [B, NH, S]
+        f_pre = self.fgate_preact(gate_input)  # [B, NH, S]
 
-        # Log-space gates
+        # Log-space gates: forget uses sigmoid, input uses exponential gating
         log_f = F.logsigmoid(f_pre)  # [B, NH, S]
-        log_i = F.logsigmoid(i_pre)
+        log_i = i_pre  # exponential input gate: log(exp(i)) = i
 
         # Cumulative log forget gate
         log_f_cumsum = torch.cumsum(log_f, dim=-1)  # [B, NH, S]
@@ -432,6 +474,10 @@ class mLSTMLayer(nn.Module):
         # Causal mask
         causal = torch.tril(torch.ones(S, S, dtype=torch.bool, device=x.device))
         log_D = torch.where(causal, log_D, torch.tensor(-1e9, device=x.device))
+
+        # Stabilize: subtract row-wise max before exp
+        max_log_D = log_D.max(dim=-1, keepdim=True).values  # [B, NH, S, 1]
+        log_D = log_D - max_log_D
         log_D = log_D.clamp(max=80.0)
         D = torch.exp(log_D)  # [B, NH, S, S]
 
@@ -442,13 +488,14 @@ class mLSTMLayer(nn.Module):
         # Weighted sum of values
         h = attn @ v  # [B, NH, S, d_v]
 
-        # Normalizer: max(|sum of gated weights per row|, 1)
-        normalizer = torch.clamp(attn.sum(dim=-1, keepdim=True).abs(), min=1.0)
+        # Normalizer: max(|sum of gated attention weights|, exp(-max_log_D))
+        normalizer = torch.clamp(attn.sum(dim=-1, keepdim=True).abs(),
+                                 min=torch.exp(-max_log_D))
         h = h / normalizer
 
-        # Multi-head norm → sigmoid output gate → project
+        # Multi-head norm -> skip connection + SiLU(z) output gating -> project
         h_norm = self.multihead_norm(h)  # [B, S, v_dim]
-        h_out = torch.sigmoid(o_preact) * h_norm
+        h_out = F.silu(z) * (h_norm + self.learnable_skip * x_conv_act)
         return self.out_proj(h_out)
 
 
@@ -507,6 +554,12 @@ class xLSTM(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            if isinstance(module, mLSTMLayer):
+                # Forget gate: weight=zeros (already), bias=linspace(3.0, 6.0)
+                with torch.no_grad():
+                    module.fgate_preact.bias.copy_(torch.linspace(3.0, 6.0, module.num_heads))
+                # Input gate: weight=zeros (already), bias=normal(0, 0.1)
+                nn.init.normal_(module.igate_preact.bias, mean=0.0, std=0.1)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)

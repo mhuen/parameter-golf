@@ -344,12 +344,42 @@ class MultiHeadNorm(nn.Module):
         return x_normed.astype(x.dtype)
 
 
-class mLSTMLayer(nn.Module):
-    """Pure MLX implementation of the mLSTM layer from xLSTM (Beck et al. 2024).
+class CausalConv1d(nn.Module):
+    """Causal depthwise conv1d with left-padding."""
+    def __init__(self, channels: int, kernel_size: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        scale = 1.0 / math.sqrt(kernel_size)
+        self.weight = mx.random.uniform(-scale, scale, (channels, 1, kernel_size))
+        self.bias = mx.zeros((channels,))
 
-    Uses the parallel form during training: materializes an [S, S] gating matrix
-    that combines forget/input gates with query-key similarities, then applies it
-    to values — similar to causal linear attention with learned decay.
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: [B, S, C] -> causal conv1d with left-padding
+        x_padded = mx.pad(x, [(0, 0), (self.kernel_size - 1, 0), (0, 0)])
+        return mx.conv1d(x_padded, self.weight, groups=self.channels) + self.bias
+
+
+class PerHeadGate(nn.Module):
+    """Per-head linear gate: each head has its own weight vector and scalar bias."""
+    def __init__(self, num_heads: int, head_dim: int):
+        super().__init__()
+        self.weight = mx.zeros((num_heads, head_dim))
+        self.bias = mx.zeros((num_heads,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        # x: [B, NH, S, D] -> [B, NH, S]
+        w = self.weight.astype(x.dtype)
+        b = self.bias.astype(x.dtype)
+        return (x * w[None, :, None, :]).sum(axis=-1) + b[None, :, None]
+
+
+class mLSTMLayer(nn.Module):
+    """mLSTM layer matching the official xLSTM architecture (Beck et al. 2024).
+
+    Up-proj -> split(x_mlstm, z) -> causal conv1d + SiLU on x_mlstm ->
+    q,k from conv branch, v from raw -> parallel mLSTM cell ->
+    multihead norm -> skip + SiLU(z) gating -> down-proj.
     """
     def __init__(self, dim: int, num_heads: int, qk_dim_factor: float, v_dim_factor: float,
                  gate_soft_cap: float, eps: float = 1e-6):
@@ -359,19 +389,29 @@ class mLSTMLayer(nn.Module):
         self.v_dim = int(dim * v_dim_factor)
         self.head_qk_dim = self.qk_dim // num_heads
         self.head_v_dim = self.v_dim // num_heads
-        self.gate_soft_cap = gate_soft_cap
         self.eps = eps
         self.scale = self.head_qk_dim ** -0.5
 
-        # Projections: q, k, v, output gate, input gate, forget gate
-        self.c_q = CastedLinear(dim, self.qk_dim)
-        self.c_k = CastedLinear(dim, self.qk_dim)
-        self.c_v = CastedLinear(dim, self.v_dim)
-        self.c_ogate = CastedLinear(dim, self.v_dim)
-        self.igate_preact = CastedLinear(dim, num_heads, bias=True)
-        self.fgate_preact = CastedLinear(dim, num_heads, bias=True)
+        # Up-projection: dim -> 2 * v_dim, split into x_mlstm and z
+        self.up_proj = CastedLinear(dim, 2 * self.v_dim)
 
-        # Multi-head normalization and output projection
+        # Causal depthwise conv1d on x_mlstm branch (kernel=4)
+        self.conv1d = CausalConv1d(self.v_dim, kernel_size=4)
+
+        # Q, K from conv-activated branch; V from raw x_mlstm
+        self.c_q = CastedLinear(self.v_dim, self.qk_dim)
+        self.c_k = CastedLinear(self.v_dim, self.qk_dim)
+        self.c_v = CastedLinear(self.v_dim, self.v_dim)
+
+        # Per-head gates from concatenated [q, k, v] per head
+        head_gate_dim = self.head_qk_dim * 2 + self.head_v_dim
+        self.igate_preact = PerHeadGate(num_heads, head_gate_dim)
+        self.fgate_preact = PerHeadGate(num_heads, head_gate_dim)
+
+        # Learnable skip connection
+        self.learnable_skip = mx.array([1.0])
+
+        # Multi-head norm and down-projection
         self.multihead_norm = MultiHeadNorm(num_heads, self.head_v_dim, eps=eps)
         self.out_proj = CastedLinear(self.v_dim, dim)
 
@@ -379,54 +419,60 @@ class mLSTMLayer(nn.Module):
         B, S, D = x.shape
         NH = self.num_heads
 
-        # Project to q, k, v and gates
-        q = self.c_q(x).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)  # [B, NH, S, d_qk]
-        k = self.c_k(x).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(B, S, NH, self.head_v_dim).transpose(0, 2, 1, 3)    # [B, NH, S, d_v]
-        o_preact = self.c_ogate(x)  # [B, S, v_dim]
+        # Up-project and split into x_mlstm and z (output gate branch)
+        up = self.up_proj(x)  # [B, S, 2 * v_dim]
+        x_mlstm, z = up[..., :self.v_dim], up[..., self.v_dim:]  # each [B, S, v_dim]
 
-        # Scalar gates per head (soft-capped)
-        i_pre = soft_cap(self.igate_preact(x), self.gate_soft_cap)  # [B, S, NH]
-        f_pre = soft_cap(self.fgate_preact(x), self.gate_soft_cap)  # [B, S, NH]
-        i_pre = i_pre.transpose(0, 2, 1)  # [B, NH, S]
-        f_pre = f_pre.transpose(0, 2, 1)
+        # Causal conv1d + SiLU on x_mlstm
+        x_conv_act = nn.silu(self.conv1d(x_mlstm))  # [B, S, v_dim]
 
-        # Log-space gates for numerical stability
+        # Q, K from conv-activated; V from raw x_mlstm
+        q = self.c_q(x_conv_act).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)  # [B, NH, S, d_qk]
+        k = self.c_k(x_conv_act).reshape(B, S, NH, self.head_qk_dim).transpose(0, 2, 1, 3)
+        v = self.c_v(x_mlstm).reshape(B, S, NH, self.head_v_dim).transpose(0, 2, 1, 3)  # [B, NH, S, d_v]
+
+        # Per-head gates from concatenated [q, k, v]
+        gate_input = mx.concatenate([q, k, v], axis=-1)  # [B, NH, S, head_gate_dim]
+        i_pre = self.igate_preact(gate_input)  # [B, NH, S]
+        f_pre = self.fgate_preact(gate_input)  # [B, NH, S]
+
+        # Log-space gates: forget uses sigmoid, input uses exponential gating
         log_f = log_sigmoid(f_pre)  # [B, NH, S]
-        log_i = log_sigmoid(i_pre)  # [B, NH, S]
+        log_i = i_pre  # exponential input gate: log(exp(i)) = i
 
         # Cumulative log forget gate
         log_f_cumsum = mx.cumsum(log_f, axis=-1)  # [B, NH, S]
 
-        # Gating matrix in log space: log_D[t,s] = cumsum_f[t] - cumsum_f[s] + log_i[s]
-        # Shape: [B, NH, S, S] — this is the key "parallel form" computation
-        log_D = (log_f_cumsum[:, :, :, None]       # [B, NH, S, 1]  (target positions)
-                 - log_f_cumsum[:, :, None, :]      # [B, NH, 1, S]  (source positions)
-                 + log_i[:, :, None, :])            # [B, NH, 1, S]  (input gate at source)
+        # Gating matrix: log_D[t,s] = cumsum_f[t] - cumsum_f[s] + log_i[s]
+        log_D = (log_f_cumsum[:, :, :, None]
+                 - log_f_cumsum[:, :, None, :]
+                 + log_i[:, :, None, :])  # [B, NH, S, S]
 
-        # Causal mask: only attend to past and present
+        # Causal mask
         causal = mx.tril(mx.ones((S, S), dtype=mx.bool_))
         log_D = mx.where(causal, log_D, mx.array(-1e9))
-        # Clamp to prevent exp() overflow in bfloat16 (max representable ~ 3.4e38, exp(88) ~ 1.6e38)
+
+        # Stabilize: subtract row-wise max before exp
+        max_log_D = mx.max(log_D, axis=-1, keepdims=True)  # [B, NH, S, 1]
+        log_D = log_D - max_log_D
         log_D = mx.clip(log_D, a_min=None, a_max=80.0)
         D = mx.exp(log_D)  # [B, NH, S, S]
 
-        # Query-key similarity scaled by sqrt(d_qk)
+        # Gated attention
         qk = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # [B, NH, S, S]
-
-        # Gated attention: combine data-dependent gating with content-based similarity
         attn = D * qk  # [B, NH, S, S]
 
         # Weighted sum of values
         h = attn @ v  # [B, NH, S, d_v]
 
-        # Normalizer: max(|sum of gated attention weights per row|, 1)
-        normalizer = mx.maximum(mx.abs(attn.sum(axis=-1, keepdims=True)), mx.array(1.0))
+        # Normalizer: max(|sum of gated attention weights|, exp(-max_log_D))
+        normalizer = mx.maximum(mx.abs(attn.sum(axis=-1, keepdims=True)),
+                                mx.exp(-max_log_D))
         h = h / normalizer
 
-        # Multi-head norm → sigmoid output gate → project out
+        # Multi-head norm -> skip connection + SiLU(z) output gating -> project
         h_norm = self.multihead_norm(h)  # [B, S, v_dim]
-        h_out = mx.sigmoid(o_preact) * h_norm
+        h_out = nn.silu(z) * (h_norm + self.learnable_skip * x_conv_act)
         return self.out_proj(h_out)
 
 
@@ -480,10 +526,14 @@ class xLSTM(nn.Module):
         ]
         self.final_norm = RMSNormWeighted(dim)
 
-        # Zero-init output projections (like the GPT baseline)
+        # Zero-init output projections (like the GPT baseline) + gate initialization
         for b in self.blocks:
             b.mlstm.out_proj.weight = mx.zeros_like(b.mlstm.out_proj.weight)
             b.ffn.down_proj.weight = mx.zeros_like(b.ffn.down_proj.weight)
+            # Forget gate: bias=linspace(3.0, 6.0), weight already zeros
+            b.mlstm.fgate_preact.bias = mx.linspace(3.0, 6.0, num_heads)
+            # Input gate: bias=normal(0, 0.1), weight already zeros
+            b.mlstm.igate_preact.bias = mx.random.normal((num_heads,)) * 0.1
 
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
