@@ -397,10 +397,10 @@ def restore_low_dim_params_to_fp32(module):
 # -----------------------------
 
 def main():
-    global zeropower_via_newtonschulz5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    # NOTE: torch.compile is disabled — it triggers an LLVM SLPVectorizer assertion
+    # when combined with Triton kernels from mlstm_kernels.
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0")); world_size = int(os.environ.get("WORLD_SIZE", "1")); local_rank = int(os.environ.get("LOCAL_RANK", "0"))
