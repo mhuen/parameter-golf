@@ -465,10 +465,10 @@ class mLSTMLayer(nn.Module):
         # Weighted sum of values
         h = attn @ v  # [B, NH, S, d_v]
 
-        # Normalizer: max(|sum of gated attention weights|, exp(-max_log_D))
+        # Normalizer: max(|sum of gated attention weights|, exp(-max_log_D)) + eps
         normalizer = mx.maximum(mx.abs(attn.sum(axis=-1, keepdims=True)),
-                                mx.exp(-max_log_D))
-        h = h / normalizer
+                                mx.exp(mx.clip(-max_log_D, a_min=None, a_max=80.0)))
+        h = h / (normalizer + self.eps)
 
         # Multi-head norm -> skip connection + SiLU(z) output gating -> project
         h_norm = self.multihead_norm(h)  # [B, S, v_dim]
