@@ -386,15 +386,6 @@ def _custom_init(model: xLSTMLarge, args):
                 layer.ifgate_preact.bias[nh:].copy_(torch.linspace(3.0, 6.0, nh))
 
 
-def make_forward_fn(model):
-    """Return a function (input_ids, target_ids) -> scalar loss."""
-    def forward_fn(input_ids, target_ids):
-        logits = model(input_ids)  # [B, S, V]
-        return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
-                               target_ids.reshape(-1), reduction="mean")
-    return forward_fn
-
-
 def restore_low_dim_params_to_fp32(module):
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -450,18 +441,20 @@ def main():
     base_model = build_model(args).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
 
-    forward_fn = make_forward_fn(base_model)
-    compiled_forward_fn = torch.compile(forward_fn, dynamic=False)
+    # No torch.compile on the model — mlstm_kernels already provides optimized
+    # Triton kernels, and torch.compile conflicts with them (LLVM assertion).
+    def forward_with_loss(model_fn, x, y):
+        logits = model_fn(x)
+        return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
+                               y.reshape(-1), reduction="mean")
 
-    # For DDP we wrap the whole model
     if distributed:
         ddp_model = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False)
         def train_forward(x, y):
-            logits = ddp_model(x)
-            return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
-                                   y.reshape(-1), reduction="mean")
+            return forward_with_loss(ddp_model, x, y)
     else:
-        train_forward = compiled_forward_fn
+        def train_forward(x, y):
+            return forward_with_loss(base_model, x, y)
 
     # Optimizer split: 2D backbone params (excluding control) → Muon, rest → Adam.
     # Separate embedding and lm_head since no weight tying.
@@ -525,7 +518,7 @@ def main():
         if distributed: ddp_model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # Eval forward uses compiled non-DDP path
+    # Eval forward uses non-DDP path
     def eval_forward(x, y):
         logits = base_model(x)
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)),
