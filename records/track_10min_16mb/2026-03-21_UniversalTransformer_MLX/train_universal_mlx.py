@@ -6,9 +6,9 @@ Key idea: transformer blocks (attention + MLP) are shared across groups of layer
 with only per-layer scalars (attn_scale, mlp_scale, resid_mix) being unique per
 application. This is ALBERT-style weight sharing.
 
-Default config: 21 layers with 7 shared blocks (3 layers per block), dim=512,
-8 heads, 4 KV heads, SwiGLU MLP (2x expansion). This matches the baseline
-parameter budget (~17M params) while providing 2.3x more depth via weight sharing.
+Default config: 27 layers with 9 shared blocks (3 layers per block), dim=512,
+8 heads, 4 KV heads, relu^2 MLP (2x expansion). This matches the baseline
+parameter budget (~17M params) while providing 3x more depth via weight sharing.
 
 The BLOCK_PATTERN env var controls which layers share weights. Set to "" for a
 single shared block across all layers (extreme sharing), or specify per-layer
@@ -48,8 +48,8 @@ COMPUTE_DTYPE = mx.bfloat16
 # HYPERPARAMETERS
 # ==============================================================================
 # Universal Transformer config:
-# - 21 layers with 7 shared blocks (3 layers per block) at width 512
-# - 8 attention heads with 4 KV heads (GQA) and SwiGLU MLP (2x expansion)
+# - 27 layers with 9 shared blocks (3 layers per block) at width 512
+# - 8 attention heads with 4 KV heads (GQA) and relu^2 MLP (2x expansion)
 # - vocab size 1024, sequence length 1024, tied embeddings
 # - ~17.1M params, matches baseline parameter budget
 class Hyperparameters:
@@ -80,9 +80,9 @@ class Hyperparameters:
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model — 21 layers with 7 shared blocks (3 layers per block), width 512, SwiGLU MLP.
+    # Model — 27 layers with 9 shared blocks (3 layers per block), width 512, relu^2 MLP.
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers: int = int(os.environ.get("NUM_LAYERS", 21))
+    num_layers: int = int(os.environ.get("NUM_LAYERS", 27))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -96,7 +96,7 @@ class Hyperparameters:
     # Block sharing pattern: comma-separated block indices per layer.
     # E.g. "0,0,0,1,1,1" means layers 0-2 share block 0, layers 3-5 share block 1.
     # Default "" means all layers share a single block (original behavior).
-    block_pattern: str = os.environ.get("BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6")
+    block_pattern: str = os.environ.get("BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8")
 
     # Optimizer.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -375,18 +375,17 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-class SwiGLU(nn.Module):
-    """SwiGLU MLP: gate and up projections with SiLU gating, then down projection."""
-
+class MLP(nn.Module):
+    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.gate = CastedLinear(dim, hidden)
-        self.up = CastedLinear(dim, hidden)
-        self.down = CastedLinear(hidden, dim)
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden)
+        self.proj = CastedLinear(hidden, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down(nn.silu(self.gate(x)) * self.up(x))
+        x = nn.relu(self.fc(x))
+        return self.proj(x * x)
 
 
 class SharedBlock(nn.Module):
@@ -407,7 +406,7 @@ class SharedBlock(nn.Module):
         self.attn = CausalSelfAttention(
             dim, num_heads, num_kv_heads, rope_base, qk_gain_init
         )
-        self.mlp = SwiGLU(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult)
 
     def __call__(
         self, x: mx.array, attn_scale: mx.array, mlp_scale: mx.array
@@ -483,7 +482,7 @@ class GPT(nn.Module):
         # Zero-init output projections for residual-friendly start.
         for block in self.shared_blocks:
             block.attn.proj.weight = mx.zeros_like(block.attn.proj.weight)
-            block.mlp.down.weight = mx.zeros_like(block.mlp.down.weight)
+            block.mlp.proj.weight = mx.zeros_like(block.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32)
             * tied_embed_init_std

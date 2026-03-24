@@ -5,9 +5,9 @@ Key idea: transformer blocks (attention + MLP) are shared across groups of layer
 with only per-layer scalars (attn_scale, mlp_scale, resid_mix) being unique per
 application. This is ALBERT-style weight sharing.
 
-Default config: 21 layers with 7 shared blocks (3 layers per block), dim=512,
-8 heads, 4 KV heads, SwiGLU MLP (2x expansion). This matches the baseline
-parameter budget (~17M params) while providing 2.3x more depth via weight sharing.
+Default config: 27 layers with 9 shared blocks (3 layers per block), dim=512,
+8 heads, 4 KV heads, relu^2 MLP (2x expansion). This matches the baseline
+parameter budget (~17M params) while providing 3x more depth via weight sharing.
 
 The BLOCK_PATTERN env var controls which layers share weights. Set to "" for a
 single shared block across all layers (extreme sharing), or specify per-layer
@@ -65,9 +65,9 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model — 21 layers with 7 shared blocks (3 layers per block), width 512, SwiGLU MLP.
+    # Model — 27 layers with 9 shared blocks (3 layers per block), width 512, relu^2 MLP.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 21))
+    num_layers = int(os.environ.get("NUM_LAYERS", 27))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -79,7 +79,7 @@ class Hyperparameters:
     # E.g. "0,0,0,1,1,1" means layers 0-2 share block 0, layers 3-5 share block 1.
     # Default "" means all layers share a single block (original behavior).
     block_pattern = os.environ.get(
-        "BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6"
+        "BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8"
     )
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -568,9 +568,15 @@ def apply_rotary_emb(x, cos, sin):
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
         kv_dim = num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -607,19 +613,18 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
 
 
-class SwiGLU(nn.Module):
-    """SwiGLU MLP: gate and up projections with SiLU gating, then down projection."""
-
+class MLP(nn.Module):
+    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim, mlp_mult):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.gate = CastedLinear(dim, hidden, bias=False)
-        self.up = CastedLinear(dim, hidden, bias=False)
-        self.down = CastedLinear(hidden, dim, bias=False)
-        self.down._zero_init = True
+        hidden = mlp_mult * dim
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.proj._zero_init = True
 
     def forward(self, x):
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        x = torch.relu(self.fc(x))
+        return self.proj(x.square())
 
 
 class SharedBlock(nn.Module):
@@ -632,7 +637,7 @@ class SharedBlock(nn.Module):
         self.attn = CausalSelfAttention(
             dim, num_heads, num_kv_heads, rope_base, qk_gain_init
         )
-        self.mlp = SwiGLU(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult)
 
     def forward(self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None):
         n = self.attn_norm(x)
@@ -1031,6 +1036,8 @@ def main():
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 0:
+        raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if "GRAD_ACCUM_STEPS" in os.environ:
         grad_accum_steps = int(os.environ["GRAD_ACCUM_STEPS"])
     else:
@@ -1097,6 +1104,10 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
+    if not args.tokenizer_path.endswith(".model"):
+        raise ValueError(
+            f"TOKENIZER_PATH must point to a SentencePiece .model file: {args.tokenizer_path}"
+        )
     sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
     if int(sp.vocab_size()) != args.vocab_size:
         raise ValueError(
@@ -1113,6 +1124,7 @@ def main():
     log0(
         f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}"
     )
+    log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
 
     base_model = (
@@ -1186,13 +1198,32 @@ def main():
         fused=True,
     )
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.lm_head is not None:
+        optimizer_head = torch.optim.Adam(
+            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
     num_blocks = len(base_model.shared_blocks)
-    log0(
-        f"model_params:{n_params} num_layers:{args.num_layers} model_dim:{args.model_dim} num_blocks:{num_blocks} block_map:{base_model.block_map}"
-    )
+    log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
+        f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
+    log0(
+        f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
+        f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
+        f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
+    )
+    log0(f"num_blocks:{num_blocks} block_map:{base_model.block_map}")
     log0(f"seed:{args.seed}")
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
