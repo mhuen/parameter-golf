@@ -1289,9 +1289,11 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    model_dir = f"models/{datetime.now().strftime('%Y_%m_%d')}"
     if master_process:
-        torch.save(base_model.state_dict(), f"final_model_{args.run_id}.pt")
-        model_bytes = os.path.getsize(f"final_model_{args.run_id}.pt")
+        os.makedirs(model_dir, exist_ok=True)
+        torch.save(base_model.state_dict(), f"{model_dir}/final_model_{args.run_id}.pt")
+        model_bytes = os.path.getsize(f"{model_dir}/final_model_{args.run_id}.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
@@ -1304,9 +1306,9 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open(f"final_model_{args.run_id}.int8.ptz", "wb") as f:
+        with open(f"{model_dir}/final_model_{args.run_id}.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize(f"final_model_{args.run_id}.int8.ptz")
+        quant_file_bytes = os.path.getsize(f"{model_dir}/final_model_{args.run_id}.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(
             quant_stats["int8_payload_bytes"], 1
@@ -1319,7 +1321,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open(f"final_model_{args.run_id}.int8.ptz", "rb") as f:
+    with open(f"{model_dir}/final_model_{args.run_id}.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu"
@@ -1347,7 +1349,7 @@ def main() -> None:
     log0(
         f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
-    log0(f"run_id: {args.run_id} | log_file: logs/{args.run_id}.txt | model_weights: final_model_{args.run_id}.pt | model_compressed: final_model_{args.run_id}.int8.ptz")
+    log0(f"run_id: {args.run_id} | log_file: logs/{args.run_id}.txt | model_weights: {model_dir}/final_model_{args.run_id}.pt | model_compressed: {model_dir}/final_model_{args.run_id}.int8.ptz")
 
     if distributed:
         dist.destroy_process_group()
