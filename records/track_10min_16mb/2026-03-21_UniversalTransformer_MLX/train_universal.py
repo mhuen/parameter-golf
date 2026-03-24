@@ -17,6 +17,7 @@ block indices like "0,0,0,1,1,1,..." for grouped sharing.
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import glob
 import io
 import math
@@ -49,7 +50,7 @@ class Hyperparameters:
     tokenizer_path = os.environ.get(
         "TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model"
     )
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", str(uuid.uuid4())) + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -1479,6 +1480,7 @@ def main():
     log0(
         f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
+    log0(f"run_id: {args.run_id} | log_file: logs/{args.run_id}.txt | model_weights: final_model_{args.run_id}.pt | model_compressed: final_model_{args.run_id}.int8.ptz")
 
     torch._dynamo.reset()
     torch.cuda.synchronize()

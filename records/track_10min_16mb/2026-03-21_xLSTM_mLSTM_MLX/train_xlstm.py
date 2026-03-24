@@ -11,6 +11,7 @@ No encoder/decoder split, no skip connections, no x0 residual mixing.
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import glob
 import io
 import math
@@ -40,7 +41,7 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", str(uuid.uuid4())) + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -930,6 +931,7 @@ def main():
     torch.cuda.synchronize()
     log0(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms")
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"run_id: {args.run_id} | log_file: logs/{args.run_id}.txt | model_weights: final_model_{args.run_id}.pt | model_compressed: final_model_{args.run_id}.int8.ptz")
 
     torch._dynamo.reset(); torch.cuda.synchronize(); t_ttt = time.perf_counter()
     ttt_val_loss, ttt_val_bpb = eval_val_ttt_lora(args, base_model, rank, world_size, device, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
