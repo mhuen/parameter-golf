@@ -105,6 +105,10 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
+    # Packing with document-level attention masking. When enabled, BOS tokens mark
+    # document boundaries and tokens cannot attend across documents within a packed sequence.
+    pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))
+
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -267,8 +271,9 @@ def eval_val(
             )
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
+            doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, doc_mask=doc_mask).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -565,6 +570,16 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
+    """Build a causal block-diagonal attention mask from BOS document boundaries.
+    Tokens only attend to earlier tokens within the same document."""
+    bsz, seq_len = input_ids.shape
+    doc_ids = (input_ids == bos_id).cumsum(dim=1)  # (B, S)
+    same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=input_ids.device))
+    return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
         super().__init__()
@@ -588,7 +603,7 @@ class CausalSelfAttention(nn.Module):
         )
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x, q_delta=None, v_delta=None):
+    def forward(self, x, q_delta=None, v_delta=None, doc_mask=None):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x) + (q_delta if q_delta is not None else 0)
         k = self.c_k(x)
@@ -602,14 +617,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if doc_mask is not None:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=doc_mask,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
 
 
@@ -639,11 +656,11 @@ class SharedBlock(nn.Module):
         )
         self.mlp = MLP(dim, mlp_mult)
 
-    def forward(self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None):
+    def forward(self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None, doc_mask=None):
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
-        attn_out = self.attn(n, qd, vd)
+        attn_out = self.attn(n, qd, vd, doc_mask=doc_mask)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -737,7 +754,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids, target_ids, lora=None):
+    def forward(self, input_ids, target_ids, lora=None, doc_mask=None):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -750,7 +767,7 @@ class GPT(nn.Module):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
             x = self.shared_blocks[self.block_map[i]](
-                x, ls.attn_scale, ls.mlp_scale, qd, vd
+                x, ls.attn_scale, ls.mlp_scale, qd, vd, doc_mask=doc_mask
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -767,7 +784,7 @@ class GPT(nn.Module):
             qd = lora.q_loras[layer_idx] if lora else None
             vd = lora.v_loras[layer_idx] if lora else None
             x = self.shared_blocks[self.block_map[layer_idx]](
-                x, ls.attn_scale, ls.mlp_scale, qd, vd
+                x, ls.attn_scale, ls.mlp_scale, qd, vd, doc_mask=doc_mask
             )
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1065,8 +1082,9 @@ def main():
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    # mem_efficient and math backends needed when using custom attention masks (flash doesn't support them).
+    enable_mem_efficient_sdp(args.pack_doc_mask)
+    enable_math_sdp(args.pack_doc_mask)
 
     logfile = None
     if master_process:
@@ -1212,7 +1230,7 @@ def main():
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} pack_doc_mask:{args.pack_doc_mask}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1273,8 +1291,9 @@ def main():
                 x, y = train_loader.next_batch(
                     args.train_batch_tokens, args.train_seq_len, grad_accum_steps
                 )
+                doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, doc_mask=doc_mask)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1341,8 +1360,9 @@ def main():
             x, y = train_loader.next_batch(
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
+            doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = model(x, y)
+                loss = model(x, y, doc_mask=doc_mask)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
