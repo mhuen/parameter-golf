@@ -678,9 +678,21 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, doc_mask=None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.c_q(x)
+            .reshape(bsz, seqlen, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.c_k(x)
+            .reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.c_v(x)
+            .reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -824,7 +836,11 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = (
+                    x
+                    + self.skip_weights[i].to(dtype=x.dtype)[None, None, :]
+                    * skips.pop()
+                )
             x = self.blocks[self.num_encoder_layers + i](x, x0, doc_mask=doc_mask)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -844,6 +860,7 @@ class GPT(nn.Module):
 # -----------------------------
 
 BOS_ID = 1
+
 
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1272,8 +1289,8 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
+        torch.save(base_model.state_dict(), f"final_model_{args.run_id}.pt")
+        model_bytes = os.path.getsize(f"final_model_{args.run_id}.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
@@ -1286,9 +1303,9 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(f"final_model_{args.run_id}.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(f"final_model_{args.run_id}.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(
             quant_stats["int8_payload_bytes"], 1
@@ -1301,7 +1318,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(f"final_model_{args.run_id}.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(
         io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu"

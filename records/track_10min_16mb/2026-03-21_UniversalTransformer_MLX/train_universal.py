@@ -1432,17 +1432,17 @@ def main():
     )
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
+        torch.save(base_model.state_dict(), f"final_model_{args.run_id}.pt")
+        log0(f"Serialized model: {os.path.getsize(f'final_model_{args.run_id}.pt')} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(f"final_model_{args.run_id}.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        qfb = os.path.getsize("final_model.int8.ptz")
+        qfb = os.path.getsize(f"final_model_{args.run_id}.int8.ptz")
         ratio = quant_stats["baseline_tensor_bytes"] / max(
             quant_stats["int8_payload_bytes"], 1
         )
@@ -1450,7 +1450,7 @@ def main():
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(f"final_model_{args.run_id}.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     base_model.load_state_dict(
         dequantize_state_dict_int8(

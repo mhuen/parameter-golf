@@ -911,19 +911,19 @@ def main():
     log0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        log0(f"Serialized model: {os.path.getsize('final_model.pt')} bytes")
+        torch.save(base_model.state_dict(), f"final_model_{args.run_id}.pt")
+        log0(f"Serialized model: {os.path.getsize(f'final_model_{args.run_id}.pt')} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO(); torch.save(quant_obj, quant_buf)
     quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f: f.write(quant_blob)
+        with open(f"final_model_{args.run_id}.int8.ptz", "wb") as f: f.write(quant_blob)
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(f"Serialized model int8+zlib: {os.path.getsize('final_model.int8.ptz')} bytes (payload_ratio:{ratio:.2f}x)")
+        log0(f"Serialized model int8+zlib: {os.path.getsize(f'final_model_{args.run_id}.int8.ptz')} bytes (payload_ratio:{ratio:.2f}x)")
 
     if distributed: dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f: quant_blob_disk = f.read()
+    with open(f"final_model_{args.run_id}.int8.ptz", "rb") as f: quant_blob_disk = f.read()
     base_model.load_state_dict(dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")), strict=True)
     torch.cuda.synchronize(); t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
