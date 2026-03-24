@@ -79,7 +79,9 @@ class Hyperparameters:
     # E.g. "0,0,0,1,1,1" means layers 0-2 share block 0, layers 3-5 share block 1.
     # Default "" means all layers share a single block (original behavior).
     block_pattern = os.environ.get(
-        "BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8"
+        # "BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8"
+        "BLOCK_PATTERN",
+        "0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8",
     )
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -576,7 +578,9 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
     bsz, seq_len = input_ids.shape
     doc_ids = (input_ids == bos_id).cumsum(dim=1)  # (B, S)
     same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
-    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=input_ids.device))
+    causal = torch.tril(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=input_ids.device)
+    )
     return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
 
 
@@ -619,12 +623,19 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if doc_mask is not None:
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=doc_mask,
+                q,
+                k,
+                v,
+                attn_mask=doc_mask,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, is_causal=True,
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
@@ -656,7 +667,9 @@ class SharedBlock(nn.Module):
         )
         self.mlp = MLP(dim, mlp_mult)
 
-    def forward(self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None, doc_mask=None):
+    def forward(
+        self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None, doc_mask=None
+    ):
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
@@ -1218,7 +1231,13 @@ def main():
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+            [
+                {
+                    "params": [base_model.lm_head.weight],
+                    "lr": args.head_lr,
+                    "base_lr": args.head_lr,
+                }
+            ],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1230,7 +1249,9 @@ def main():
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} pack_doc_mask:{args.pack_doc_mask}")
+    log0(
+        f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} pack_doc_mask:{args.pack_doc_mask}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
