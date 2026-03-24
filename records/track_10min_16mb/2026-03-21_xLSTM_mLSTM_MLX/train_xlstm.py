@@ -88,6 +88,11 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
+    # Packing with document-level masking. When enabled, BOS tokens mark document
+    # boundaries: the mLSTM gating matrix is masked to prevent cross-document attention,
+    # and the cumulative forget gate is reset at each document boundary.
+    pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -210,8 +215,10 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
+            doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
+            doc_reset = (x == BOS_ID) if args.pack_doc_mask else None
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                batch_loss = model(x, y, doc_mask=doc_mask, doc_reset_mask=doc_reset).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -392,6 +399,38 @@ class PerHeadGate(nn.Module):
         return (x * w[None, :, None, :]).sum(dim=-1) + b[None, :, None]
 
 
+def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
+    """Build a causal block-diagonal mask from BOS document boundaries.
+    Tokens only attend to earlier tokens within the same document.
+    Returns (B, 1, S, S) boolean mask."""
+    bsz, seq_len = input_ids.shape
+    doc_ids = (input_ids == bos_id).cumsum(dim=1)  # (B, S)
+    same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
+    causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=input_ids.device))
+    return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
+
+
+def segmented_cumsum(x: Tensor, reset_mask: Tensor) -> Tensor:
+    """Cumulative sum along dim=-1 that restarts at positions where reset_mask is True.
+    x: (B, NH, S), reset_mask: (B, S) boolean — True at document starts (BOS positions)."""
+    # Expand reset_mask to match x: (B, 1, S) broadcasts over NH
+    rm = reset_mask.unsqueeze(1).expand_as(x)  # (B, NH, S)
+    # Zero out the running sum at reset points by subtracting the accumulated value
+    full_cumsum = torch.cumsum(x, dim=-1)
+    # At each reset point, record the cumsum value just before it (the offset to subtract)
+    # offset[t] = cumsum[t] - x[t] at reset points, carried forward until next reset
+    correction = torch.zeros_like(x)
+    correction[rm] = full_cumsum[rm] - x[rm]
+    # cummax-style carry: we need the correction to persist until the next reset
+    # Use cummax on a version that's -inf except at reset points
+    neg_inf = torch.tensor(-float("inf"), device=x.device, dtype=x.dtype)
+    correction_sparse = torch.where(rm, correction, neg_inf)
+    # cummax gives the most recent correction value at each position
+    carried_correction, _ = torch.cummax(correction_sparse, dim=-1)
+    carried_correction = torch.where(carried_correction.isinf(), torch.zeros_like(carried_correction), carried_correction)
+    return full_cumsum - carried_correction
+
+
 class mLSTMLayer(nn.Module):
     """mLSTM layer matching the official xLSTM architecture (Beck et al. 2024).
 
@@ -434,7 +473,7 @@ class mLSTMLayer(nn.Module):
         self.multihead_norm = MultiHeadNorm(num_heads, self.head_v_dim, eps=eps)
         self.out_proj = CastedLinear(self.v_dim, dim, bias=False)
 
-    def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
+    def forward(self, x: Tensor, q_delta=None, v_delta=None, doc_mask=None, doc_reset_mask=None) -> Tensor:
         B, S, D = x.shape
         NH = self.num_heads
 
@@ -443,8 +482,28 @@ class mLSTMLayer(nn.Module):
         x_mlstm, z = up[..., :self.v_dim], up[..., self.v_dim:]  # each [B, S, v_dim]
 
         # Causal conv1d + SiLU on x_mlstm
-        x_conv = F.pad(x_mlstm.transpose(1, 2), (3, 0))  # [B, v_dim, S+3]
-        x_conv = self.conv1d(x_conv).transpose(1, 2)  # [B, S, v_dim]
+        x_mlstm_t = x_mlstm.transpose(1, 2)  # [B, v_dim, S]
+        x_conv = self.conv1d(F.pad(x_mlstm_t, (3, 0))).transpose(1, 2)  # [B, S, v_dim]
+        if doc_reset_mask is not None:
+            # Fix conv leakage across document boundaries. The conv (kernel=4) at
+            # positions d, d+1, d+2 of a new document reads 1-3 tokens from the
+            # previous doc. We re-run the conv on an input where the K-1 positions
+            # before each BOS are zeroed, then blend only the affected positions.
+            K = self.conv1d.kernel_size[0] - 1  # 3
+            non_first_bos = doc_reset_mask.clone()
+            non_first_bos[:, 0] = False  # first BOS is already correctly zero-padded
+            # Zero pre-boundary positions: for BOS at t, zero t-1, t-2, t-3
+            pre_boundary = torch.zeros(B, S, dtype=torch.bool, device=x.device)
+            for k in range(1, K + 1):
+                pre_boundary[:, :-k] |= non_first_bos[:, k:]
+            x_mlstm_reset = x_mlstm_t.clone()
+            x_mlstm_reset *= (~pre_boundary).unsqueeze(1)  # [B, v_dim, S]
+            x_conv_reset = self.conv1d(F.pad(x_mlstm_reset, (3, 0))).transpose(1, 2)
+            # Blend: use reset version for the first K positions of each non-first doc
+            post_boundary = torch.zeros(B, S, dtype=torch.bool, device=x.device)
+            for k in range(K):
+                post_boundary[:, k:] |= non_first_bos[:, :S - k] if k > 0 else non_first_bos
+            x_conv = torch.where(post_boundary.unsqueeze(-1), x_conv_reset, x_conv)
         x_conv_act = F.silu(x_conv)
 
         # Q, K from conv-activated; V from raw x_mlstm
@@ -463,17 +522,24 @@ class mLSTMLayer(nn.Module):
         log_f = F.logsigmoid(f_pre)  # [B, NH, S]
         log_i = i_pre  # exponential input gate: log(exp(i)) = i
 
-        # Cumulative log forget gate
-        log_f_cumsum = torch.cumsum(log_f, dim=-1)  # [B, NH, S]
+        # Cumulative log forget gate — segmented by document when masking is active
+        if doc_reset_mask is not None:
+            log_f_cumsum = segmented_cumsum(log_f, doc_reset_mask)  # [B, NH, S]
+        else:
+            log_f_cumsum = torch.cumsum(log_f, dim=-1)  # [B, NH, S]
 
         # Gating matrix: log_D[t,s] = cumsum_f[t] - cumsum_f[s] + log_i[s]
         log_D = (log_f_cumsum[:, :, :, None]
                  - log_f_cumsum[:, :, None, :]
                  + log_i[:, :, None, :])  # [B, NH, S, S]
 
-        # Causal mask
-        causal = torch.tril(torch.ones(S, S, dtype=torch.bool, device=x.device))
-        log_D = torch.where(causal, log_D, torch.tensor(-1e9, device=x.device))
+        # Causal mask (also blocks cross-document attention when doc_mask is provided)
+        if doc_mask is not None:
+            # doc_mask is (B, 1, S, S) — squeeze to broadcast over NH
+            log_D = torch.where(doc_mask, log_D, torch.tensor(-1e9, device=x.device))
+        else:
+            causal = torch.tril(torch.ones(S, S, dtype=torch.bool, device=x.device))
+            log_D = torch.where(causal, log_D, torch.tensor(-1e9, device=x.device))
 
         # Stabilize: subtract row-wise max before exp
         max_log_D = log_D.max(dim=-1, keepdim=True).values  # [B, NH, S, 1]
@@ -507,11 +573,11 @@ class mLSTMBlock(nn.Module):
         self.norm = RMSNormWeighted(dim)
         self.mlstm = mLSTMLayer(dim, num_heads, qk_dim_factor, v_dim_factor, gate_soft_cap)
 
-    def forward(self, x: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
+    def forward(self, x: Tensor, q_delta_fn=None, v_delta_fn=None, doc_mask=None, doc_reset_mask=None) -> Tensor:
         n = self.norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
-        return x + self.mlstm(n, qd, vd)
+        return x + self.mlstm(n, qd, vd, doc_mask=doc_mask, doc_reset_mask=doc_reset_mask)
 
 
 class xLSTM(nn.Module):
@@ -543,12 +609,12 @@ class xLSTM(nn.Module):
                 # Input gate: weight=zeros (already), bias=normal(0, 0.1)
                 nn.init.normal_(module.igate_preact.bias, mean=0.0, std=0.1)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None, doc_mask=None, doc_reset_mask=None) -> Tensor:
         x = self.tok_emb(input_ids)
         for i, block in enumerate(self.blocks):
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
-            x = block(x, qd, vd)
+            x = block(x, qd, vd, doc_mask=doc_mask, doc_reset_mask=doc_reset_mask)
         x = self.final_norm(x)
         logits = F.linear(x, self.tok_emb.weight)
         logits = logits + (lora.lm_head_lora(x) if lora else 0)
@@ -762,7 +828,7 @@ def main():
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params} architecture:xLSTM num_layers:{args.num_layers} dim:{args.model_dim} heads:{args.num_heads}")
+    log0(f"model_params:{n_params} architecture:xLSTM num_layers:{args.num_layers} dim:{args.model_dim} heads:{args.num_heads} pack_doc_mask:{args.pack_doc_mask}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps} seed:{args.seed}")
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -788,7 +854,9 @@ def main():
             for micro_step in range(grad_accum_steps):
                 if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16): warmup_loss = model(x, y)
+                doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
+                doc_reset = (x == BOS_ID) if args.pack_doc_mask else None
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16): warmup_loss = model(x, y, doc_mask=doc_mask, doc_reset_mask=doc_reset)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers: opt.step()
             zero_grad_all()
@@ -821,7 +889,9 @@ def main():
         for micro_step in range(grad_accum_steps):
             if distributed: model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16): loss = model(x, y)
+            doc_mask = build_doc_mask(x, BOS_ID) if args.pack_doc_mask else None
+            doc_reset = (x == BOS_ID) if args.pack_doc_mask else None
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16): loss = model(x, y, doc_mask=doc_mask, doc_reset_mask=doc_reset)
             train_loss += loss.detach(); (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
