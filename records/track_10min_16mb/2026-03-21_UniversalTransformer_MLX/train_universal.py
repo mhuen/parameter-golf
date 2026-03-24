@@ -79,9 +79,10 @@ class Hyperparameters:
     # E.g. "0,0,0,1,1,1" means layers 0-2 share block 0, layers 3-5 share block 1.
     # Default "" means all layers share a single block (original behavior).
     block_pattern = os.environ.get(
-        # "BLOCK_PATTERN", "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8"
         "BLOCK_PATTERN",
-        "0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8",
+        "0,0,0,1,1,1,2,2,2,3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,8,8,8",
+        # "BLOCK_PATTERN",
+        # "0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8,0,1,2,3,4,5,6,7,8",
     )
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
