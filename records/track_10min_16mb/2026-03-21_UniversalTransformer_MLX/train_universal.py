@@ -1101,10 +1101,11 @@ def main():
     enable_mem_efficient_sdp(args.pack_doc_mask)
     enable_math_sdp(args.pack_doc_mask)
 
+    run_dir = f"models/{args.run_id}"
     logfile = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        os.makedirs(run_dir, exist_ok=True)
+        logfile = f"{run_dir}/log.txt"
         print(logfile)
 
     def log0(msg, console=True):
@@ -1432,20 +1433,18 @@ def main():
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    model_dir = f"models/{datetime.now().strftime('%Y_%m_%d')}"
     if master_process:
-        os.makedirs(model_dir, exist_ok=True)
-        torch.save(base_model.state_dict(), f"{model_dir}/final_model_{args.run_id}.pt")
-        log0(f"Serialized model: {os.path.getsize(f'{model_dir}/final_model_{args.run_id}.pt')} bytes")
+        torch.save(base_model.state_dict(), f"{run_dir}/model.pt")
+        log0(f"Serialized model: {os.path.getsize(f'{run_dir}/model.pt')} bytes")
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_blob = zlib.compress(quant_buf.getvalue(), level=9)
     if master_process:
-        with open(f"{model_dir}/final_model_{args.run_id}.int8.ptz", "wb") as f:
+        with open(f"{run_dir}/model.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        qfb = os.path.getsize(f"{model_dir}/final_model_{args.run_id}.int8.ptz")
+        qfb = os.path.getsize(f"{run_dir}/model.int8.ptz")
         ratio = quant_stats["baseline_tensor_bytes"] / max(
             quant_stats["int8_payload_bytes"], 1
         )
@@ -1453,7 +1452,7 @@ def main():
 
     if distributed:
         dist.barrier()
-    with open(f"{model_dir}/final_model_{args.run_id}.int8.ptz", "rb") as f:
+    with open(f"{run_dir}/model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     base_model.load_state_dict(
         dequantize_state_dict_int8(
@@ -1482,7 +1481,7 @@ def main():
     log0(
         f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
-    log0(f"run_id: {args.run_id} | log_file: logs/{args.run_id}.txt | model_weights: {model_dir}/final_model_{args.run_id}.pt | model_compressed: {model_dir}/final_model_{args.run_id}.int8.ptz")
+    log0(f"run_id: {args.run_id} | run_dir: {run_dir}/")
 
     torch._dynamo.reset()
     torch.cuda.synchronize()
