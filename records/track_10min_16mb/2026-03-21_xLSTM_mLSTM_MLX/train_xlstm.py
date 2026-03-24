@@ -412,20 +412,16 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
 
 def segmented_cumsum(x: Tensor, reset_mask: Tensor) -> Tensor:
     """Cumulative sum along dim=-1 that restarts at positions where reset_mask is True.
-    x: (B, NH, S), reset_mask: (B, S) boolean — True at document starts (BOS positions)."""
-    # Expand reset_mask to match x: (B, 1, S) broadcasts over NH
+    x: (B, NH, S), reset_mask: (B, S) boolean — True at document starts (BOS positions).
+    Uses only static-shape ops so it works with torch.compile(fullgraph=True)."""
     rm = reset_mask.unsqueeze(1).expand_as(x)  # (B, NH, S)
-    # Zero out the running sum at reset points by subtracting the accumulated value
     full_cumsum = torch.cumsum(x, dim=-1)
-    # At each reset point, record the cumsum value just before it (the offset to subtract)
-    # offset[t] = cumsum[t] - x[t] at reset points, carried forward until next reset
-    correction = torch.zeros_like(x)
-    correction[rm] = full_cumsum[rm] - x[rm]
-    # cummax-style carry: we need the correction to persist until the next reset
-    # Use cummax on a version that's -inf except at reset points
+    # At reset position t, the prior accumulated sum is cumsum[t] - x[t].
+    # We subtract this correction to restart the cumsum from x[t].
+    correction_at_reset = full_cumsum - x
+    # Use -inf at non-reset positions so cummax carries the latest correction forward.
     neg_inf = torch.tensor(-float("inf"), device=x.device, dtype=x.dtype)
-    correction_sparse = torch.where(rm, correction, neg_inf)
-    # cummax gives the most recent correction value at each position
+    correction_sparse = torch.where(rm, correction_at_reset, neg_inf)
     carried_correction, _ = torch.cummax(correction_sparse, dim=-1)
     carried_correction = torch.where(carried_correction.isinf(), torch.zeros_like(carried_correction), carried_correction)
     return full_cumsum - carried_correction
