@@ -565,7 +565,9 @@ class Rotary(nn.Module):
         super().__init__()
         # Only compute frequencies for the rotated subset of dimensions.
         rope_dims = max(2, 2 * (int(dim * rope_dim_fraction) // 2))  # ensure even
-        inv_freq = 1.0 / (base ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims))
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached = None
@@ -613,7 +615,15 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dim_fraction=1.0):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        rope_base,
+        qk_gain_init,
+        rope_dim_fraction=1.0,
+    ):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -633,7 +643,9 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
         )
-        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction)
+        self.rotary = Rotary(
+            self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
+        )
 
     def forward(self, x, q_delta=None, v_delta=None, doc_mask=None):
         bsz, seqlen, dim = x.shape
@@ -693,7 +705,9 @@ class GatedCausalConv(nn.Module):
         # groups=0 means depthwise (groups=dim)
         groups = dim if groups <= 0 else groups
         if dim % groups != 0:
-            raise ValueError(f"model_dim ({dim}) must be divisible by conv_groups ({groups})")
+            raise ValueError(
+                f"model_dim ({dim}) must be divisible by conv_groups ({groups})"
+            )
         self.pad = kernel_size - 1
         self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
         self.conv_value = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
@@ -710,8 +724,18 @@ class GatedCausalConv(nn.Module):
 class SharedBlock(nn.Module):
     """Shared transformer block: attention + MLP with norms. No per-layer scalars."""
 
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                 rope_dim_fraction=1.0, conv_kernel_size=0, conv_groups=0):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        num_kv_heads,
+        mlp_mult,
+        rope_base,
+        qk_gain_init,
+        rope_dim_fraction=1.0,
+        conv_kernel_size=0,
+        conv_groups=0,
+    ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -720,11 +744,22 @@ class SharedBlock(nn.Module):
         )
         self.mlp = MLP(dim, mlp_mult)
         # Optional shared conv (when conv is shared across layers).
-        self.conv = GatedCausalConv(dim, conv_kernel_size, conv_groups) if conv_kernel_size > 0 else None
+        self.conv = (
+            GatedCausalConv(dim, conv_kernel_size, conv_groups)
+            if conv_kernel_size > 0
+            else None
+        )
 
     def forward(
-        self, x, attn_scale, mlp_scale, conv=None, conv_scale=None,
-        q_delta_fn=None, v_delta_fn=None, doc_mask=None,
+        self,
+        x,
+        attn_scale,
+        mlp_scale,
+        conv=None,
+        conv_scale=None,
+        q_delta_fn=None,
+        v_delta_fn=None,
+        doc_mask=None,
     ):
         # Conv before attention: local n-gram mixing enriches Q/K/V inputs.
         conv_mod = conv if conv is not None else self.conv
@@ -751,8 +786,16 @@ class LayerScalars(nn.Module):
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
         # Per-layer conv (when not shared) and its scale.
-        self.conv = GatedCausalConv(dim, conv_kernel_size, conv_groups) if conv_kernel_size > 0 else None
-        self.conv_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if conv_kernel_size > 0 else None
+        self.conv = (
+            GatedCausalConv(dim, conv_kernel_size, conv_groups)
+            if conv_kernel_size > 0
+            else None
+        )
+        self.conv_scale = (
+            nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            if conv_kernel_size > 0
+            else None
+        )
 
 
 class GPT(nn.Module):
@@ -837,7 +880,10 @@ class GPT(nn.Module):
         self.conv_enabled = conv_kernel_size > 0
         if conv_shared and conv_kernel_size > 0:
             self.shared_conv_scales = nn.ParameterList(
-                [nn.Parameter(torch.ones(model_dim, dtype=torch.float32)) for _ in range(num_layers)]
+                [
+                    nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+                    for _ in range(num_layers)
+                ]
             )
         else:
             self.shared_conv_scales = None
@@ -881,8 +927,14 @@ class GPT(nn.Module):
             vd = lora.v_loras[i] if lora else None
             conv, conv_scale = self._get_conv_args(ls, i)
             x = self.shared_blocks[self.block_map[i]](
-                x, ls.attn_scale, ls.mlp_scale, conv=conv, conv_scale=conv_scale,
-                q_delta_fn=qd, v_delta_fn=vd, doc_mask=doc_mask,
+                x,
+                ls.attn_scale,
+                ls.mlp_scale,
+                conv=conv,
+                conv_scale=conv_scale,
+                q_delta_fn=qd,
+                v_delta_fn=vd,
+                doc_mask=doc_mask,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -900,8 +952,14 @@ class GPT(nn.Module):
             vd = lora.v_loras[layer_idx] if lora else None
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
             x = self.shared_blocks[self.block_map[layer_idx]](
-                x, ls.attn_scale, ls.mlp_scale, conv=conv, conv_scale=conv_scale,
-                q_delta_fn=qd, v_delta_fn=vd, doc_mask=doc_mask,
+                x,
+                ls.attn_scale,
+                ls.mlp_scale,
+                conv=conv,
+                conv_scale=conv_scale,
+                q_delta_fn=qd,
+                v_delta_fn=vd,
+                doc_mask=doc_mask,
             )
         x = self.final_norm(x)
         if self.tie_embeddings:
