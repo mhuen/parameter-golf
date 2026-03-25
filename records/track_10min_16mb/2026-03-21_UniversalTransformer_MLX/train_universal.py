@@ -705,6 +705,7 @@ class GatedCausalConv(nn.Module):
         self.pad = kernel_size - 1
         self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
         self.conv_value = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
+        self.conv_value._zero_init = True
 
     def forward(self, x):
         # x: (B, S, D) -> transpose to (B, D, S) for conv1d
@@ -890,7 +891,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
+            if isinstance(module, (nn.Linear, nn.Conv1d)) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def _get_conv_args(self, ls, layer_idx):
