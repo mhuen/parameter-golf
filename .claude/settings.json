@@ -1,5 +1,5 @@
 {
-  "model": "Opus[1m]",
+  "model": "opus",
   "permissions": {
     "defaultMode": "default",
     "allow": [
@@ -42,7 +42,9 @@
       "Bash(helm install)",
       "Bash(helm uninstall)"
     ],
-    "ask": ["Bash(git push:*)"]
+    "ask": [
+      "Bash(git push:*)"
+    ]
   },
   "env": {
     "PYTHONPATH": ".",

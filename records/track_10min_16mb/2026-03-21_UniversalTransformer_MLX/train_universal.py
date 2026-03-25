@@ -759,7 +759,9 @@ class SharedBlock(nn.Module):
         # Conv before attention: local n-gram mixing enriches Q/K/V inputs.
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
-            x = x + conv_scale.to(dtype=x.dtype)[None, None, :] * conv_mod(self.conv_norm(x))
+            x = x + conv_scale.to(dtype=x.dtype)[None, None, :] * conv_mod(
+                self.conv_norm(x)
+            )
         n = self.attn_norm(x)
         attn_out = self.attn(n, doc_mask=doc_mask)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
@@ -893,7 +895,9 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d)) and getattr(module, "_zero_init", False):
+            if isinstance(module, (nn.Linear, nn.Conv1d)) and getattr(
+                module, "_zero_init", False
+            ):
                 nn.init.zeros_(module.weight)
 
     def _get_conv_args(self, ls, layer_idx):
@@ -1106,7 +1110,12 @@ def main():
 
     # Optimizer: shared_blocks 2D (non-conv) -> Muon, everything else -> Adam
     # Conv weights get their own Adam group with conv_lr.
-    conv_weight_ids = {id(p) for m in base_model.modules() if isinstance(m, nn.Conv1d) for p in m.parameters()}
+    conv_weight_ids = {
+        id(p)
+        for m in base_model.modules()
+        if isinstance(m, nn.Conv1d)
+        for p in m.parameters()
+    }
     shared_blocks_named = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
