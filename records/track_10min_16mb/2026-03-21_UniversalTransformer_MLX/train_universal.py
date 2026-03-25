@@ -50,7 +50,10 @@ class Hyperparameters:
     tokenizer_path = os.environ.get(
         "TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model"
     )
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4())) + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id = (
+        os.environ.get("RUN_ID", str(uuid.uuid4()))
+        + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -108,6 +111,18 @@ class Hyperparameters:
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
+
+    # Causal convolution before attention for local n-gram mixing.
+    conv_kernel_size = int(os.environ.get("CONV_KERNEL_SIZE", 4))
+    conv_groups = int(os.environ.get("CONV_GROUPS", 0))  # 0 = depthwise (groups=dim)
+    conv_shared = bool(
+        int(os.environ.get("CONV_SHARED", "0"))
+    )  # share conv weights across layers
+    conv_enabled = bool(int(os.environ.get("CONV_ENABLED", "1")))
+
+    # Partial RoPE: fraction of head dimensions to apply rotary embeddings to (0.0-1.0).
+    # Remaining dimensions are position-independent "semantic" channels.
+    rope_dim_fraction = float(os.environ.get("ROPE_DIM_FRACTION", 1.0))
 
     # Packing with document-level attention masking. When enabled, BOS tokens mark
     # document boundaries and tokens cannot attend across documents within a packed sequence.
@@ -303,7 +318,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_scale",
     ).split(",")
     if pattern
 )
@@ -546,9 +561,11 @@ def restore_low_dim_params_to_fp32(module):
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim, base=10000.0):
+    def __init__(self, dim, base=10000.0, rope_dim_fraction=1.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # Only compute frequencies for the rotated subset of dimensions.
+        rope_dims = max(2, 2 * (int(dim * rope_dim_fraction) // 2))  # ensure even
+        inv_freq = 1.0 / (base ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached = None
@@ -569,9 +586,18 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x, cos, sin):
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    rope_dims = cos.size(-1) * 2  # cos covers half the rotated dims
+    if rope_dims >= x.size(-1):
+        # Full RoPE: apply to all dimensions.
+        half = x.size(-1) // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    # Partial RoPE: only rotate first rope_dims, pass the rest through.
+    x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+    half = rope_dims // 2
+    x1, x2 = x_rope[..., :half], x_rope[..., half:]
+    x_rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((x_rotated, x_pass), dim=-1)
 
 
 def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
@@ -587,7 +613,7 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
+    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dim_fraction=1.0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -607,7 +633,7 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
         )
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction)
 
     def forward(self, x, q_delta=None, v_delta=None, doc_mask=None):
         bsz, seqlen, dim = x.shape
@@ -657,21 +683,53 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class GatedCausalConv(nn.Module):
+    """Gated causal conv1d for local n-gram mixing.
+    gate = sigmoid(conv_gate(x)), value = SiLU(conv_value(x)), out = gate * value.
+    Uses causal (left) padding so output[t] only depends on input[t-k+1..t]."""
+
+    def __init__(self, dim, kernel_size=4, groups=0):
+        super().__init__()
+        # groups=0 means depthwise (groups=dim)
+        groups = dim if groups <= 0 else groups
+        if dim % groups != 0:
+            raise ValueError(f"model_dim ({dim}) must be divisible by conv_groups ({groups})")
+        self.pad = kernel_size - 1
+        self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
+        self.conv_value = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
+
+    def forward(self, x):
+        # x: (B, S, D) -> transpose to (B, D, S) for conv1d
+        h = x.transpose(1, 2)
+        h = F.pad(h, (self.pad, 0))  # causal left-padding
+        gate = torch.sigmoid(self.conv_gate(h))
+        value = F.silu(self.conv_value(h))
+        return (gate * value).transpose(1, 2)
+
+
 class SharedBlock(nn.Module):
     """Shared transformer block: attention + MLP with norms. No per-layer scalars."""
 
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                 rope_dim_fraction=1.0, conv_kernel_size=0, conv_groups=0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dim_fraction
         )
         self.mlp = MLP(dim, mlp_mult)
+        # Optional shared conv (when conv is shared across layers).
+        self.conv = GatedCausalConv(dim, conv_kernel_size, conv_groups) if conv_kernel_size > 0 else None
 
     def forward(
-        self, x, attn_scale, mlp_scale, q_delta_fn=None, v_delta_fn=None, doc_mask=None
+        self, x, attn_scale, mlp_scale, conv=None, conv_scale=None,
+        q_delta_fn=None, v_delta_fn=None, doc_mask=None,
     ):
+        # Conv before attention: local n-gram mixing enriches Q/K/V inputs.
+        conv_mod = conv if conv is not None else self.conv
+        if conv_mod is not None and conv_scale is not None:
+            x = x + conv_scale.to(dtype=x.dtype)[None, None, :] * conv_mod(x)
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
@@ -682,15 +740,19 @@ class SharedBlock(nn.Module):
 
 
 class LayerScalars(nn.Module):
-    """Per-layer scalars: attn_scale, mlp_scale, resid_mix."""
+    """Per-layer scalars: attn_scale, mlp_scale, conv_scale, resid_mix.
+    Optionally holds a per-layer GatedCausalConv when conv is not shared."""
 
-    def __init__(self, dim):
+    def __init__(self, dim, conv_kernel_size=0, conv_groups=0):
         super().__init__()
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
+        # Per-layer conv (when not shared) and its scale.
+        self.conv = GatedCausalConv(dim, conv_kernel_size, conv_groups) if conv_kernel_size > 0 else None
+        self.conv_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32)) if conv_kernel_size > 0 else None
 
 
 class GPT(nn.Module):
@@ -708,6 +770,10 @@ class GPT(nn.Module):
         rope_base,
         qk_gain_init,
         block_pattern="",
+        rope_dim_fraction=1.0,
+        conv_kernel_size=0,
+        conv_groups=0,
+        conv_shared=False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -734,6 +800,10 @@ class GPT(nn.Module):
         else:
             self.block_map = [0] * num_layers  # all layers share a single block
 
+        # Conv lives in SharedBlock when shared, in LayerScalars when per-layer.
+        shared_conv_ks = conv_kernel_size if conv_shared else 0
+        per_layer_conv_ks = conv_kernel_size if not conv_shared else 0
+
         num_blocks = max(self.block_map) + 1
         self.shared_blocks = nn.ModuleList(
             [
@@ -744,15 +814,33 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    rope_dim_fraction=rope_dim_fraction,
+                    conv_kernel_size=shared_conv_ks,
+                    conv_groups=conv_groups,
                 )
                 for _ in range(num_blocks)
             ]
         )
 
-        # Per-layer scalars (unique per application).
+        # Per-layer scalars (unique per application). Conv scale is always per-layer.
         self.layer_scalars = nn.ModuleList(
-            [LayerScalars(model_dim) for _ in range(num_layers)]
+            [
+                LayerScalars(
+                    model_dim,
+                    conv_kernel_size=per_layer_conv_ks,
+                    conv_groups=conv_groups,
+                )
+                for _ in range(num_layers)
+            ]
         )
+        # When conv is shared, we still need a per-layer conv_scale.
+        self.conv_enabled = conv_kernel_size > 0
+        if conv_shared and conv_kernel_size > 0:
+            self.shared_conv_scales = nn.ParameterList(
+                [nn.Parameter(torch.ones(model_dim, dtype=torch.float32)) for _ in range(num_layers)]
+            )
+        else:
+            self.shared_conv_scales = None
 
         self.final_norm = RMSNorm()
         self.lm_head = (
@@ -769,6 +857,16 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _get_conv_args(self, ls, layer_idx):
+        """Return (conv, conv_scale) for a given layer."""
+        if not self.conv_enabled:
+            return None, None
+        if ls.conv is not None:
+            # Per-layer conv lives in LayerScalars.
+            return ls.conv, ls.conv_scale
+        # Shared conv: scale is per-layer, conv is in SharedBlock.
+        return None, self.shared_conv_scales[layer_idx]
+
     def forward(self, input_ids, target_ids, lora=None, doc_mask=None):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -781,8 +879,10 @@ class GPT(nn.Module):
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             qd = lora.q_loras[i] if lora else None
             vd = lora.v_loras[i] if lora else None
+            conv, conv_scale = self._get_conv_args(ls, i)
             x = self.shared_blocks[self.block_map[i]](
-                x, ls.attn_scale, ls.mlp_scale, qd, vd, doc_mask=doc_mask
+                x, ls.attn_scale, ls.mlp_scale, conv=conv, conv_scale=conv_scale,
+                q_delta_fn=qd, v_delta_fn=vd, doc_mask=doc_mask,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -798,8 +898,10 @@ class GPT(nn.Module):
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             qd = lora.q_loras[layer_idx] if lora else None
             vd = lora.v_loras[layer_idx] if lora else None
+            conv, conv_scale = self._get_conv_args(ls, layer_idx)
             x = self.shared_blocks[self.block_map[layer_idx]](
-                x, ls.attn_scale, ls.mlp_scale, qd, vd, doc_mask=doc_mask
+                x, ls.attn_scale, ls.mlp_scale, conv=conv, conv_scale=conv_scale,
+                q_delta_fn=qd, v_delta_fn=vd, doc_mask=doc_mask,
             )
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1175,6 +1277,10 @@ def main():
             rope_base=args.rope_base,
             qk_gain_init=args.qk_gain_init,
             block_pattern=args.block_pattern,
+            rope_dim_fraction=args.rope_dim_fraction,
+            conv_kernel_size=args.conv_kernel_size if args.conv_enabled else 0,
+            conv_groups=args.conv_groups,
+            conv_shared=args.conv_shared,
         )
         .to(device)
         .bfloat16()
@@ -1192,7 +1298,7 @@ def main():
         else compiled_model
     )
 
-    # Optimizer: shared_blocks 2D -> Muon, layer_scalars + skip_weights + shared_blocks 1D -> Adam
+    # Optimizer: shared_blocks 2D (non-conv) -> Muon, everything else -> Adam
     shared_blocks_named = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
@@ -1202,13 +1308,16 @@ def main():
     scalar_params = [
         p
         for n, p in shared_blocks_named
-        if p.ndim < 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim != 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
             scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.shared_conv_scales is not None:
+        for p in base_model.shared_conv_scales:
+            scalar_params.append(p)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
