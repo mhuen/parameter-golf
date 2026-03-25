@@ -745,6 +745,7 @@ class SharedBlock(nn.Module):
             if conv_kernel_size > 0
             else None
         )
+        self.conv_norm = RMSNorm()
 
     def forward(
         self,
@@ -758,7 +759,7 @@ class SharedBlock(nn.Module):
         # Conv before attention: local n-gram mixing enriches Q/K/V inputs.
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
-            x = x + conv_scale.to(dtype=x.dtype)[None, None, :] * conv_mod(x)
+            x = x + conv_scale.to(dtype=x.dtype)[None, None, :] * conv_mod(self.conv_norm(x))
         n = self.attn_norm(x)
         attn_out = self.attn(n, doc_mask=doc_mask)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
