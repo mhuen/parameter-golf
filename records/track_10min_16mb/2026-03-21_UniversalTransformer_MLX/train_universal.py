@@ -113,6 +113,7 @@ class Hyperparameters:
         int(os.environ.get("CONV_SHARED", "0"))
     )  # share conv weights across layers
     conv_enabled = bool(int(os.environ.get("CONV_ENABLED", "1")))
+    conv_lr = float(os.environ.get("CONV_LR", 0.01))
 
     # Partial RoPE: fraction of head dimensions to apply rotary embeddings to (0.0-1.0).
     # Remaining dimensions are position-independent "semantic" channels.
@@ -1090,7 +1091,7 @@ def main():
         .bfloat16()
     )
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, nn.Conv1d)):
             module.float()
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
@@ -1103,6 +1104,8 @@ def main():
     )
 
     # Optimizer: shared_blocks 2D (non-conv) -> Muon, everything else -> Adam
+    # Conv weights get their own Adam group with conv_lr.
+    conv_weight_ids = {id(p) for m in base_model.modules() if isinstance(m, nn.Conv1d) for p in m.parameters()}
     shared_blocks_named = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
@@ -1112,11 +1115,16 @@ def main():
     scalar_params = [
         p
         for n, p in shared_blocks_named
-        if p.ndim != 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim != 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS))
+        and id(p) not in conv_weight_ids
     ]
+    conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
-            scalar_params.append(p)
+            if id(p) in conv_weight_ids:
+                conv_params.append(p)
+            else:
+                scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.shared_conv_scales is not None:
@@ -1145,6 +1153,14 @@ def main():
         fused=True,
     )
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if conv_params:
+        optimizer_conv = torch.optim.Adam(
+            [{"params": conv_params, "lr": args.conv_lr, "base_lr": args.conv_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_conv)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [
