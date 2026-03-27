@@ -18,6 +18,7 @@ Steps:
 Usage:
   python build_kenlm.py [--order 5] [--max-tokens 200000000] [--eval]
   python build_kenlm.py --byte-mode [--order 6] [--sentence-len 512] [--eval]
+  python build_kenlm.py --efficient-byte-mode [--order 6] [--sentence-len 512] [--eval]
 """
 
 import argparse
@@ -42,6 +43,7 @@ KENLM_BIN = (
 )
 OUTPUT_DIR_SP1024 = "./models/kenlm"
 OUTPUT_DIR_BYTES = "./models/kenlm_bytes"
+OUTPUT_DIR_EFFICIENT_BYTES = "./models/kenlm_efficient_bytes"
 
 BOS_ID = 1  # SentencePiece BOS token id
 BYTE_SENTENCE_LEN = 512  # default chunk size for byte-mode sentences
@@ -192,7 +194,7 @@ def run_build_binary(
 # ---------------------------------------------------------------------------
 def _split_into_sentences(token_ids: np.ndarray) -> list[list[str]]:
     """Split token IDs into sentences on BOS, returning lists of ID strings.
-    BOS tokens are omitted (KenLM adds its own <s>/<\/s> markers)."""
+    BOS tokens are omitted (KenLM adds its own <s>/</s> markers)."""
     sentences: list[list[str]] = []
     current: list[str] = []
     for tid in token_ids:
@@ -364,10 +366,16 @@ def main():
         action="store_true",
         help="Only generate the text corpus, don't train",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--byte-mode",
         action="store_true",
         help="Use raw byte data (vocab 256) instead of SentencePiece tokens",
+    )
+    mode_group.add_argument(
+        "--efficient-byte-mode",
+        action="store_true",
+        help="Use efficient byte tokenizer (vocab 208) — remaps raw byte shards",
     )
     parser.add_argument(
         "--sentence-len",
@@ -375,13 +383,45 @@ def main():
         default=BYTE_SENTENCE_LEN,
         help=f"Sentence length for byte mode chunking (default: {BYTE_SENTENCE_LEN})",
     )
+    parser.add_argument(
+        "--keep",
+        type=str,
+        nargs="+",
+        default=None,
+        help="ByteCategory(s) to keep (e.g. letter digit). Only with --efficient-byte-mode.",
+    )
+    parser.add_argument(
+        "--fold",
+        type=str,
+        nargs="+",
+        default=None,
+        help="ByteCategory(s) to fold (e.g. uppercase). Only with --efficient-byte-mode.",
+    )
+    parser.add_argument(
+        "--other-strategy",
+        type=str,
+        default="drop",
+        choices=["drop", "pad", "boundary"],
+        help="How to handle non-kept tokens (default: drop). Only with --efficient-byte-mode.",
+    )
     args = parser.parse_args()
 
     # Resolve defaults based on mode
+    any_byte_mode = args.byte_mode or args.efficient_byte_mode
     if args.data_path is None:
-        args.data_path = DATA_PATH_BYTES if args.byte_mode else DATA_PATH_SP1024
+        args.data_path = DATA_PATH_BYTES if any_byte_mode else DATA_PATH_SP1024
     if args.output_dir is None:
-        args.output_dir = OUTPUT_DIR_BYTES if args.byte_mode else OUTPUT_DIR_SP1024
+        if args.efficient_byte_mode:
+            suffix = ""
+            if args.keep:
+                suffix += "_" + "_".join(sorted(args.keep))
+            if args.fold:
+                suffix += "_fold_" + "_".join(sorted(args.fold))
+            args.output_dir = OUTPUT_DIR_EFFICIENT_BYTES + suffix
+        elif args.byte_mode:
+            args.output_dir = OUTPUT_DIR_BYTES
+        else:
+            args.output_dir = OUTPUT_DIR_SP1024
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -390,7 +430,19 @@ def main():
     arpa_path = os.path.join(args.output_dir, f"kenlm_{args.order}gram.arpa")
     binary_path = os.path.join(args.output_dir, f"kenlm_{args.order}gram.binary")
 
-    if args.byte_mode:
+    if args.efficient_byte_mode:
+        from efficient_byte_tokenizer import EfficientByteTokenizer, ByteCategory, OtherTokenStrategy
+        tok_kwargs: dict = {}
+        if args.keep:
+            tok_kwargs["keep"] = frozenset(ByteCategory(k) for k in args.keep)
+        if args.fold:
+            tok_kwargs["fold"] = frozenset(ByteCategory(f) for f in args.fold)
+        if args.keep:
+            tok_kwargs["other"] = OtherTokenStrategy(args.other_strategy)
+        eff_tok = EfficientByteTokenizer(**tok_kwargs)
+        print(f"  {eff_tok.describe()}")
+        print(f"  sentence_len={args.sentence_len}")
+    elif args.byte_mode:
         print(f"Byte mode: vocab=256, sentence_len={args.sentence_len}")
     else:
         import sentencepiece as spm
@@ -414,9 +466,14 @@ def main():
         )
         train_tokens = load_all_tokens(train_pattern, max_tokens=args.max_tokens)
         print(f"  Loaded {train_tokens.size:,} tokens")
+        if args.efficient_byte_mode:
+            train_tokens = eff_tok.filter_stream(
+                eff_tok.remap_byte_array(train_tokens.astype(np.uint8))
+            )
+            print(f"  Remapped + filtered: {train_tokens.size:,} tokens (vocab {eff_tok.vocab_size})")
 
         print(f"\nWriting text corpus to: {corpus_path}")
-        if args.byte_mode:
+        if any_byte_mode:
             n_sentences = write_text_corpus_bytes(
                 train_tokens, corpus_path, args.sentence_len
             )
@@ -450,7 +507,7 @@ def main():
         print(f"{'=' * 60}")
         val_pattern = f"{args.data_path}/fineweb_val_*.bin"
         val_files = sorted(glob.glob(val_pattern))
-        if not val_files and args.byte_mode:
+        if not val_files and any_byte_mode:
             # No dedicated val split — use the last training shard
             train_files = sorted(glob.glob(f"{args.data_path}/fineweb_train_*.bin"))
             if not train_files:
@@ -460,8 +517,12 @@ def main():
             val_tokens = load_data_shard(Path(val_file))
         else:
             val_tokens = load_all_tokens(val_pattern)
+        if args.efficient_byte_mode:
+            val_tokens = eff_tok.filter_stream(
+                eff_tok.remap_byte_array(val_tokens.astype(np.uint8))
+            )
         print(f"  Loaded {val_tokens.size:,} validation tokens")
-        if args.byte_mode:
+        if any_byte_mode:
             evaluate_kenlm_bytes(
                 binary_path, val_tokens, args.kenlm_bin, args.sentence_len
             )
