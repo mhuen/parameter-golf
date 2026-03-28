@@ -530,8 +530,8 @@ class DistributedTokenLoader:
         # Skip remaining ranks' tokens.
         for _ in range(self.rank + 1, self.world_size):
             self.stream.take(local_seqs * seq_len)
-        x = local[:-1].reshape(local_seqs, seq_len).to(self.device, non_blocking=True)
-        y = local[1:].reshape(local_seqs, seq_len).to(self.device, non_blocking=True)
+        x = local[:-1].reshape(local_seqs, seq_len).to(device=self.device, dtype=torch.int64, non_blocking=True)
+        y = local[1:].reshape(local_seqs, seq_len).to(device=self.device, dtype=torch.int64, non_blocking=True)
         return x, y
 
 
