@@ -1359,8 +1359,9 @@ def main():
             or step % args.train_log_every == 0
             or stop_after_step is not None
         ):
+            tl = train_loss.item()
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"step:{step}/{args.iterations} train_loss:{tl:.4f} train_bpb:{tl / math.log(2.0):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
