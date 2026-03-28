@@ -506,17 +506,7 @@ def main():
         print("Evaluating on validation data...")
         print(f"{'=' * 60}")
         val_pattern = f"{args.data_path}/fineweb_val_*.bin"
-        val_files = sorted(glob.glob(val_pattern))
-        if not val_files and any_byte_mode:
-            # No dedicated val split — use the last training shard
-            train_files = sorted(glob.glob(f"{args.data_path}/fineweb_train_*.bin"))
-            if not train_files:
-                raise FileNotFoundError(f"No shards found in {args.data_path}")
-            val_file = train_files[-1]
-            print(f"  No val split found; using last train shard as holdout: {val_file}")
-            val_tokens = load_data_shard(Path(val_file))
-        else:
-            val_tokens = load_all_tokens(val_pattern)
+        val_tokens = load_all_tokens(val_pattern)
         if args.efficient_byte_mode:
             val_tokens = eff_tok.filter_stream(
                 eff_tok.remap_byte_array(val_tokens.astype(np.uint8))
