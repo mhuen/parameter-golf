@@ -199,9 +199,7 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 p.data.add_(
-                    updates_flat[curr : curr + p.numel()]
-                    .reshape(p.shape)
-                    .to(p.dtype),
+                    updates_flat[curr : curr + p.numel()].reshape(p.shape).to(p.dtype),
                     alpha=-lr,
                 )
                 curr += p.numel()
@@ -972,7 +970,9 @@ def _build_tokenizer(args: Hyperparameters) -> EfficientByteTokenizer:
     """Construct EfficientByteTokenizer from env-var config."""
     fold_cats: frozenset[ByteCategory] = frozenset()
     if args.fold:
-        fold_cats = frozenset(ByteCategory(c.strip()) for c in args.fold.split(",") if c.strip())
+        fold_cats = frozenset(
+            ByteCategory(c.strip()) for c in args.fold.split(",") if c.strip()
+        )
     return EfficientByteTokenizer(
         discard_unused_bytes=args.discard_unused_bytes,
         fold=fold_cats if fold_cats else None,
