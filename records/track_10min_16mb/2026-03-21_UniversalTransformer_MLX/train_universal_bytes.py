@@ -1360,8 +1360,11 @@ def main():
             or stop_after_step is not None
         ):
             tl = train_loss.item()
+            # Correct for special tokens (0 bytes) in targets, same as eval_val.
+            tgt_bytes = base_bytes_lut[y.reshape(-1)].to(torch.float64).sum().item()
+            tpb = float(y.numel()) / max(tgt_bytes, 1.0)
             log0(
-                f"step:{step}/{args.iterations} train_loss:{tl:.4f} train_bpb:{tl / math.log(2.0):.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"step:{step}/{args.iterations} train_loss:{tl:.4f} train_bpb:{tl / math.log(2.0) * tpb:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
