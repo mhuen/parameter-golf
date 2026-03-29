@@ -10,8 +10,8 @@ Tokenizer configs (via env vars):
     DISCARD_UNUSED_BYTES=0           all 256 bytes, vocab=258
     FOLD=uppercase                   fold uppercase->lowercase, vocab=182
 
-Data: expects PureByteTokenizer .bin shards (4 special + 256 bytes = 260 vocab).
-Token IDs are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
+Data: expects raw UTF-8 byte shards (byte values 0-255 as uint16, no special tokens).
+Byte values are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
 """
 
 from __future__ import annotations
@@ -222,13 +222,13 @@ def load_validation_tokens(pattern, seq_len, max_tokens=0):
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    raw_bytes = np.concatenate([load_data_shard(file) for file in files])
     if max_tokens > 0:
-        tokens = tokens[: max_tokens + 1]
-    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+        raw_bytes = raw_bytes[: max_tokens + 1]
+    usable = ((len(raw_bytes) - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return tokens[: usable + 1]
+    return raw_bytes[: usable + 1]
 
 
 def eval_val(
@@ -433,28 +433,8 @@ def dequantize_state_dict_int8(obj):
 # DATA LOADING
 # -----------------------------
 
-# PureByteTokenizer shard format: 4 special tokens (pad=0, bos=1, eos=2, unk=3),
-# byte values offset by 4. We need to remap to EfficientByteTokenizer IDs.
-_PURE_BYTE_OFFSET = 4
-_PURE_BYTE_BOS = 1
-
-
-def _build_shard_remap_lut(tok: EfficientByteTokenizer) -> np.ndarray:
-    """Build a LUT that maps PureByteTokenizer token IDs -> EfficientByteTokenizer IDs.
-
-    PureByteTokenizer layout: [pad=0, bos=1, eos=2, unk=3, byte_0=4, ..., byte_255=259]
-    The LUT has 260 entries.
-    """
-    lut = np.full(260, tok.pad_id, dtype=np.uint16)  # unmapped -> pad
-    lut[_PURE_BYTE_BOS] = tok.bos_id  # BOS -> BOS
-    # Map each byte: PureByteTokenizer ID (byte+4) -> EfficientByteTokenizer ID
-    for byte_val in range(256):
-        eff_id = int(tok._byte_to_id[byte_val])
-        if eff_id != 0xFFFF:  # not a drop marker
-            lut[_PURE_BYTE_OFFSET + byte_val] = eff_id
-        else:
-            lut[_PURE_BYTE_OFFSET + byte_val] = tok.pad_id
-    return lut
+# Byte shard format: raw UTF-8 byte values (0-255) stored as uint16, no special tokens.
+# We use tok.remap_byte_array() + tok.filter_stream() to convert to token IDs.
 
 
 def load_data_shard(file):
@@ -470,30 +450,36 @@ def load_data_shard(file):
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
-    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+    return tokens_np
 
 
-def remap_shard_tokens(tokens: torch.Tensor, remap_lut: np.ndarray) -> torch.Tensor:
-    """Remap PureByteTokenizer IDs to EfficientByteTokenizer IDs using a numpy LUT."""
-    tokens_np = tokens.numpy()
-    remapped = remap_lut[tokens_np]
+def remap_shard_tokens(
+    raw_bytes: np.ndarray, tok: EfficientByteTokenizer
+) -> torch.Tensor:
+    """Convert raw byte values to EfficientByteTokenizer IDs.
+
+    Uses tok.remap_byte_array() for the LUT lookup, then tok.filter_stream()
+    to apply the OtherTokenStrategy (e.g. drop unused bytes).
+    """
+    remapped = tok.remap_byte_array(raw_bytes)
+    remapped = tok.filter_stream(remapped)
     return torch.from_numpy(remapped)
 
 
 class TokenStream:
-    def __init__(self, pattern, remap_lut: np.ndarray):
+    def __init__(self, pattern, tok: EfficientByteTokenizer):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.remap_lut = remap_lut
+        self.tok = tok
         self.file_idx = 0
-        self.tokens = remap_shard_tokens(load_data_shard(self.files[0]), remap_lut)
+        self.tokens = remap_shard_tokens(load_data_shard(self.files[0]), tok)
         self.pos = 0
 
     def _advance_file(self):
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = remap_shard_tokens(
-            load_data_shard(self.files[self.file_idx]), self.remap_lut
+            load_data_shard(self.files[self.file_idx]), self.tok
         )
         self.pos = 0
 
@@ -513,9 +499,9 @@ class TokenStream:
 
 
 class DistributedTokenLoader:
-    def __init__(self, pattern, remap_lut, rank, world_size, device):
+    def __init__(self, pattern, tok, rank, world_size, device):
         self.rank, self.world_size, self.device = rank, world_size, device
-        self.stream = TokenStream(pattern, remap_lut)
+        self.stream = TokenStream(pattern, tok)
 
     def next_batch(self, global_tokens, seq_len, grad_accum_steps):
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -530,8 +516,16 @@ class DistributedTokenLoader:
         # Skip remaining ranks' tokens.
         for _ in range(self.rank + 1, self.world_size):
             self.stream.take(local_seqs * seq_len)
-        x = local[:-1].reshape(local_seqs, seq_len).to(device=self.device, dtype=torch.int64, non_blocking=True)
-        y = local[1:].reshape(local_seqs, seq_len).to(device=self.device, dtype=torch.int64, non_blocking=True)
+        x = (
+            local[:-1]
+            .reshape(local_seqs, seq_len)
+            .to(device=self.device, dtype=torch.int64, non_blocking=True)
+        )
+        y = (
+            local[1:]
+            .reshape(local_seqs, seq_len)
+            .to(device=self.device, dtype=torch.int64, non_blocking=True)
+        )
         return x, y
 
 
@@ -1061,17 +1055,16 @@ def main():
     # --- Byte tokenizer setup ---
     tok = _build_tokenizer(args)
     vocab_size = tok.vocab_size
-    remap_lut = _build_shard_remap_lut(tok)
     log0(f"tokenizer: {tok.describe()}")
 
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
 
-    # Remap validation tokens
-    raw_val_tokens = load_validation_tokens(
+    # Remap validation tokens: raw byte values -> EfficientByteTokenizer IDs
+    raw_val_bytes = load_validation_tokens(
         args.val_files, args.train_seq_len, args.val_max_tokens
     )
-    val_tokens = remap_shard_tokens(raw_val_tokens, remap_lut)
+    val_tokens = remap_shard_tokens(raw_val_bytes, tok)
 
     base_bytes_lut = build_byte_bpb_lut(tok, device)
     log0(f"val_bpb:enabled tokenizer_kind=efficient_byte vocab_size={vocab_size}")
@@ -1212,7 +1205,7 @@ def main():
     log0(f"seed:{args.seed}")
 
     train_loader = DistributedTokenLoader(
-        args.train_files, remap_lut, rank, world_size, device
+        args.train_files, tok, rank, world_size, device
     )
 
     def zero_grad_all():
@@ -1280,7 +1273,7 @@ def main():
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(
-            args.train_files, remap_lut, rank, world_size, device
+            args.train_files, tok, rank, world_size, device
         )
 
     training_time_ms = 0.0
