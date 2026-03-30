@@ -469,25 +469,20 @@ class ContextTargetLoader:
         stride = self.stride
 
         per_rank_seqs = batch_size_per_rank
-        per_rank_tokens = (s + 1) + (per_rank_seqs - 1) * stride
+        total_seqs = per_rank_seqs * self.world_size
+        total_tokens = (s + 1) + (total_seqs - 1) * stride
 
-        # Skip preceding ranks
-        skip_before = 0
-        for r in range(self.rank):
-            skip_before += per_rank_seqs * stride
-        if skip_before > 0:
-            self.stream.take(skip_before)
+        # Fill buffer with contiguous tokens covering all ranks
+        self._fill_buffer(total_tokens)
+        buf = self._buf[:total_tokens]
+        self._buf = self._buf[total_seqs * stride :]
 
-        # Read this rank's contiguous block
-        self._fill_buffer(per_rank_tokens)
-        buf = self._buf[:per_rank_tokens]
-        self._buf = self._buf[per_rank_seqs * stride :]
-
-        # Extract sliding windows
+        # Extract this rank's sliding windows
+        rank_offset = self.rank * per_rank_seqs * stride
         contexts = []
         targets = []
         for i in range(per_rank_seqs):
-            start = i * stride
+            start = rank_offset + i * stride
             window = buf[start : start + s + 1]
             contexts.append(window[:s])
             targets.append(window[s])
@@ -500,13 +495,6 @@ class ContextTargetLoader:
             device=self.device,
             dtype=torch.int64,
         )
-
-        # Skip remaining ranks
-        skip_after = 0
-        for r in range(self.rank + 1, self.world_size):
-            skip_after += per_rank_seqs * stride
-        if skip_after > 0:
-            self.stream.take(skip_after)
 
         return context, target
 
