@@ -1183,6 +1183,22 @@ def main():
         )
         optimizers.insert(1, optimizer_head)
 
+    # Verify every trainable parameter is in exactly one optimizer.
+    optimized_ids: set[int] = set()
+    for opt in optimizers:
+        for group in opt.param_groups:
+            for p in group["params"]:
+                assert id(p) not in optimized_ids, "parameter in multiple optimizers"
+                optimized_ids.add(id(p))
+    all_param_ids = {id(p) for p in base_model.parameters()}
+    untrained = all_param_ids - optimized_ids
+    assert not untrained, (
+        f"{len(untrained)} parameters not in any optimizer: "
+        + ", ".join(
+            n for n, p in base_model.named_parameters() if id(p) not in optimized_ids
+        )
+    )
+
     n_params = sum(p.numel() for p in base_model.parameters())
     num_blocks = len(base_model.shared_blocks)
     log0(f"model_params:{n_params}")
