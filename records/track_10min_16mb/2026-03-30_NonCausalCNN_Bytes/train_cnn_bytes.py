@@ -518,7 +518,7 @@ class ConvLayerConfig:
     padding: str = "same"  # "same", "valid", or an integer string like "2"
     dilation: int = 1
     groups: int = 1
-    activation: str = "gelu"  # "relu", "gelu", "silu", "relu_squared", "none"
+    activation: str = "relu"  # "relu", "gelu", "silu", "relu_squared", "none"
     use_residual: bool = True
     use_scale_factor: bool = True  # learned residual scale (TFScripts AddResidual)
     scale_factor_init: float = 0.001  # initial std for learned scale factor
@@ -538,7 +538,7 @@ DEFAULT_LAYER_CONFIGS = [
         kernel_size=7,
         stride=1,
         padding="same",
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -546,7 +546,7 @@ DEFAULT_LAYER_CONFIGS = [
         num_filters=128,
         kernel_size=5,
         stride=2,
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -555,7 +555,7 @@ DEFAULT_LAYER_CONFIGS = [
         kernel_size=5,
         stride=1,
         padding="same",
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -563,7 +563,7 @@ DEFAULT_LAYER_CONFIGS = [
         num_filters=256,
         kernel_size=3,
         stride=2,
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -572,7 +572,7 @@ DEFAULT_LAYER_CONFIGS = [
         kernel_size=3,
         stride=1,
         padding="same",
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -580,7 +580,7 @@ DEFAULT_LAYER_CONFIGS = [
         num_filters=512,
         kernel_size=3,
         stride=2,
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -589,7 +589,7 @@ DEFAULT_LAYER_CONFIGS = [
         kernel_size=3,
         stride=1,
         padding="same",
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -597,7 +597,7 @@ DEFAULT_LAYER_CONFIGS = [
         num_filters=512,
         kernel_size=3,
         stride=2,
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
@@ -605,7 +605,7 @@ DEFAULT_LAYER_CONFIGS = [
         num_filters=512,
         kernel_size=3,
         stride=2,
-        activation="gelu",
+        activation="relu",
         use_residual=True,
         repair_std_deviation=True,
     ),
