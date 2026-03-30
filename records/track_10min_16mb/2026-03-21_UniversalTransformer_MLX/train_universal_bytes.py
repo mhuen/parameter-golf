@@ -119,6 +119,10 @@ class Hyperparameters:
 
     pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))  # broken with byte shards — see NotImplementedError below
 
+    # Learnable category attention mask
+    catmask_enabled = bool(int(os.environ.get("CATMASK_ENABLED", "0")))
+    catmask_lr = float(os.environ.get("CATMASK_LR", 0.04))
+
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
     fold = os.environ.get("FOLD", "")  # comma-separated ByteCategory values
@@ -292,7 +296,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_scale,cat_attn_logits",
     ).split(",")
     if pattern
 )
@@ -650,7 +654,7 @@ class CausalSelfAttention(nn.Module):
             self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
         )
 
-    def forward(self, x, doc_mask=None):
+    def forward(self, x, doc_mask=None, attn_bias=None):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         k = self.c_k(x)
@@ -664,12 +668,28 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        if doc_mask is not None:
+        if doc_mask is not None or attn_bias is not None:
+            # Build explicit causal + bias mask for non-flash path
+            mask = torch.zeros(
+                1, 1, seqlen, seqlen, device=x.device, dtype=q.dtype
+            )
+            # Causal: -inf for future positions
+            causal = torch.triu(
+                torch.full((seqlen, seqlen), float("-inf"), device=x.device, dtype=q.dtype),
+                diagonal=1,
+            )
+            mask = mask + causal
+            if doc_mask is not None:
+                # doc_mask is (B, 1, S, S) bool — convert disallowed to -inf
+                mask = mask + torch.where(doc_mask, 0.0, float("-inf"))
+            if attn_bias is not None:
+                # attn_bias is (B, H, S, S) float — additive bias
+                mask = mask + attn_bias
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=doc_mask,
+                attn_mask=mask,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
@@ -722,6 +742,60 @@ class GatedCausalConv(nn.Module):
         return (gate * value).transpose(1, 2)
 
 
+NUM_BYTE_CATEGORIES = 8
+_BYTE_CATEGORY_DEFS = [
+    ByteCategory.BOS,
+    ByteCategory.PAD,
+    ByteCategory.DIGIT,
+    ByteCategory.LETTER,
+    ByteCategory.SEPARATOR,
+    ByteCategory.PUNCTUATION,
+    ByteCategory.SYMBOL,
+    ByteCategory.MULTIBYTE,
+]
+
+
+class CategoryAttnBias(nn.Module):
+    """Builds a token→category LUT and computes (B, H, S, S) attention bias
+    from per-layer learnable logits of shape (H, C, C).
+
+    The bias encodes which category-pairs should attend more/less to each other.
+    Initialized to zero (no bias), so the model starts with standard causal
+    attention and learns to differentiate.
+    """
+
+    def __init__(self, tok: EfficientByteTokenizer):
+        super().__init__()
+        V = tok.vocab_size
+        token_to_cat = torch.zeros(V, dtype=torch.long)
+        for ci, cat in enumerate(_BYTE_CATEGORY_DEFS):
+            mask = tok.mask(cat)
+            for tid in range(V):
+                if mask[tid]:
+                    token_to_cat[tid] = ci
+        self.register_buffer("token_to_cat", token_to_cat)
+
+    def forward(self, input_ids: Tensor, cat_attn_logits: Tensor) -> Tensor:
+        """Compute (B, H, S, S) additive attention bias.
+
+        Args:
+            input_ids: (B, S) token IDs.
+            cat_attn_logits: (H, C, C) learnable logits for this layer.
+
+        Returns:
+            (B, H, S, S) additive bias (combine with causal mask before softmax).
+        """
+        cat_ids = self.token_to_cat[input_ids]  # (B, S)
+        cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(
+            dtype=cat_attn_logits.dtype
+        )  # (B, S, C)
+        # (B, 1, S, C) @ (1, H, C, C) -> (B, H, S, C)
+        q_contrib = cat_oh.unsqueeze(1) @ cat_attn_logits.unsqueeze(0)
+        # (B, H, S, C) @ (B, 1, C, S) -> (B, H, S, S)
+        bias = q_contrib @ cat_oh.unsqueeze(1).transpose(-1, -2)
+        return bias
+
+
 class SharedBlock(nn.Module):
     """Shared transformer block: attention + MLP with norms. No per-layer scalars."""
 
@@ -759,6 +833,7 @@ class SharedBlock(nn.Module):
         conv=None,
         conv_scale=None,
         doc_mask=None,
+        attn_bias=None,
     ):
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
@@ -766,7 +841,7 @@ class SharedBlock(nn.Module):
                 self.conv_norm(x)
             )
         n = self.attn_norm(x)
-        attn_out = self.attn(n, doc_mask=doc_mask)
+        attn_out = self.attn(n, doc_mask=doc_mask, attn_bias=attn_bias)
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -776,7 +851,7 @@ class LayerScalars(nn.Module):
     """Per-layer scalars: attn_scale, mlp_scale, conv_scale, resid_mix.
     Optionally holds a per-layer GatedCausalConv when conv is not shared."""
 
-    def __init__(self, dim, conv_kernel_size=0, conv_groups=0):
+    def __init__(self, dim, num_heads=0, conv_kernel_size=0, conv_groups=0, catmask=False):
         super().__init__()
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -791,6 +866,16 @@ class LayerScalars(nn.Module):
         self.conv_scale = (
             nn.Parameter(torch.ones(dim, dtype=torch.float32))
             if conv_kernel_size > 0
+            else None
+        )
+        self.cat_attn_logits = (
+            nn.Parameter(
+                torch.zeros(
+                    num_heads, NUM_BYTE_CATEGORIES, NUM_BYTE_CATEGORIES,
+                    dtype=torch.float32,
+                )
+            )
+            if catmask
             else None
         )
 
@@ -1194,6 +1279,7 @@ class GPT(nn.Module):
         conv_shared=False,
         structured_output_logits=False,
         utf8_prior=False,
+        catmask=False,
         tok=None,
     ):
         super().__init__()
@@ -1241,12 +1327,15 @@ class GPT(nn.Module):
             ]
         )
 
+        self.catmask = catmask
         self.layer_scalars = nn.ModuleList(
             [
                 LayerScalars(
                     model_dim,
+                    num_heads=num_heads,
                     conv_kernel_size=per_layer_conv_ks,
                     conv_groups=conv_groups,
+                    catmask=catmask,
                 )
                 for _ in range(num_layers)
             ]
@@ -1288,6 +1377,12 @@ class GPT(nn.Module):
             self.utf8_prior_mod = UTF8Prior(tok)
         else:
             self.utf8_prior_mod = None
+        # Learnable category attention bias (token→category LUT, no learnable params here)
+        if catmask:
+            assert tok is not None, "catmask requires tok"
+            self.cat_attn_bias = CategoryAttnBias(tok)
+        else:
+            self.cat_attn_bias = None
         self._init_weights()
 
     def _init_weights(self):
@@ -1306,6 +1401,11 @@ class GPT(nn.Module):
             return ls.conv, ls.conv_scale
         return None, self.shared_conv_scales[layer_idx]
 
+    def _get_attn_bias(self, ls, input_ids):
+        if self.cat_attn_bias is None or ls.cat_attn_logits is None:
+            return None
+        return self.cat_attn_bias(input_ids, ls.cat_attn_logits)
+
     def forward(self, input_ids, target_ids, doc_mask=None):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -1317,6 +1417,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
+            attn_bias = self._get_attn_bias(ls, input_ids)
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1324,6 +1425,7 @@ class GPT(nn.Module):
                 conv=conv,
                 conv_scale=conv_scale,
                 doc_mask=doc_mask,
+                attn_bias=attn_bias,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -1338,6 +1440,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
+            attn_bias = self._get_attn_bias(ls, input_ids)
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
@@ -1345,6 +1448,7 @@ class GPT(nn.Module):
                 conv=conv,
                 conv_scale=conv_scale,
                 doc_mask=doc_mask,
+                attn_bias=attn_bias,
             )
         x = self.final_norm(x)
         # Compute UTF-8 prior masks (purely from input_ids, causal)
@@ -1431,10 +1535,11 @@ def main():
         enable_mem_efficient_sdp,
     )
 
+    _needs_explicit_mask = args.pack_doc_mask or args.catmask_enabled
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(args.pack_doc_mask)
-    enable_math_sdp(args.pack_doc_mask)
+    enable_mem_efficient_sdp(_needs_explicit_mask)
+    enable_math_sdp(_needs_explicit_mask)
 
     run_dir = f"models/{args.run_id}"
     logfile = None
@@ -1504,7 +1609,10 @@ def main():
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
     if args.utf8_prior:
         log0("utf8_prior:enabled")
+    if args.catmask_enabled:
+        log0("catmask:enabled (per-layer learnable category attention bias)")
 
+    _needs_tok = args.structured_output_logits or args.utf8_prior or args.catmask_enabled
     base_model = (
         GPT(
             vocab_size=vocab_size,
@@ -1525,7 +1633,8 @@ def main():
             conv_shared=args.conv_shared,
             structured_output_logits=args.structured_output_logits,
             utf8_prior=args.utf8_prior,
-            tok=tok if (args.structured_output_logits or args.utf8_prior) else None,
+            catmask=args.catmask_enabled,
+            tok=tok if _needs_tok else None,
         )
         .to(device)
         .bfloat16()
@@ -1563,10 +1672,18 @@ def main():
         and id(p) not in conv_weight_ids
     ]
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
+    catmask_param_ids = {
+        id(ls.cat_attn_logits)
+        for ls in base_model.layer_scalars
+        if ls.cat_attn_logits is not None
+    }
+    catmask_params = []
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
             if id(p) in conv_weight_ids:
                 conv_params.append(p)
+            elif id(p) in catmask_param_ids:
+                catmask_params.append(p)
             else:
                 scalar_params.append(p)
     if base_model.skip_weights.numel() > 0:
@@ -1605,6 +1722,14 @@ def main():
             fused=True,
         )
         optimizers.append(optimizer_conv)
+    if catmask_params:
+        optimizer_catmask = torch.optim.Adam(
+            [{"params": catmask_params, "lr": args.catmask_lr, "base_lr": args.catmask_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_catmask)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [
@@ -1656,7 +1781,7 @@ def main():
     num_blocks = len(base_model.shared_blocks)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}")
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} pack_doc_mask:{args.pack_doc_mask}"
     )
