@@ -85,12 +85,15 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     global_pool = os.environ.get("GLOBAL_POOL", "adaptive_avg")
     layer_configs_json = os.environ.get("LAYER_CONFIGS", "")
+    head_dims_json = os.environ.get(
+        "HEAD_DIMS", ""
+    )  # e.g. "[512,256]" or empty=one hidden layer matching final conv channels
     window_stride = int(os.environ.get("WINDOW_STRIDE", 0))  # 0 = seq_len // 2
 
     # Optimizer
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    conv_lr = float(os.environ.get("CONV_LR", 0.01))
+    conv_lr = float(os.environ.get("CONV_LR", 0.001))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
@@ -905,6 +908,7 @@ class CNNNextTokenPredictor(nn.Module):
         tied_embed_init_std: float,
         global_pool: str = "adaptive_avg",
         seq_len: int = 512,
+        head_dims: list[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -935,12 +939,19 @@ class CNNNextTokenPredictor(nn.Module):
         else:
             self._flat_dim = in_ch
 
-        # MLP head
-        self.head = nn.Sequential(
-            nn.Linear(self._flat_dim, in_ch),
-            nn.GELU(),
-            nn.Linear(in_ch, vocab_size),
-        )
+        # MLP head: configurable hidden layers
+        # head_dims=None or [] -> single hidden layer matching final conv channels
+        # head_dims=[512, 256] -> Linear->GELU->Linear->GELU->Linear(->vocab)
+        if head_dims is None or len(head_dims) == 0:
+            head_dims = [in_ch]
+        head_layers: list[nn.Module] = []
+        prev_dim = self._flat_dim
+        for hd in head_dims:
+            head_layers.append(nn.Linear(prev_dim, hd))
+            head_layers.append(nn.GELU())
+            prev_dim = hd
+        head_layers.append(nn.Linear(prev_dim, vocab_size))
+        self.head = nn.Sequential(*head_layers)
         # Zero-init last linear for stable training start
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
@@ -1241,6 +1252,15 @@ def main():
             f"norm={cfg.norm} pool={cfg.pool_type}"
         )
 
+    # --- Parse head dims ---
+    head_dims: list[int] | None = None
+    if args.head_dims_json.strip():
+        head_dims = json.loads(args.head_dims_json)
+        assert isinstance(head_dims, list) and all(
+            isinstance(d, int) for d in head_dims
+        )
+    log0(f"head_dims: {head_dims or '(default: match final conv channels)'}")
+
     # --- Sliding window stride ---
     window_stride = (
         args.window_stride if args.window_stride > 0 else args.train_seq_len // 2
@@ -1257,6 +1277,7 @@ def main():
             tied_embed_init_std=args.tied_embed_init_std,
             global_pool=args.global_pool,
             seq_len=args.train_seq_len,
+            head_dims=head_dims,
         )
         .to(device)
         .bfloat16()
