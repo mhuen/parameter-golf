@@ -77,7 +77,7 @@ class Hyperparameters:
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 512))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     # CNN-specific
@@ -1132,7 +1132,10 @@ def _parse_layer_configs(json_str: str) -> list[ConvLayerConfig]:
         raw = json.loads(s)
     if not isinstance(raw, list):
         raise ValueError("LAYER_CONFIGS must be a JSON array of objects")
-    return [ConvLayerConfig(**{k: v for k, v in item.items() if not k.startswith("_")}) for item in raw]
+    return [
+        ConvLayerConfig(**{k: v for k, v in item.items() if not k.startswith("_")})
+        for item in raw
+    ]
 
 
 # -----------------------------
