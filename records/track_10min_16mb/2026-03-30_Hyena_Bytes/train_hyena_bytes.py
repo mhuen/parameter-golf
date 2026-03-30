@@ -592,13 +592,15 @@ def fft_causal_conv(x, h):
     Returns:
         (B, D, L) causal convolution output
     """
+    orig_dtype = x.dtype
     L = x.size(-1)
     fft_size = 2 * L
-    X_f = torch.fft.rfft(x, n=fft_size, dim=-1)
-    H_f = torch.fft.rfft(h, n=fft_size, dim=-1)
+    # CUDA FFT requires float32 (bfloat16 not supported)
+    X_f = torch.fft.rfft(x.float(), n=fft_size, dim=-1)
+    H_f = torch.fft.rfft(h.float(), n=fft_size, dim=-1)
     Y_f = X_f * H_f.unsqueeze(0)
     y = torch.fft.irfft(Y_f, n=fft_size, dim=-1)[..., :L]
-    return y
+    return y.to(dtype=orig_dtype)
 
 
 class HyenaOperator(nn.Module):
