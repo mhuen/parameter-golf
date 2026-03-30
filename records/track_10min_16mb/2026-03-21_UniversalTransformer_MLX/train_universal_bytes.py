@@ -29,6 +29,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+from collections import Counter
 
 import numpy as np
 import torch
@@ -83,6 +84,7 @@ class Hyperparameters:
     structured_output_logits = bool(
         int(os.environ.get("STRUCTURED_OUTPUT_LOGITS", "0"))
     )
+    utf8_prior = bool(int(os.environ.get("UTF8_PRIOR", "0")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     block_pattern = os.environ.get(
@@ -793,6 +795,191 @@ class LayerScalars(nn.Module):
         )
 
 
+class UTF8Prior(nn.Module):
+    """Precomputed UTF-8 structural prior masks (no learnable parameters).
+
+    Given input_ids, computes position-dependent masks that zero out tokens
+    impossible under UTF-8 encoding rules.  All operations are parallel
+    (bounded lookback of 3, no sequential scan).
+
+    Two masks are returned:
+      cat_mask   (B, S, num_categories) — additive 0/-inf for structured head level-0
+      token_mask (B, S, V)              — additive 0/-inf for final logits/log-probs
+    """
+
+    # Byte-type enum (plain ints — torch.compile friendly)
+    BT_BOS = 0
+    BT_PAD = 1
+    BT_ASCII = 2  # digit, letter, separator, punctuation, symbol
+    BT_LEAD_2 = 3
+    BT_LEAD_3 = 4
+    BT_LEAD_4 = 5
+    BT_CONT = 6
+
+    # State enum
+    ST_READY = 0  # expect ASCII / leading / special (no continuation)
+    ST_EXPECT_CONT = 1  # expect continuation byte
+    ST_UNSYNCED = 2  # unknown state (chunk boundary) — no constraint
+
+    def __init__(self, tok, num_categories=8, multibyte_cat_idx=7):
+        super().__init__()
+        V = tok.vocab_size
+        self.num_categories = num_categories
+        NEG_INF = float("-inf")
+
+        # ---- token_id → byte type & byte value ----
+        token_byte_type = torch.zeros(V, dtype=torch.long)
+        token_byte_value = torch.zeros(V, dtype=torch.long)
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info is None:
+                token_byte_type[tid] = self.BT_BOS if tid == tok.bos_id else self.BT_PAD
+            elif info.has(ByteCategory.MB_CONTINUATION):
+                token_byte_type[tid] = self.BT_CONT
+                token_byte_value[tid] = info.byte_value
+            elif info.has(ByteCategory.MB_LEAD_2):
+                token_byte_type[tid] = self.BT_LEAD_2
+                token_byte_value[tid] = info.byte_value
+            elif info.has(ByteCategory.MB_LEAD_3):
+                token_byte_type[tid] = self.BT_LEAD_3
+                token_byte_value[tid] = info.byte_value
+            elif info.has(ByteCategory.MB_LEAD_4):
+                token_byte_type[tid] = self.BT_LEAD_4
+                token_byte_value[tid] = info.byte_value
+            else:
+                token_byte_type[tid] = self.BT_ASCII
+                token_byte_value[tid] = info.byte_value
+        self.register_buffer("token_byte_type", token_byte_type)
+        self.register_buffer("token_byte_value", token_byte_value)
+
+        # ---- lead type → expected continuation count ----
+        lead_expected = torch.zeros(7, dtype=torch.long)
+        lead_expected[self.BT_LEAD_2] = 1
+        lead_expected[self.BT_LEAD_3] = 2
+        lead_expected[self.BT_LEAD_4] = 3
+        self.register_buffer("lead_expected", lead_expected)
+
+        # ---- state → category mask (3, num_categories) ----
+        state_cat_mask = torch.zeros(3, num_categories)
+        # READY: all categories valid (no constraint)
+        # EXPECT_CONT: only multibyte (idx 7) valid
+        for ci in range(num_categories):
+            if ci != multibyte_cat_idx:
+                state_cat_mask[self.ST_EXPECT_CONT, ci] = NEG_INF
+        # UNSYNCED: all valid
+        self.register_buffer("state_cat_mask", state_cat_mask)
+
+        # ---- state → token mask (3, V) ----
+        cont_np = tok.mask(ByteCategory.MB_CONTINUATION)
+        state_token_mask = torch.zeros(3, V)
+        # READY: forbid continuation bytes
+        for tid in range(V):
+            if cont_np[tid]:
+                state_token_mask[self.ST_READY, tid] = NEG_INF
+        # EXPECT_CONT: only continuation bytes valid
+        for tid in range(V):
+            if not cont_np[tid]:
+                state_token_mask[self.ST_EXPECT_CONT, tid] = NEG_INF
+        # UNSYNCED: all valid
+        self.register_buffer("state_token_mask", state_token_mask)
+
+        # ---- special lead byte constraints (first cont only) ----
+        # After 0xE0: first cont must be 0xA0–0xBF (prevent overlong 3-byte)
+        # After 0xED: first cont must be 0x80–0x9F (prevent surrogates)
+        # After 0xF0: first cont must be 0x90–0xBF (prevent overlong 4-byte)
+        special_e0 = state_token_mask[self.ST_EXPECT_CONT].clone()
+        special_ed = state_token_mask[self.ST_EXPECT_CONT].clone()
+        special_f0 = state_token_mask[self.ST_EXPECT_CONT].clone()
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info and info.has(ByteCategory.MB_CONTINUATION):
+                bv = info.byte_value
+                if bv < 0xA0:
+                    special_e0[tid] = NEG_INF
+                if bv > 0x9F:
+                    special_ed[tid] = NEG_INF
+                if bv < 0x90:
+                    special_f0[tid] = NEG_INF
+        self.register_buffer("special_e0", special_e0)
+        self.register_buffer("special_ed", special_ed)
+        self.register_buffer("special_f0", special_f0)
+
+    def forward(self, input_ids):
+        """Compute UTF-8 structural prior masks from input_ids.
+
+        The mask at position t constrains the *prediction* at position t
+        (i.e. target token t), based on the UTF-8 state after consuming
+        input_ids[t].  Only causal information (positions ≤ t) is used.
+
+        Args:
+            input_ids: (B, S) token IDs with BOS at position 0.
+
+        Returns:
+            cat_mask:   (B, S, num_categories) additive mask (0.0 or -inf)
+            token_mask: (B, S, V) additive mask (0.0 or -inf)
+        """
+        B, S = input_ids.shape
+        device = input_ids.device
+
+        # Step 1: classify each input token
+        byte_type = self.token_byte_type[input_ids]   # (B, S) long
+        byte_val = self.token_byte_value[input_ids]    # (B, S) long
+
+        # Step 2: continuation count via bounded lookback (max 3)
+        is_cont = byte_type == self.BT_CONT  # (B, S) bool
+        c1 = is_cont
+        c2 = torch.zeros(B, S, device=device, dtype=torch.bool)
+        c2[:, 1:] = is_cont[:, 1:] & is_cont[:, :-1]
+        c3 = torch.zeros(B, S, device=device, dtype=torch.bool)
+        c3[:, 2:] = is_cont[:, 2:] & is_cont[:, 1:-1] & is_cont[:, :-2]
+        cont_count = c1.long() + c2.long() + c3.long()  # (B, S), 0-3
+
+        # Step 3: find lead byte via lookback
+        positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+        lead_pos = (positions - cont_count).clamp(min=0)
+        lead_type = byte_type.gather(1, lead_pos)
+
+        # Step 4: remaining continuations expected
+        non_cont_remaining = self.lead_expected[byte_type]
+        cont_remaining = self.lead_expected[lead_type] - cont_count
+        remaining = torch.where(is_cont, cont_remaining, non_cont_remaining)
+
+        # Step 5: state assignment
+        is_valid_lead = (
+            (lead_type == self.BT_LEAD_2)
+            | (lead_type == self.BT_LEAD_3)
+            | (lead_type == self.BT_LEAD_4)
+        )
+        is_special = (byte_type == self.BT_BOS) | (byte_type == self.BT_PAD)
+        unsynced = is_special | (is_cont & ((lead_pos <= 0) | ~is_valid_lead))
+        state = torch.where(
+            unsynced,
+            self.ST_UNSYNCED,
+            torch.where(remaining > 0, self.ST_EXPECT_CONT, self.ST_READY),
+        )  # (B, S) long
+
+        # Step 6: gather base masks by state
+        cat_mask = self.state_cat_mask[state]      # (B, S, num_categories)
+        token_mask = self.state_token_mask[state]   # (B, S, V)
+
+        # Step 7: special lead byte refinements (first cont after E0/ED/F0)
+        # These apply when byte_type[t] is LEAD_3/LEAD_4 and byte value is special
+        is_e0 = (byte_type == self.BT_LEAD_3) & (byte_val == 0xE0)
+        is_ed = (byte_type == self.BT_LEAD_3) & (byte_val == 0xED)
+        is_f0 = (byte_type == self.BT_LEAD_4) & (byte_val == 0xF0)
+        token_mask = torch.where(
+            is_e0.unsqueeze(-1), self.special_e0, token_mask
+        )
+        token_mask = torch.where(
+            is_ed.unsqueeze(-1), self.special_ed, token_mask
+        )
+        token_mask = torch.where(
+            is_f0.unsqueeze(-1), self.special_f0, token_mask
+        )
+
+        return cat_mask, token_mask
+
+
 class StructuredOutputHead(nn.Module):
     """Hierarchical softmax output head based on ByteCategory tree.
 
@@ -915,6 +1102,8 @@ class StructuredOutputHead(nn.Module):
             _add_level(3, lead_map, lead_tids, leaf=False)
 
         # Leaf levels (skip groups with <=1 token — singletons need no leaf head)
+        leaf_token_ids: list[int] = []
+
         def _add_leaf(group):
             if len(group) > 1:
                 _add_level(
@@ -923,8 +1112,12 @@ class StructuredOutputHead(nn.Module):
                     group,
                     leaf=True,
                 )
+            leaf_token_ids.extend(sorted(group))
 
+        _add_leaf(cat_id_sets["bos"])
+        _add_leaf(cat_id_sets["pad"])
         _add_leaf(cat_id_sets["digit"])
+        _add_leaf(cat_id_sets["separator"])
         _add_leaf(upper_ids & vowel_ids)
         _add_leaf(upper_ids & consonant_ids)
         _add_leaf(lower_ids & vowel_ids)
@@ -936,6 +1129,24 @@ class StructuredOutputHead(nn.Module):
         _add_leaf(mb_lead3_ids)
         _add_leaf(mb_lead4_ids)
 
+        # Assert every token appears in exactly one leaf group
+        leaf_counts = Counter(leaf_token_ids)
+        duplicates = {tid: cnt for tid, cnt in leaf_counts.items() if cnt > 1}
+        if duplicates:
+            raise ValueError(
+                f"StructuredOutputHead: tokens appear in multiple leaves: {duplicates}"
+            )
+        leaf_set = set(leaf_token_ids)
+        expected = set(range(vocab_size))
+        missing = expected - leaf_set
+        extra = leaf_set - expected
+        if missing or extra:
+            raise ValueError(
+                f"StructuredOutputHead leaf coverage error: "
+                f"missing token IDs {sorted(missing)}, "
+                f"extra token IDs {sorted(extra)}"
+            )
+
         # ---- Store as module attributes ----
         self.heads = nn.ModuleList(heads)
         self.register_buffer(
@@ -943,16 +1154,28 @@ class StructuredOutputHead(nn.Module):
         )  # (num_levels, V)
         self.register_buffer("level_masks", torch.stack(all_masks))  # (num_levels, V)
 
-    def forward(self, x):
-        """Return (B, S, V) log-probabilities assembled from the hierarchy."""
+    def forward(self, x, cat_prior=None, token_prior=None):
+        """Return (B, S, V) log-probabilities assembled from the hierarchy.
+
+        Args:
+            x: (B, S, D) hidden states.
+            cat_prior: (B, S, num_categories) additive mask for level-0 logits.
+            token_prior: (B, S, V) additive mask for final log-probs.
+        """
         B, S, _ = x.shape
         log_p = torch.zeros(B, S, self.vocab_size, device=x.device, dtype=x.dtype)
         for i, head in enumerate(self.heads):
             logits = head(x)
+            if i == 0 and cat_prior is not None:
+                logits = logits + cat_prior
             if self._is_leaf[i]:
                 logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
             lp = F.log_softmax(logits, dim=-1)
             log_p = log_p + lp[..., self.level_indices[i]] * self.level_masks[i]
+        if token_prior is not None:
+            log_p = log_p + token_prior
+            # Renormalize: nll_loss expects valid log-probs summing to 1
+            log_p = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
         return log_p
 
 
@@ -976,6 +1199,7 @@ class GPT(nn.Module):
         conv_groups=0,
         conv_shared=False,
         structured_output_logits=False,
+        utf8_prior=False,
         tok=None,
     ):
         super().__init__()
@@ -1064,6 +1288,12 @@ class GPT(nn.Module):
             )
             if self.lm_head is not None:
                 self.lm_head._zero_init = True
+        # UTF-8 structural prior (no learnable params, just buffers)
+        if utf8_prior:
+            assert tok is not None, "utf8_prior requires tok"
+            self.utf8_prior_mod = UTF8Prior(tok)
+        else:
+            self.utf8_prior_mod = None
         self._init_weights()
 
     def _init_weights(self):
@@ -1123,8 +1353,14 @@ class GPT(nn.Module):
                 doc_mask=doc_mask,
             )
         x = self.final_norm(x)
+        # Compute UTF-8 prior masks (purely from input_ids, causal)
+        cat_prior, token_prior = None, None
+        if self.utf8_prior_mod is not None:
+            cat_prior, token_prior = self.utf8_prior_mod(input_ids)
         if self.structured_output_logits:
-            log_p = self.structured_head(x)
+            log_p = self.structured_head(
+                x, cat_prior=cat_prior, token_prior=token_prior
+            )
             return F.nll_loss(
                 log_p.float().reshape(-1, log_p.size(-1)),
                 target_ids.reshape(-1),
@@ -1135,6 +1371,8 @@ class GPT(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        if token_prior is not None:
+            logits = logits + token_prior
         return F.cross_entropy(
             logits.float().reshape(-1, logits.size(-1)),
             target_ids.reshape(-1),
@@ -1263,6 +1501,8 @@ def main():
     if args.structured_output_logits:
         args.tie_embeddings = False
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
+    if args.utf8_prior:
+        log0("utf8_prior:enabled")
 
     base_model = (
         GPT(
@@ -1283,7 +1523,8 @@ def main():
             conv_groups=args.conv_groups,
             conv_shared=args.conv_shared,
             structured_output_logits=args.structured_output_logits,
-            tok=tok if args.structured_output_logits else None,
+            utf8_prior=args.utf8_prior,
+            tok=tok if (args.structured_output_logits or args.utf8_prior) else None,
         )
         .to(device)
         .bfloat16()
