@@ -1,0 +1,84 @@
+[
+    {
+        "num_filters": 128,
+        "kernel_size": 7,
+        "stride": 1,
+        "padding": "same",
+        "activation": "gelu",
+        "use_residual": true,
+        "use_scale_factor": true,
+        "repair_std_deviation": true
+    },
+    {
+        "num_filters": 128,
+        "kernel_size": 5,
+        "stride": 2,
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true,
+        "_comment": "512 -> 256"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "stride": 1,
+        "padding": "same",
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 3,
+        "stride": 2,
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true,
+        "_comment": "256 -> 128"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": "same",
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 3,
+        "stride": 2,
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true,
+        "_comment": "128 -> 64"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 3,
+        "stride": 1,
+        "padding": "same",
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 3,
+        "stride": 2,
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true,
+        "_comment": "64 -> 32"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 3,
+        "stride": 2,
+        "activation": "gelu",
+        "use_residual": true,
+        "repair_std_deviation": true,
+        "_comment": "32 -> 16, then adaptive_avg_pool -> 1"
+    }
+]

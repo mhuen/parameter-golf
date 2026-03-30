@@ -1,0 +1,113 @@
+[
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same",
+        "_comment": "256 block 1/6, 512->512"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "512->256"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 256,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "256->128"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "_comment": "512 block 1/6"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "128->64"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "64->32"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "_comment": "512 block 1/6"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "32->16"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same"
+    },
+    {
+        "num_filters": 512,
+        "kernel_size": 5,
+        "padding": "same",
+        "pool_type": "max",
+        "pool_size": 2,
+        "_comment": "16->8, then adaptive_avg_pool->1"
+    }
+]
