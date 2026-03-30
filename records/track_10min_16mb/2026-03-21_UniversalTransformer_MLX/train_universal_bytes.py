@@ -80,6 +80,9 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    structured_output_logits = bool(
+        int(os.environ.get("STRUCTURED_OUTPUT_LOGITS", "0"))
+    )
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     block_pattern = os.environ.get(
@@ -790,6 +793,169 @@ class LayerScalars(nn.Module):
         )
 
 
+class StructuredOutputHead(nn.Module):
+    """Hierarchical softmax output head based on ByteCategory tree.
+
+    Decomposes token log-probability as a sum of log-normalized levels:
+      log p(token) = log p(category) + sum(log fraction_sub_i) + log fraction_leaf
+
+    Each level is independently log-softmax normalized.  Softcap is applied
+    only to leaf-level logits.
+    """
+
+    def __init__(self, model_dim, vocab_size, tok, logit_softcap):
+        super().__init__()
+        self.logit_softcap = logit_softcap
+        self.vocab_size = vocab_size
+
+        # ---- Gather token-ID sets from the tokenizer ----
+        def _ids(cat):
+            arr = tok.ids(cat)
+            return set(arr.tolist()) if len(arr) > 0 else set()
+
+        cat_defs = [
+            ("bos", ByteCategory.BOS),
+            ("pad", ByteCategory.PAD),
+            ("digit", ByteCategory.DIGIT),
+            ("letter", ByteCategory.LETTER),
+            ("separator", ByteCategory.SEPARATOR),
+            ("punctuation", ByteCategory.PUNCTUATION),
+            ("symbol", ByteCategory.SYMBOL),
+            ("multibyte", ByteCategory.MULTIBYTE),
+        ]
+        cat_id_sets = {name: _ids(cat) for name, cat in cat_defs}
+
+        upper_ids = _ids(ByteCategory.UPPERCASE)
+        lower_ids = _ids(ByteCategory.LOWERCASE)
+        vowel_ids = _ids(ByteCategory.VOWEL)
+        consonant_ids = _ids(ByteCategory.CONSONANT)
+        mb_cont_ids = _ids(ByteCategory.MB_CONTINUATION)
+        mb_leading_ids = _ids(ByteCategory.MB_LEADING)
+        mb_lead2_ids = _ids(ByteCategory.MB_LEAD_2)
+        mb_lead3_ids = _ids(ByteCategory.MB_LEAD_3)
+        mb_lead4_ids = _ids(ByteCategory.MB_LEAD_4)
+
+        # ---- Build levels (heads + index/mask buffers) ----
+        heads = []
+        all_indices = []
+        all_masks = []
+        self._is_leaf: list[bool] = []
+
+        def _add_level(head_size, token_to_idx, active_tids, leaf):
+            idx = torch.zeros(vocab_size, dtype=torch.long)
+            mask = torch.zeros(vocab_size, dtype=torch.float32)
+            for tid, j in token_to_idx.items():
+                idx[tid] = j
+            for tid in active_tids:
+                mask[tid] = 1.0
+            head = CastedLinear(model_dim, head_size, bias=False)
+            head._zero_init = True
+            heads.append(head)
+            all_indices.append(idx)
+            all_masks.append(mask)
+            self._is_leaf.append(leaf)
+
+        # Level: category (8-way, all tokens)
+        cat_map: dict[int, int] = {}
+        all_tids: set[int] = set()
+        for ci, (name, _) in enumerate(cat_defs):
+            for tid in cat_id_sets[name]:
+                cat_map[tid] = ci
+                all_tids.add(tid)
+        _add_level(len(cat_defs), cat_map, all_tids, leaf=False)
+
+        # Level: letter case (upper=0, lower=1)
+        letter_ids = cat_id_sets["letter"]
+        if upper_ids and lower_ids:
+            _add_level(
+                2,
+                {tid: (0 if tid in upper_ids else 1) for tid in letter_ids},
+                letter_ids,
+                leaf=False,
+            )
+
+        # Level: vowel/consonant for uppercase (vowel=0, consonant=1)
+        if upper_ids and (vowel_ids & upper_ids) and (consonant_ids & upper_ids):
+            _add_level(
+                2,
+                {tid: (0 if tid in vowel_ids else 1) for tid in upper_ids},
+                upper_ids,
+                leaf=False,
+            )
+
+        # Level: vowel/consonant for lowercase (vowel=0, consonant=1)
+        if lower_ids and (vowel_ids & lower_ids) and (consonant_ids & lower_ids):
+            _add_level(
+                2,
+                {tid: (0 if tid in vowel_ids else 1) for tid in lower_ids},
+                lower_ids,
+                leaf=False,
+            )
+
+        # Level: multibyte type (continuation=0, leading=1)
+        mb_ids = cat_id_sets["multibyte"]
+        if mb_cont_ids and mb_leading_ids:
+            _add_level(
+                2,
+                {tid: (0 if tid in mb_cont_ids else 1) for tid in mb_ids},
+                mb_ids,
+                leaf=False,
+            )
+
+        # Level: multibyte lead type (lead2=0, lead3=1, lead4=2)
+        lead_tids = mb_lead2_ids | mb_lead3_ids | mb_lead4_ids
+        if len(lead_tids) > 1:
+            lead_map: dict[int, int] = {}
+            for tid in mb_lead2_ids:
+                lead_map[tid] = 0
+            for tid in mb_lead3_ids:
+                lead_map[tid] = 1
+            for tid in mb_lead4_ids:
+                lead_map[tid] = 2
+            _add_level(3, lead_map, lead_tids, leaf=False)
+
+        # Leaf levels (skip groups with <=1 token — singletons need no leaf head)
+        def _add_leaf(group):
+            if len(group) > 1:
+                _add_level(
+                    len(group),
+                    {tid: i for i, tid in enumerate(sorted(group))},
+                    group,
+                    leaf=True,
+                )
+
+        _add_leaf(cat_id_sets["digit"])
+        _add_leaf(upper_ids & vowel_ids)
+        _add_leaf(upper_ids & consonant_ids)
+        _add_leaf(lower_ids & vowel_ids)
+        _add_leaf(lower_ids & consonant_ids)
+        _add_leaf(cat_id_sets["punctuation"])
+        _add_leaf(cat_id_sets["symbol"])
+        _add_leaf(mb_cont_ids)
+        _add_leaf(mb_lead2_ids)
+        _add_leaf(mb_lead3_ids)
+        _add_leaf(mb_lead4_ids)
+
+        # ---- Store as module attributes ----
+        self.heads = nn.ModuleList(heads)
+        self.register_buffer(
+            "level_indices", torch.stack(all_indices)
+        )  # (num_levels, V)
+        self.register_buffer("level_masks", torch.stack(all_masks))  # (num_levels, V)
+
+    def forward(self, x):
+        """Return (B, S, V) log-probabilities assembled from the hierarchy."""
+        B, S, _ = x.shape
+        log_p = torch.zeros(B, S, self.vocab_size, device=x.device, dtype=x.dtype)
+        for i, head in enumerate(self.heads):
+            logits = head(x)
+            if self._is_leaf[i]:
+                logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            lp = F.log_softmax(logits, dim=-1)
+            log_p = log_p + lp[..., self.level_indices[i]] * self.level_masks[i]
+        return log_p
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -809,6 +975,8 @@ class GPT(nn.Module):
         conv_kernel_size=0,
         conv_groups=0,
         conv_shared=False,
+        structured_output_logits=False,
+        tok=None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -877,11 +1045,25 @@ class GPT(nn.Module):
             self.shared_conv_scales = None
 
         self.final_norm = RMSNorm()
-        self.lm_head = (
-            None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-        )
-        if self.lm_head is not None:
-            self.lm_head._zero_init = True
+        self.structured_output_logits = structured_output_logits
+        if structured_output_logits:
+            assert not tie_embeddings, (
+                "structured_output_logits requires tie_embeddings=False"
+            )
+            assert tok is not None, "structured_output_logits requires tok"
+            self.structured_head = StructuredOutputHead(
+                model_dim, vocab_size, tok, logit_softcap
+            )
+            self.lm_head = None
+        else:
+            self.structured_head = None
+            self.lm_head = (
+                None
+                if tie_embeddings
+                else CastedLinear(model_dim, vocab_size, bias=False)
+            )
+            if self.lm_head is not None:
+                self.lm_head._zero_init = True
         self._init_weights()
 
     def _init_weights(self):
@@ -941,6 +1123,13 @@ class GPT(nn.Module):
                 doc_mask=doc_mask,
             )
         x = self.final_norm(x)
+        if self.structured_output_logits:
+            log_p = self.structured_head(x)
+            return F.nll_loss(
+                log_p.float().reshape(-1, log_p.size(-1)),
+                target_ids.reshape(-1),
+                reduction="mean",
+            )
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
         else:
@@ -1071,6 +1260,10 @@ def main():
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
 
+    if args.structured_output_logits:
+        args.tie_embeddings = False
+        log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
+
     base_model = (
         GPT(
             vocab_size=vocab_size,
@@ -1089,6 +1282,8 @@ def main():
             conv_kernel_size=args.conv_kernel_size if args.conv_enabled else 0,
             conv_groups=args.conv_groups,
             conv_shared=args.conv_shared,
+            structured_output_logits=args.structured_output_logits,
+            tok=tok if args.structured_output_logits else None,
         )
         .to(device)
         .bfloat16()
@@ -1182,6 +1377,22 @@ def main():
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+    if base_model.structured_head is not None:
+        structured_params = list(base_model.structured_head.parameters())
+        if structured_params:
+            optimizer_structured = torch.optim.Adam(
+                [
+                    {
+                        "params": structured_params,
+                        "lr": args.head_lr,
+                        "base_lr": args.head_lr,
+                    }
+                ],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=True,
+            )
+            optimizers.insert(1, optimizer_structured)
 
     # Verify every trainable parameter is in exactly one optimizer.
     optimized_ids: set[int] = set()
