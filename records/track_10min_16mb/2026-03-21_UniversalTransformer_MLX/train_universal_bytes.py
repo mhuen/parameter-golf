@@ -922,8 +922,8 @@ class UTF8Prior(nn.Module):
         device = input_ids.device
 
         # Step 1: classify each input token
-        byte_type = self.token_byte_type[input_ids]   # (B, S) long
-        byte_val = self.token_byte_value[input_ids]    # (B, S) long
+        byte_type = self.token_byte_type[input_ids]  # (B, S) long
+        byte_val = self.token_byte_value[input_ids]  # (B, S) long
 
         # Step 2: continuation count via bounded lookback (max 3)
         is_cont = byte_type == self.BT_CONT  # (B, S) bool
@@ -959,23 +959,17 @@ class UTF8Prior(nn.Module):
         )  # (B, S) long
 
         # Step 6: gather base masks by state
-        cat_mask = self.state_cat_mask[state]      # (B, S, num_categories)
-        token_mask = self.state_token_mask[state]   # (B, S, V)
+        cat_mask = self.state_cat_mask[state]  # (B, S, num_categories)
+        token_mask = self.state_token_mask[state]  # (B, S, V)
 
         # Step 7: special lead byte refinements (first cont after E0/ED/F0)
         # These apply when byte_type[t] is LEAD_3/LEAD_4 and byte value is special
         is_e0 = (byte_type == self.BT_LEAD_3) & (byte_val == 0xE0)
         is_ed = (byte_type == self.BT_LEAD_3) & (byte_val == 0xED)
         is_f0 = (byte_type == self.BT_LEAD_4) & (byte_val == 0xF0)
-        token_mask = torch.where(
-            is_e0.unsqueeze(-1), self.special_e0, token_mask
-        )
-        token_mask = torch.where(
-            is_ed.unsqueeze(-1), self.special_ed, token_mask
-        )
-        token_mask = torch.where(
-            is_f0.unsqueeze(-1), self.special_f0, token_mask
-        )
+        token_mask = torch.where(is_e0.unsqueeze(-1), self.special_e0, token_mask)
+        token_mask = torch.where(is_ed.unsqueeze(-1), self.special_ed, token_mask)
+        token_mask = torch.where(is_f0.unsqueeze(-1), self.special_f0, token_mask)
 
         return cat_mask, token_mask
 
