@@ -117,7 +117,7 @@ class Hyperparameters:
 
     rope_dim_fraction = float(os.environ.get("ROPE_DIM_FRACTION", 1.0))
 
-    pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))
+    pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))  # broken with byte shards — see NotImplementedError below
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -1492,6 +1492,13 @@ def main():
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
 
+    if args.pack_doc_mask:
+        raise NotImplementedError(
+            "PACK_DOC_MASK is broken with byte shards: BOS tokens are stripped "
+            "during remap_byte_array (byte value 1 is in _UNUSED_BYTES) so "
+            "build_doc_mask never finds document boundaries. The mask collapses "
+            "to a plain causal mask, adding overhead with no effect."
+        )
     if args.structured_output_logits:
         args.tie_embeddings = False
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
