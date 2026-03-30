@@ -83,10 +83,10 @@ class Hyperparameters:
     # CNN-specific
     embed_dim = int(os.environ.get("EMBED_DIM", 128))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    global_pool = os.environ.get("GLOBAL_POOL", "adaptive_avg")
+    global_pool = os.environ.get("GLOBAL_POOL", "flatten")
     layer_configs_json = os.environ.get("LAYER_CONFIGS", "")
     head_dims_json = os.environ.get(
-        "HEAD_DIMS", ""
+        "HEAD_DIMS", "[512, 512]"
     )  # e.g. "[512,256]" or empty=one hidden layer matching final conv channels
     window_stride = int(os.environ.get("WINDOW_STRIDE", 0))  # 0 = seq_len // 2
 
