@@ -113,8 +113,15 @@ class Hyperparameters:
 
 # Flash Attention 4 (optional, requires Hopper/Blackwell + flash-attn-4 package)
 try:
-    from flash_attn.cute import flash_attn_func as _fa4_func
-    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
+    from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+
+    @torch.compiler.disable
+    def _fa4_func(*args, **kwargs):
+        return flash_attn_func(*args, **kwargs)
+
+    @torch.compiler.disable
+    def _fa4_varlen_func(*args, **kwargs):
+        return flash_attn_varlen_func(*args, **kwargs)
 
     _FA4_AVAILABLE = True
 except ImportError:
