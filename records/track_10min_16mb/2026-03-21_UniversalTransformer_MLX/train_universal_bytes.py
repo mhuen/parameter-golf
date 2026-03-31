@@ -104,6 +104,7 @@ class Hyperparameters:
         os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
     )
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_gram_ns = bool(int(os.environ.get("MUON_GRAM_NS", "0")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -117,7 +118,9 @@ class Hyperparameters:
 
     rope_dim_fraction = float(os.environ.get("ROPE_DIM_FRACTION", 1.0))
 
-    pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))  # broken with byte shards — see NotImplementedError below
+    pack_doc_mask = bool(
+        int(os.environ.get("PACK_DOC_MASK", "0"))
+    )  # broken with byte shards — see NotImplementedError below
 
     # Learnable category attention mask: off, bias, or lora
     catmask_mode = os.environ.get("CATMASK_MODE", "off")  # off | bias | lora
@@ -133,11 +136,35 @@ class Hyperparameters:
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
+# Gram Newton-Schulz: https://dao-lab.ai/blog/2026/gram-newton-schulz/
+
+# Try to import Dao-AILab's optimized Gram Newton-Schulz (requires Hopper/Blackwell + CUDA 12.9+)
+try:
+    from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
+
+    _gram_ns_op = GramNewtonSchulz(
+        ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
+        gram_newton_schulz_reset_iterations=[2],
+    )
+    print("Imported optimized Gram Newton-Schulz from Dao-AILab.")
+    _GRAM_NS_LIB = True
+except ImportError:
+    _GRAM_NS_LIB = False
+    print(
+        "Could not import optimized Gram Newton-Schulz from Dao-AILab; falling back to pure PyTorch implementation."
+    )
+
+# Polar Express coefficients for pure-PyTorch Gram NS fallback.
+_GRAM_NS_COEFFS = [
+    (8.123737, -22.232240, 16.373715),
+    (4.026529, -2.776323, 0.514551),
+    (3.870284, -2.739120, 0.520999),
+    (3.253351, -2.343223, 0.481420),
+    (2.300652, -1.668904, 0.418807),
+]
 
 
-def zeropower_via_newtonschulz5(
-    G: Tensor, steps: int = 10, eps: float = 1e-7
-) -> Tensor:
+def _zeropower_standard_ns5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -151,6 +178,44 @@ def zeropower_via_newtonschulz5(
     return X.T if transposed else X
 
 
+def _zeropower_gram_ns5(G: Tensor, eps: float = 1e-7) -> Tensor:
+    """Stabilized Gram Newton-Schulz: iterates on the n×n Gram matrix instead of
+    the full n×m rectangle.  ~42-58 % fewer FLOPs for rectangular matrices.
+    Falls back to standard NS for square matrices (no benefit)."""
+    if G.size(0) == G.size(1):
+        return _zeropower_standard_ns5(G, eps=eps)
+    X = G.half()  # Gram NS uses fp16, not bf16
+    X /= X.norm() + eps
+    transposed = X.size(0) > X.size(1)
+    if transposed:
+        X = X.T
+    n = X.size(0)
+    R = X @ X.T
+    Q = torch.eye(n, device=X.device, dtype=X.dtype)
+    for t in range(5):
+        if t == 2:  # restart after iteration 2 for numerical stability
+            X = Q @ X
+            R = X @ X.T
+            Q = torch.eye(n, device=X.device, dtype=X.dtype)
+        a, b, c = _GRAM_NS_COEFFS[t]
+        Z = b * R + c * R @ R
+        Q = Q @ Z + a * Q
+        RZ = R @ Z + a * R
+        R = Z @ RZ + a * RZ
+    X = Q @ X
+    return X.T if transposed else X
+
+
+def zeropower_via_newtonschulz5(
+    G: Tensor, steps: int = 10, eps: float = 1e-7, gram_ns: bool = False
+) -> Tensor:
+    if gram_ns and G.size(0) != G.size(1):
+        if _GRAM_NS_LIB:
+            return _gram_ns_op(G)
+        return _zeropower_gram_ns5(G, eps=eps)
+    return _zeropower_standard_ns5(G, steps=steps, eps=eps)
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(
         self,
@@ -159,11 +224,16 @@ class Muon(torch.optim.Optimizer):
         momentum: float,
         backend_steps: int,
         nesterov: bool = True,
+        gram_ns: bool = False,
     ):
         super().__init__(
             params,
             dict(
-                lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                gram_ns=gram_ns,
             ),
         )
 
@@ -180,11 +250,12 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
-            lr, momentum, backend_steps, nesterov = (
+            lr, momentum, backend_steps, nesterov, gram_ns = (
                 group["lr"],
                 group["momentum"],
                 group["backend_steps"],
                 group["nesterov"],
+                group["gram_ns"],
             )
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(
@@ -201,7 +272,9 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g = zeropower_via_newtonschulz5(
+                        g, steps=backend_steps, gram_ns=gram_ns
+                    )
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -656,7 +729,9 @@ class CausalSelfAttention(nn.Module):
             self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
         )
 
-    def forward(self, x, doc_mask=None, attn_bias=None, q_delta=None, k_delta=None, v_delta=None):
+    def forward(
+        self, x, doc_mask=None, attn_bias=None, q_delta=None, k_delta=None, v_delta=None
+    ):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         k = self.c_k(x)
@@ -679,12 +754,12 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if doc_mask is not None or attn_bias is not None:
             # Build explicit causal + bias mask for non-flash path
-            mask = torch.zeros(
-                1, 1, seqlen, seqlen, device=x.device, dtype=q.dtype
-            )
+            mask = torch.zeros(1, 1, seqlen, seqlen, device=x.device, dtype=q.dtype)
             # Causal: -inf for future positions
             causal = torch.triu(
-                torch.full((seqlen, seqlen), float("-inf"), device=x.device, dtype=q.dtype),
+                torch.full(
+                    (seqlen, seqlen), float("-inf"), device=x.device, dtype=q.dtype
+                ),
                 diagonal=1,
             )
             mask = mask + causal
@@ -849,22 +924,30 @@ class SharedBlock(nn.Module):
         if cat_lora is not None:
             cat_oh, down, q_up, k_up, v_up = cat_lora
             low = n @ down.to(dtype=n.dtype).T  # (B, S, r)
+
             # One-hot matmul: (B,S,C) @ (C, dim*r) -> (B,S, dim*r), then contract with low
             def _cat_lora_delta(up, low):
                 C, out_dim, r = up.shape
-                selected = cat_oh @ up.to(dtype=n.dtype).reshape(C, -1)  # (B, S, out_dim*r)
+                selected = cat_oh @ up.to(dtype=n.dtype).reshape(
+                    C, -1
+                )  # (B, S, out_dim*r)
                 if r == 1:
                     return selected * low  # (B, S, out_dim) * (B, S, 1) broadcast
                 return (
                     selected.reshape(-1, out_dim, r) @ low.reshape(-1, r, 1)
                 ).reshape(cat_oh.shape[0], cat_oh.shape[1], out_dim)
+
             q_delta = _cat_lora_delta(q_up, low)
             k_delta = _cat_lora_delta(k_up, low)
             if v_up is not None:
                 v_delta = _cat_lora_delta(v_up, low)
         attn_out = self.attn(
-            n, doc_mask=doc_mask, attn_bias=attn_bias,
-            q_delta=q_delta, k_delta=k_delta, v_delta=v_delta,
+            n,
+            doc_mask=doc_mask,
+            attn_bias=attn_bias,
+            q_delta=q_delta,
+            k_delta=k_delta,
+            v_delta=v_delta,
         )
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -876,8 +959,15 @@ class LayerScalars(nn.Module):
     Optionally holds a per-layer GatedCausalConv when conv is not shared."""
 
     def __init__(
-        self, dim, num_heads=0, num_kv_heads=0, conv_kernel_size=0, conv_groups=0,
-        catmask_mode="off", catmask_rank=1, catmask_lora_v=False,
+        self,
+        dim,
+        num_heads=0,
+        num_kv_heads=0,
+        conv_kernel_size=0,
+        conv_groups=0,
+        catmask_mode="off",
+        catmask_rank=1,
+        catmask_lora_v=False,
     ):
         super().__init__()
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -897,10 +987,14 @@ class LayerScalars(nn.Module):
         )
         # Catmask: bias mode — per-head (C, C) attention score bias
         self.cat_attn_logits = (
-            nn.Parameter(torch.zeros(
-                num_heads, NUM_BYTE_CATEGORIES, NUM_BYTE_CATEGORIES,
-                dtype=torch.float32,
-            ))
+            nn.Parameter(
+                torch.zeros(
+                    num_heads,
+                    NUM_BYTE_CATEGORIES,
+                    NUM_BYTE_CATEGORIES,
+                    dtype=torch.float32,
+                )
+            )
             if catmask_mode == "bias"
             else None
         )
@@ -912,7 +1006,7 @@ class LayerScalars(nn.Module):
         if catmask_mode == "lora":
             # down: shared projection (random init — gradient flows via zero-init up)
             self.cat_lora_down = nn.Parameter(
-                torch.randn(r, dim, dtype=torch.float32) * (1.0 / dim ** 0.5)
+                torch.randn(r, dim, dtype=torch.float32) * (1.0 / dim**0.5)
             )
             # up: per-category projections (zero init — output is zero at start)
             self.cat_q_up = nn.Parameter(torch.zeros(C, dim, r, dtype=torch.float32))
@@ -1462,7 +1556,13 @@ class GPT(nn.Module):
         if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
             return self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits), None
         if self.catmask_mode == "lora" and ls.cat_lora_down is not None:
-            return None, (cat_oh, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
+            return None, (
+                cat_oh,
+                ls.cat_lora_down,
+                ls.cat_q_up,
+                ls.cat_k_up,
+                ls.cat_v_up,
+            )
         return None, None
 
     def forward(self, input_ids, target_ids, doc_mask=None):
@@ -1566,10 +1666,12 @@ def _build_tokenizer(args: Hyperparameters) -> EfficientByteTokenizer:
 
 
 def main():
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, _zeropower_standard_ns5, _zeropower_gram_ns5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    _zeropower_standard_ns5 = torch.compile(_zeropower_standard_ns5)
+    if args.muon_gram_ns and not _GRAM_NS_LIB:
+        _zeropower_gram_ns5 = torch.compile(_zeropower_gram_ns5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -1677,9 +1779,13 @@ def main():
     if args.utf8_prior:
         log0("utf8_prior:enabled")
     if args.catmask_mode != "off":
-        log0(f"catmask:mode={args.catmask_mode} rank={args.catmask_rank} lr={args.catmask_lr}")
+        log0(
+            f"catmask:mode={args.catmask_mode} rank={args.catmask_rank} lr={args.catmask_lr}"
+        )
 
-    _needs_tok = args.structured_output_logits or args.utf8_prior or args.catmask_mode != "off"
+    _needs_tok = (
+        args.structured_output_logits or args.utf8_prior or args.catmask_mode != "off"
+    )
     base_model = (
         GPT(
             vocab_size=vocab_size,
@@ -1743,7 +1849,13 @@ def main():
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
     catmask_param_ids = set()
     for ls in base_model.layer_scalars:
-        for attr in ("cat_attn_logits", "cat_lora_down", "cat_q_up", "cat_k_up", "cat_v_up"):
+        for attr in (
+            "cat_attn_logits",
+            "cat_lora_down",
+            "cat_q_up",
+            "cat_k_up",
+            "cat_v_up",
+        ):
             p = getattr(ls, attr, None)
             if p is not None:
                 catmask_param_ids.add(id(p))
@@ -1774,6 +1886,7 @@ def main():
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        gram_ns=args.muon_gram_ns,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1794,7 +1907,13 @@ def main():
         optimizers.append(optimizer_conv)
     if catmask_params:
         optimizer_catmask = torch.optim.Adam(
-            [{"params": catmask_params, "lr": args.catmask_lr, "base_lr": args.catmask_lr}],
+            [
+                {
+                    "params": catmask_params,
+                    "lr": args.catmask_lr,
+                    "base_lr": args.catmask_lr,
+                }
+            ],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
@@ -1851,7 +1970,9 @@ def main():
     num_blocks = len(base_model.shared_blocks)
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}")
+    log0(
+        f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}"
+    )
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} pack_doc_mask:{args.pack_doc_mask}"
     )

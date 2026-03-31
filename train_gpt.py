@@ -46,7 +46,10 @@ class Hyperparameters:
     tokenizer_path = os.environ.get(
         "TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model"
     )
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4())) + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_id = (
+        os.environ.get("RUN_ID", str(uuid.uuid4()))
+        + f"_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -88,6 +91,7 @@ class Hyperparameters:
         os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
     )
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_gram_ns = bool(int(os.environ.get("MUON_GRAM_NS", "0")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -104,13 +108,35 @@ class Hyperparameters:
 #
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
+# Gram Newton-Schulz: https://dao-lab.ai/blog/2026/gram-newton-schulz/
+
+# Try to import Dao-AILab's optimized Gram Newton-Schulz (requires Hopper/Blackwell + CUDA 12.9+)
+try:
+    from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
+
+    _gram_ns_op = GramNewtonSchulz(
+        ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
+        gram_newton_schulz_reset_iterations=[2],
+    )
+    _GRAM_NS_LIB = True
+    print("Imported optimized Gram Newton-Schulz from Dao-AILab.")
+except ImportError:
+    _GRAM_NS_LIB = False
+    print(
+        "Could not import optimized Gram Newton-Schulz from Dao-AILab; falling back to pure PyTorch implementation. To use the optimized version, ensure you have CUDA 12.9+ and a compatible GPU, and install the gram_newton_schulz package from Dao-AILab."
+    )
+
+# Polar Express coefficients for pure-PyTorch Gram NS fallback.
+_GRAM_NS_COEFFS = [
+    (8.123737, -22.232240, 16.373715),
+    (4.026529, -2.776323, 0.514551),
+    (3.870284, -2.739120, 0.520999),
+    (3.253351, -2.343223, 0.481420),
+    (2.300652, -1.668904, 0.418807),
+]
 
 
-def zeropower_via_newtonschulz5(
-    G: Tensor, steps: int = 10, eps: float = 1e-7
-) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
+def _zeropower_standard_ns5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -124,6 +150,48 @@ def zeropower_via_newtonschulz5(
     return X.T if transposed else X
 
 
+def _zeropower_gram_ns5(G: Tensor, eps: float = 1e-7) -> Tensor:
+    """Stabilized Gram Newton-Schulz: iterates on the n×n Gram matrix instead of
+    the full n×m rectangle.  ~42-58 % fewer FLOPs for rectangular matrices.
+    Falls back to standard NS for square matrices (no benefit)."""
+    if G.size(0) == G.size(1):
+        return _zeropower_standard_ns5(G, eps=eps)
+    X = G.half()  # Gram NS uses fp16, not bf16
+    X /= X.norm() + eps
+    transposed = X.size(0) > X.size(1)
+    if transposed:
+        X = X.T
+    n = X.size(0)
+    R = X @ X.T
+    Q = torch.eye(n, device=X.device, dtype=X.dtype)
+    for t in range(5):
+        if t == 2:  # restart after iteration 2 for numerical stability
+            X = Q @ X
+            R = X @ X.T
+            Q = torch.eye(n, device=X.device, dtype=X.dtype)
+        a, b, c = _GRAM_NS_COEFFS[t]
+        Z = b * R + c * R @ R
+        Q = Q @ Z + a * Q
+        RZ = R @ Z + a * R
+        R = Z @ RZ + a * RZ
+    X = Q @ X
+    return X.T if transposed else X
+
+
+def zeropower_via_newtonschulz5(
+    G: Tensor, steps: int = 10, eps: float = 1e-7, gram_ns: bool = False
+) -> Tensor:
+    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
+    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    # When gram_ns=True and the matrix is rectangular, use the stabilized Gram
+    # Newton-Schulz variant which iterates on the smaller Gram matrix.
+    if gram_ns and G.size(0) != G.size(1):
+        if _GRAM_NS_LIB:
+            return _gram_ns_op(G)
+        return _zeropower_gram_ns5(G, eps=eps)
+    return _zeropower_standard_ns5(G, steps=steps, eps=eps)
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(
         self,
@@ -132,11 +200,16 @@ class Muon(torch.optim.Optimizer):
         momentum: float,
         backend_steps: int,
         nesterov: bool = True,
+        gram_ns: bool = False,
     ):
         super().__init__(
             params,
             dict(
-                lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov
+                lr=lr,
+                momentum=momentum,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                gram_ns=gram_ns,
             ),
         )
 
@@ -159,6 +232,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            gram_ns = group["gram_ns"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(
@@ -176,7 +250,9 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    g = zeropower_via_newtonschulz5(
+                        g, steps=backend_steps, gram_ns=gram_ns
+                    )
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -864,11 +940,13 @@ BOS_ID = 1
 
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, _zeropower_standard_ns5, _zeropower_gram_ns5
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    _zeropower_standard_ns5 = torch.compile(_zeropower_standard_ns5)
+    if args.muon_gram_ns and not _GRAM_NS_LIB:
+        _zeropower_gram_ns5 = torch.compile(_zeropower_gram_ns5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1042,6 +1120,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        gram_ns=args.muon_gram_ns,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
