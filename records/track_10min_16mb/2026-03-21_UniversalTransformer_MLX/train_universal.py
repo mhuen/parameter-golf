@@ -368,7 +368,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
             else:
                 cu_seqlens, max_seqlen = None, None
             doc_mask = (
@@ -702,8 +702,18 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
     return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
 
 
-def build_cu_seqlens(input_ids: Tensor, bos_id: int) -> tuple[Tensor, int]:
-    """BOS boundaries → cu_seqlens for flash_attn_varlen_func. O(S) memory."""
+def build_cu_seqlens(input_ids: Tensor, bos_id: int, pad_to: int = 0) -> tuple[Tensor, int]:
+    """BOS boundaries → cu_seqlens for flash_attn_varlen_func. O(S) memory.
+
+    Args:
+        pad_to: if > 0, pad cu_seqlens to this fixed length with zero-length
+                phantom segments (terminal value repeated). Keeps tensor shape
+                constant for torch.compile with dynamic=False.
+
+    Returns:
+        cu_seqlens: (num_docs+1,) or (pad_to,) int32 cumulative sequence lengths.
+        max_seqlen: S (safe upper bound; avoids GPU→CPU sync).
+    """
     B, S = input_ids.shape
     flat = input_ids.reshape(-1)
     total = B * S
@@ -713,8 +723,10 @@ def build_cu_seqlens(input_ids: Tensor, bos_id: int) -> tuple[Tensor, int]:
     cu_seqlens = torch.cat(
         [all_starts, torch.tensor([total], device=input_ids.device, dtype=torch.int32)]
     )
-    doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    return cu_seqlens, int(doc_lens.max().item())
+    if pad_to > 0 and cu_seqlens.size(0) < pad_to:
+        padding = cu_seqlens.new_full((pad_to - cu_seqlens.size(0),), total)
+        cu_seqlens = torch.cat([cu_seqlens, padding])
+    return cu_seqlens, S
 
 
 class CausalSelfAttention(nn.Module):
@@ -1237,7 +1249,9 @@ def main():
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(
+        base_model, dynamic=False, fullgraph=not args.use_fa4,
+    )
     model = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
@@ -1362,6 +1376,7 @@ def main():
     if args.use_fa4:
         assert _FA4_AVAILABLE, "USE_FA4=1 but flash-attn-4 is not installed"
         log0("Using Flash Attention 4 (FA4)")
+    cu_seqlens_budget = args.train_batch_tokens // 64 + 2 if args.use_fa4 else 0
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
@@ -1415,7 +1430,7 @@ def main():
                     args.train_batch_tokens, args.train_seq_len, grad_accum_steps
                 )
                 if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                    cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                    cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
                 else:
                     cu_seqlens, max_seqlen = None, None
                 doc_mask = (
@@ -1495,7 +1510,7 @@ def main():
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
             if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
             else:
                 cu_seqlens, max_seqlen = None, None
             doc_mask = (

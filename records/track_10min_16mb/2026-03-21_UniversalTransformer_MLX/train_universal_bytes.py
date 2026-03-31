@@ -368,7 +368,7 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
             else:
                 cu_seqlens, max_seqlen = None, None
             doc_mask = (
@@ -378,8 +378,11 @@ def eval_val(
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(
-                    x, y, doc_mask=doc_mask,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    x,
+                    y,
+                    doc_mask=doc_mask,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
                 ).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -728,8 +731,18 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
     return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
 
 
-def build_cu_seqlens(input_ids: Tensor, bos_id: int) -> tuple[Tensor, int]:
-    """BOS boundaries → cu_seqlens for flash_attn_varlen_func. O(S) memory."""
+def build_cu_seqlens(input_ids: Tensor, bos_id: int, pad_to: int = 0) -> tuple[Tensor, int]:
+    """BOS boundaries → cu_seqlens for flash_attn_varlen_func. O(S) memory.
+
+    Args:
+        pad_to: if > 0, pad cu_seqlens to this fixed length with zero-length
+                phantom segments (terminal value repeated). Keeps tensor shape
+                constant for torch.compile with dynamic=False.
+
+    Returns:
+        cu_seqlens: (num_docs+1,) or (pad_to,) int32 cumulative sequence lengths.
+        max_seqlen: S (safe upper bound; avoids GPU→CPU sync).
+    """
     B, S = input_ids.shape
     flat = input_ids.reshape(-1)
     total = B * S
@@ -739,8 +752,10 @@ def build_cu_seqlens(input_ids: Tensor, bos_id: int) -> tuple[Tensor, int]:
     cu_seqlens = torch.cat(
         [all_starts, torch.tensor([total], device=input_ids.device, dtype=torch.int32)]
     )
-    doc_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    return cu_seqlens, int(doc_lens.max().item())
+    if pad_to > 0 and cu_seqlens.size(0) < pad_to:
+        padding = cu_seqlens.new_full((pad_to - cu_seqlens.size(0),), total)
+        cu_seqlens = torch.cat([cu_seqlens, padding])
+    return cu_seqlens, S
 
 
 class CausalSelfAttention(nn.Module):
@@ -815,12 +830,20 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if cu_seqlens is not None:
             # FA4 varlen path: (B,H,S,D) → (B*S, H, D)
-            q_fa = q.transpose(1, 2).reshape(bsz * seqlen, self.num_heads, self.head_dim)
-            k_fa = k.transpose(1, 2).reshape(bsz * seqlen, self.num_kv_heads, self.head_dim)
-            v_fa = v.transpose(1, 2).reshape(bsz * seqlen, self.num_kv_heads, self.head_dim)
+            q_fa = q.transpose(1, 2).reshape(
+                bsz * seqlen, self.num_heads, self.head_dim
+            )
+            k_fa = k.transpose(1, 2).reshape(
+                bsz * seqlen, self.num_kv_heads, self.head_dim
+            )
+            v_fa = v.transpose(1, 2).reshape(
+                bsz * seqlen, self.num_kv_heads, self.head_dim
+            )
             kwargs = dict(
-                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
                 causal=True,
             )
             if cat_attn_logits is not None and cat_ids is not None:
@@ -847,17 +870,32 @@ class CausalSelfAttention(nn.Module):
                 mask = mask + torch.where(doc_mask, 0.0, float("-inf"))
             if attn_bias is not None:
                 mask = mask + attn_bias
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=mask,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+            y = (
+                F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=mask,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                )
+                .transpose(1, 2)
+                .contiguous()
+                .reshape(bsz, seqlen, dim)
+            )
         else:
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None, is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
-            ).transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+            y = (
+                F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=None,
+                    is_causal=True,
+                    enable_gqa=(self.num_kv_heads != self.num_heads),
+                )
+                .transpose(1, 2)
+                .contiguous()
+                .reshape(bsz, seqlen, dim)
+            )
         return self.proj(y)
 
 
@@ -966,7 +1004,12 @@ class SharedBlock(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dim_fraction,
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            rope_dim_fraction,
             use_fa4=use_fa4,
         )
         self.mlp = MLP(dim, mlp_mult)
@@ -1647,18 +1690,30 @@ class GPT(nn.Module):
                 # FA4 path: return sparse tensors for score_mod
                 cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
                 return None, None, cat_ids, ls.cat_attn_logits
-            return self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits), None, None, None
+            return (
+                self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits),
+                None,
+                None,
+                None,
+            )
         if self.catmask_mode == "lora" and ls.cat_lora_down is not None:
-            return None, (
-                cat_oh,
-                ls.cat_lora_down,
-                ls.cat_q_up,
-                ls.cat_k_up,
-                ls.cat_v_up,
-            ), None, None
+            return (
+                None,
+                (
+                    cat_oh,
+                    ls.cat_lora_down,
+                    ls.cat_q_up,
+                    ls.cat_k_up,
+                    ls.cat_v_up,
+                ),
+                None,
+                None,
+            )
         return None, None, None, None
 
-    def forward(self, input_ids, target_ids, doc_mask=None, cu_seqlens=None, max_seqlen=None):
+    def forward(
+        self, input_ids, target_ids, doc_mask=None, cu_seqlens=None, max_seqlen=None
+    ):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1675,8 +1730,13 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = self._get_catmask_args(
-                ls, input_ids, cat_oh, cu_seqlens=cu_seqlens,
+            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = (
+                self._get_catmask_args(
+                    ls,
+                    input_ids,
+                    cat_oh,
+                    cu_seqlens=cu_seqlens,
+                )
             )
             x = self.shared_blocks[self.block_map[i]](
                 x,
@@ -1705,8 +1765,13 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = self._get_catmask_args(
-                ls, input_ids, cat_oh, cu_seqlens=cu_seqlens,
+            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = (
+                self._get_catmask_args(
+                    ls,
+                    input_ids,
+                    cat_oh,
+                    cu_seqlens=cu_seqlens,
+                )
             )
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
@@ -1926,7 +1991,9 @@ def main():
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(
+        base_model, dynamic=False, fullgraph=not args.use_fa4,
+    )
     model = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
@@ -2097,6 +2164,7 @@ def main():
     if args.use_fa4:
         assert _FA4_AVAILABLE, "USE_FA4=1 but flash-attn-4 is not installed"
         log0("Using Flash Attention 4 (FA4)")
+    cu_seqlens_budget = args.train_batch_tokens // 64 + 2 if args.use_fa4 else 0
 
     train_loader = DistributedTokenLoader(
         args.train_files, tok, rank, world_size, device
@@ -2152,7 +2220,7 @@ def main():
                     args.train_batch_tokens, args.train_seq_len, grad_accum_steps
                 )
                 if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                    cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                    cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
                 else:
                     cu_seqlens, max_seqlen = None, None
                 doc_mask = (
@@ -2162,8 +2230,11 @@ def main():
                 )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     warmup_loss = model(
-                        x, y, doc_mask=doc_mask,
-                        cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                        x,
+                        y,
+                        doc_mask=doc_mask,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -2230,7 +2301,7 @@ def main():
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
             if args.use_fa4 and _FA4_AVAILABLE and args.pack_doc_mask:
-                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID)
+                cu_seqlens, max_seqlen = build_cu_seqlens(x, BOS_ID, pad_to=cu_seqlens_budget)
             else:
                 cu_seqlens, max_seqlen = None, None
             doc_mask = (
@@ -2240,8 +2311,11 @@ def main():
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 loss = model(
-                    x, y, doc_mask=doc_mask,
-                    cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                    x,
+                    y,
+                    doc_mask=doc_mask,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
                 )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
