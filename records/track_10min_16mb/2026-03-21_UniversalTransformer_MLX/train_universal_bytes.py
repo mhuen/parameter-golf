@@ -847,14 +847,21 @@ class SharedBlock(nn.Module):
         # Compute category-conditional LoRA deltas from normed input
         q_delta, k_delta, v_delta = None, None, None
         if cat_lora is not None:
-            cat_ids, down, q_up, k_up, v_up = cat_lora
+            cat_oh, down, q_up, k_up, v_up = cat_lora
             low = n @ down.to(dtype=n.dtype).T  # (B, S, r)
-            low_unsq = low.unsqueeze(-1)  # (B, S, r, 1)
-            # *_up: (C, *_dim, r), gather by cat -> (B, S, *_dim, r) @ (B, S, r, 1)
-            q_delta = (q_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
-            k_delta = (k_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
+            # One-hot matmul: (B,S,C) @ (C, dim*r) -> (B,S, dim*r), then contract with low
+            def _cat_lora_delta(up, low):
+                C, out_dim, r = up.shape
+                selected = cat_oh @ up.to(dtype=n.dtype).reshape(C, -1)  # (B, S, out_dim*r)
+                if r == 1:
+                    return selected * low  # (B, S, out_dim) * (B, S, 1) broadcast
+                return (
+                    selected.reshape(-1, out_dim, r) @ low.reshape(-1, r, 1)
+                ).reshape(cat_oh.shape[0], cat_oh.shape[1], out_dim)
+            q_delta = _cat_lora_delta(q_up, low)
+            k_delta = _cat_lora_delta(k_up, low)
             if v_up is not None:
-                v_delta = (v_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
+                v_delta = _cat_lora_delta(v_up, low)
         attn_out = self.attn(
             n, doc_mask=doc_mask, attn_bias=attn_bias,
             q_delta=q_delta, k_delta=k_delta, v_delta=v_delta,
@@ -1448,15 +1455,14 @@ class GPT(nn.Module):
             return ls.conv, ls.conv_scale
         return None, self.shared_conv_scales[layer_idx]
 
-    def _get_catmask_args(self, ls, input_ids):
+    def _get_catmask_args(self, ls, input_ids, cat_oh):
         """Return (attn_bias, cat_lora) — one or both will be None."""
         if self.cat_attn_mod is None:
             return None, None
         if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
             return self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits), None
         if self.catmask_mode == "lora" and ls.cat_lora_down is not None:
-            cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
-            return None, (cat_ids, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
+            return None, (cat_oh, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
         return None, None
 
     def forward(self, input_ids, target_ids, doc_mask=None):
@@ -1465,12 +1471,18 @@ class GPT(nn.Module):
         x0 = x
         skips = []
 
+        # Precompute category one-hot once for all layers (lora mode)
+        cat_oh = None
+        if self.catmask_mode == "lora" and self.cat_attn_mod is not None:
+            cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
+            cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=x.dtype)
+
         for i in range(self.num_encoder_layers):
             ls = self.layer_scalars[i]
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids)
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids, cat_oh)
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1494,7 +1506,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids)
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids, cat_oh)
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
