@@ -145,16 +145,6 @@ except ImportError:
     _FA4_AVAILABLE = False
 
 
-def _catmask_score_mod(scores, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """FA4 score_mod for category attention bias.
-    aux_tensors[0] = cat_attn_logits (H, C, C), aux_tensors[1] = flat_cat_ids (total,)."""
-    cat_logits = aux_tensors[0]
-    flat_cats = aux_tensors[1]
-    q_cat = flat_cats[q_idx]
-    kv_cat = flat_cats[kv_idx]
-    return scores + cat_logits[h_idx, q_cat, kv_cat]
-
-
 # MUON OPTIMIZER
 # -----------------------------
 # Gram Newton-Schulz: https://dao-lab.ai/blog/2026/gram-newton-schulz/
@@ -805,8 +795,6 @@ class CausalSelfAttention(nn.Module):
         v_delta=None,
         cu_seqlens=None,
         max_seqlen=None,
-        cat_ids=None,
-        cat_attn_logits=None,
     ):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
@@ -839,20 +827,14 @@ class CausalSelfAttention(nn.Module):
             v_fa = v.transpose(1, 2).reshape(
                 bsz * seqlen, self.num_kv_heads, self.head_dim
             )
-            kwargs = dict(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen,
-                max_seqlen_k=max_seqlen,
+            y = _fa4_varlen_func(
+                q_fa, k_fa, v_fa,
+                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=True,
-            )
-            if cat_attn_logits is not None and cat_ids is not None:
-                flat_cat_ids = cat_ids.reshape(-1)
-                kwargs["score_mod"] = _catmask_score_mod
-                kwargs["aux_tensors"] = [cat_attn_logits, flat_cat_ids]
-            y = _fa4_varlen_func(q_fa, k_fa, v_fa, **kwargs)[0].reshape(bsz, seqlen, dim)
-        elif self.use_fa4:
-            # FA4 simple causal: (B,H,S,D) → (B,S,H,D)
+            )[0].reshape(bsz, seqlen, dim)
+        elif self.use_fa4 and attn_bias is None:
+            # FA4 simple causal (no attn_bias support — catmask_mode=bias uses SDPA)
             y = _fa4_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True
             )[0].reshape(bsz, seqlen, dim)
@@ -1032,8 +1014,6 @@ class SharedBlock(nn.Module):
         cat_lora=None,
         cu_seqlens=None,
         max_seqlen=None,
-        cat_ids=None,
-        cat_attn_logits=None,
     ):
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
@@ -1072,8 +1052,6 @@ class SharedBlock(nn.Module):
             v_delta=v_delta,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
-            cat_ids=cat_ids,
-            cat_attn_logits=cat_attn_logits,
         )
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -1678,39 +1656,21 @@ class GPT(nn.Module):
             return ls.conv, ls.conv_scale
         return None, self.shared_conv_scales[layer_idx]
 
-    def _get_catmask_args(self, ls, input_ids, cat_oh, cu_seqlens=None):
-        """Return (attn_bias, cat_lora, cat_ids, cat_attn_logits).
-
-        When cu_seqlens is not None (FA4 varlen path) and mode is 'bias',
-        return sparse (cat_ids, cat_attn_logits) instead of dense O(S²) bias.
-        """
+    def _get_catmask_args(self, ls, input_ids, cat_oh):
+        """Return (attn_bias, cat_lora) — one or both will be None."""
         if self.cat_attn_mod is None:
-            return None, None, None, None
+            return None, None
         if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
-            if cu_seqlens is not None:
-                # FA4 path: return sparse tensors for score_mod
-                cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
-                return None, None, cat_ids, ls.cat_attn_logits
-            return (
-                self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits),
-                None,
-                None,
-                None,
-            )
+            return self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits), None
         if self.catmask_mode == "lora" and ls.cat_lora_down is not None:
-            return (
-                None,
-                (
-                    cat_oh,
-                    ls.cat_lora_down,
-                    ls.cat_q_up,
-                    ls.cat_k_up,
-                    ls.cat_v_up,
-                ),
-                None,
-                None,
+            return None, (
+                cat_oh,
+                ls.cat_lora_down,
+                ls.cat_q_up,
+                ls.cat_k_up,
+                ls.cat_v_up,
             )
-        return None, None, None, None
+        return None, None
 
     def forward(
         self, input_ids, target_ids, doc_mask=None, cu_seqlens=None, max_seqlen=None
@@ -1726,32 +1686,12 @@ class GPT(nn.Module):
             cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
             cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=x.dtype)
 
-        # FA4 + catmask bias needs the varlen path (score_mod) even without doc_mask.
-        # Create trivial cu_seqlens (one segment per batch element) if not provided.
-        B, S = input_ids.shape
-        if (
-            self.use_fa4
-            and self.catmask_mode == "bias"
-            and cu_seqlens is None
-        ):
-            cu_seqlens = torch.arange(
-                0, (B + 1) * S, S, device=input_ids.device, dtype=torch.int32
-            )
-            max_seqlen = S
-
         for i in range(self.num_encoder_layers):
             ls = self.layer_scalars[i]
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = (
-                self._get_catmask_args(
-                    ls,
-                    input_ids,
-                    cat_oh,
-                    cu_seqlens=cu_seqlens,
-                )
-            )
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids, cat_oh)
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1763,8 +1703,6 @@ class GPT(nn.Module):
                 cat_lora=cat_lora,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cat_ids=layer_cat_ids,
-                cat_attn_logits=layer_cat_logits,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -1779,14 +1717,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias, cat_lora, layer_cat_ids, layer_cat_logits = (
-                self._get_catmask_args(
-                    ls,
-                    input_ids,
-                    cat_oh,
-                    cu_seqlens=cu_seqlens,
-                )
-            )
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids, cat_oh)
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
@@ -1798,8 +1729,6 @@ class GPT(nn.Module):
                 cat_lora=cat_lora,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
-                cat_ids=layer_cat_ids,
-                cat_attn_logits=layer_cat_logits,
             )
         x = self.final_norm(x)
         # Compute UTF-8 prior masks (purely from input_ids, causal)
