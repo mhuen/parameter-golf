@@ -840,12 +840,12 @@ class CausalSelfAttention(nn.Module):
                 cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
                 causal=True,
-            ).reshape(bsz, seqlen, dim)
+            )[0].reshape(bsz, seqlen, dim)
         elif self.use_fa4:
             # FA4 simple causal: (B,H,S,D) → (B,S,H,D)
             y = _fa4_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True
-            ).reshape(bsz, seqlen, dim)
+            )[0].reshape(bsz, seqlen, dim)
         elif doc_mask is not None:
             y = F.scaled_dot_product_attention(
                 q, k, v,

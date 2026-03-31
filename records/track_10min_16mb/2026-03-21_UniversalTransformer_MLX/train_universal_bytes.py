@@ -850,12 +850,12 @@ class CausalSelfAttention(nn.Module):
                 flat_cat_ids = cat_ids.reshape(-1)
                 kwargs["score_mod"] = _catmask_score_mod
                 kwargs["aux_tensors"] = [cat_attn_logits, flat_cat_ids]
-            y = _fa4_varlen_func(q_fa, k_fa, v_fa, **kwargs).reshape(bsz, seqlen, dim)
+            y = _fa4_varlen_func(q_fa, k_fa, v_fa, **kwargs)[0].reshape(bsz, seqlen, dim)
         elif self.use_fa4:
             # FA4 simple causal: (B,H,S,D) → (B,S,H,D)
             y = _fa4_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True
-            ).reshape(bsz, seqlen, dim)
+            )[0].reshape(bsz, seqlen, dim)
         elif doc_mask is not None or attn_bias is not None:
             # Build explicit causal + bias mask for non-flash path
             mask = torch.zeros(1, 1, seqlen, seqlen, device=x.device, dtype=q.dtype)
