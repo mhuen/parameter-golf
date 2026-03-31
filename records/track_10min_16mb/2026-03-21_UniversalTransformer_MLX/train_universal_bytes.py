@@ -2106,6 +2106,11 @@ def main():
     log0(f"seed:{args.seed}")
     if args.use_fa4:
         assert _FA4_AVAILABLE, "USE_FA4=1 but flash-attn-4 is not installed"
+        if args.catmask_mode == "bias":
+            raise RuntimeError(
+                "USE_FA4=1 is incompatible with CATMASK_MODE=bias (requires dense attn_bias). "
+                "Use CATMASK_MODE=lora or CATMASK_MODE=off for FA4."
+            )
         log0("Using Flash Attention 4 (FA4)")
     cu_seqlens_budget = args.train_batch_tokens // 64 + 2 if args.use_fa4 else 0
 
