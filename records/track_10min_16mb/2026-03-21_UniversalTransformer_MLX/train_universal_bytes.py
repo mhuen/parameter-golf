@@ -982,11 +982,11 @@ class DistanceBias(nn.Module):
         distances = torch.arange(max_distance + 1, dtype=torch.long)
         max_exact = num_buckets // 2
         is_small = distances < max_exact
-        val_if_large = max_exact + (
-            torch.log(distances.float() / max_exact)
-            / math.log(max_distance / max_exact)
-            * (num_buckets - max_exact)
-        ).long().clamp(min=max_exact, max=num_buckets - 1)
+        # Log-spaced buckets for distances >= max_exact
+        log_ratio = torch.log(distances.float().clamp(min=1) / max_exact) / math.log(max_distance / max_exact)
+        val_if_large = (max_exact + (log_ratio * (num_buckets - max_exact)).long()).clamp(
+            min=max_exact, max=num_buckets - 1
+        )
         bucket_ids = torch.where(is_small, distances, val_if_large)
         self.register_buffer("distance_to_bucket", bucket_ids)
         # For LoRA: same bucketing on absolute positions
