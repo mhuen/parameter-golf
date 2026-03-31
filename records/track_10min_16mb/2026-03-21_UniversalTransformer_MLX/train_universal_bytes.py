@@ -1562,6 +1562,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
         self.catmask_mode = catmask_mode
+        self.use_fa4 = use_fa4
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1724,6 +1725,19 @@ class GPT(nn.Module):
         if self.catmask_mode == "lora" and self.cat_attn_mod is not None:
             cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
             cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=x.dtype)
+
+        # FA4 + catmask bias needs the varlen path (score_mod) even without doc_mask.
+        # Create trivial cu_seqlens (one segment per batch element) if not provided.
+        B, S = input_ids.shape
+        if (
+            self.use_fa4
+            and self.catmask_mode == "bias"
+            and cu_seqlens is None
+        ):
+            cu_seqlens = torch.arange(
+                0, (B + 1) * S, S, device=input_ids.device, dtype=torch.int32
+            )
+            max_seqlen = S
 
         for i in range(self.num_encoder_layers):
             ls = self.layer_scalars[i]
