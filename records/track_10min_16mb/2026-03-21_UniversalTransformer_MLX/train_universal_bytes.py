@@ -119,9 +119,11 @@ class Hyperparameters:
 
     pack_doc_mask = bool(int(os.environ.get("PACK_DOC_MASK", "0")))  # broken with byte shards — see NotImplementedError below
 
-    # Learnable category attention mask
-    catmask_enabled = bool(int(os.environ.get("CATMASK_ENABLED", "0")))
+    # Learnable category attention mask: off, bias, or lora
+    catmask_mode = os.environ.get("CATMASK_MODE", "off")  # off | bias | lora
     catmask_lr = float(os.environ.get("CATMASK_LR", 0.04))
+    catmask_rank = int(os.environ.get("CATMASK_RANK", 1))
+    catmask_lora_v = bool(int(os.environ.get("CATMASK_LORA_V", "0")))
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -296,7 +298,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_scale,cat_attn_logits",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,conv_scale,cat_attn_logits,cat_lora_down,cat_q_up,cat_k_up,cat_v_up",
     ).split(",")
     if pattern
 )
@@ -654,11 +656,18 @@ class CausalSelfAttention(nn.Module):
             self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
         )
 
-    def forward(self, x, doc_mask=None, attn_bias=None):
+    def forward(self, x, doc_mask=None, attn_bias=None, q_delta=None, k_delta=None, v_delta=None):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         k = self.c_k(x)
         v = self.c_v(x)
+        # Category-conditional LoRA deltas (applied before reshape/norm)
+        if q_delta is not None:
+            q = q + q_delta
+        if k_delta is not None:
+            k = k + k_delta
+        if v_delta is not None:
+            v = v + v_delta
         q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -756,12 +765,10 @@ _BYTE_CATEGORY_DEFS = [
 
 
 class CategoryAttnBias(nn.Module):
-    """Builds a token→category LUT and computes (B, H, S, S) attention bias
-    from per-layer learnable logits of shape (H, C, C).
+    """Token→category LUT shared by both catmask modes.
 
-    The bias encodes which category-pairs should attend more/less to each other.
-    Initialized to zero (no bias), so the model starts with standard causal
-    attention and learns to differentiate.
+    - bias mode: computes (B, H, S, S) additive attention bias from (H, C, C) logits.
+    - lora mode: provides cat_ids for the LoRA gather (computation in SharedBlock).
     """
 
     def __init__(self, tok: EfficientByteTokenizer):
@@ -775,16 +782,12 @@ class CategoryAttnBias(nn.Module):
                     token_to_cat[tid] = ci
         self.register_buffer("token_to_cat", token_to_cat)
 
-    def forward(self, input_ids: Tensor, cat_attn_logits: Tensor) -> Tensor:
-        """Compute (B, H, S, S) additive attention bias.
+    def get_cat_ids(self, input_ids: Tensor) -> Tensor:
+        """(B, S) token IDs → (B, S) category indices."""
+        return self.token_to_cat[input_ids]
 
-        Args:
-            input_ids: (B, S) token IDs.
-            cat_attn_logits: (H, C, C) learnable logits for this layer.
-
-        Returns:
-            (B, H, S, S) additive bias (combine with causal mask before softmax).
-        """
+    def bias_forward(self, input_ids: Tensor, cat_attn_logits: Tensor) -> Tensor:
+        """Compute (B, H, S, S) additive attention bias (bias mode only)."""
         cat_ids = self.token_to_cat[input_ids]  # (B, S)
         cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(
             dtype=cat_attn_logits.dtype
@@ -792,8 +795,7 @@ class CategoryAttnBias(nn.Module):
         # (B, 1, S, C) @ (1, H, C, C) -> (B, H, S, C)
         q_contrib = cat_oh.unsqueeze(1) @ cat_attn_logits.unsqueeze(0)
         # (B, H, S, C) @ (B, 1, C, S) -> (B, H, S, S)
-        bias = q_contrib @ cat_oh.unsqueeze(1).transpose(-1, -2)
-        return bias
+        return q_contrib @ cat_oh.unsqueeze(1).transpose(-1, -2)
 
 
 class SharedBlock(nn.Module):
@@ -834,6 +836,7 @@ class SharedBlock(nn.Module):
         conv_scale=None,
         doc_mask=None,
         attn_bias=None,
+        cat_lora=None,
     ):
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
@@ -841,7 +844,21 @@ class SharedBlock(nn.Module):
                 self.conv_norm(x)
             )
         n = self.attn_norm(x)
-        attn_out = self.attn(n, doc_mask=doc_mask, attn_bias=attn_bias)
+        # Compute category-conditional LoRA deltas from normed input
+        q_delta, k_delta, v_delta = None, None, None
+        if cat_lora is not None:
+            cat_ids, down, q_up, k_up, v_up = cat_lora
+            low = n @ down.to(dtype=n.dtype).T  # (B, S, r)
+            low_unsq = low.unsqueeze(-1)  # (B, S, r, 1)
+            # *_up: (C, *_dim, r), gather by cat -> (B, S, *_dim, r) @ (B, S, r, 1)
+            q_delta = (q_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
+            k_delta = (k_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
+            if v_up is not None:
+                v_delta = (v_up.to(dtype=n.dtype)[cat_ids] @ low_unsq).squeeze(-1)
+        attn_out = self.attn(
+            n, doc_mask=doc_mask, attn_bias=attn_bias,
+            q_delta=q_delta, k_delta=k_delta, v_delta=v_delta,
+        )
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -851,7 +868,10 @@ class LayerScalars(nn.Module):
     """Per-layer scalars: attn_scale, mlp_scale, conv_scale, resid_mix.
     Optionally holds a per-layer GatedCausalConv when conv is not shared."""
 
-    def __init__(self, dim, num_heads=0, conv_kernel_size=0, conv_groups=0, catmask=False):
+    def __init__(
+        self, dim, num_heads=0, num_kv_heads=0, conv_kernel_size=0, conv_groups=0,
+        catmask_mode="off", catmask_rank=1, catmask_lora_v=False,
+    ):
         super().__init__()
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -868,16 +888,38 @@ class LayerScalars(nn.Module):
             if conv_kernel_size > 0
             else None
         )
+        # Catmask: bias mode — per-head (C, C) attention score bias
         self.cat_attn_logits = (
-            nn.Parameter(
-                torch.zeros(
-                    num_heads, NUM_BYTE_CATEGORIES, NUM_BYTE_CATEGORIES,
-                    dtype=torch.float32,
-                )
-            )
-            if catmask
+            nn.Parameter(torch.zeros(
+                num_heads, NUM_BYTE_CATEGORIES, NUM_BYTE_CATEGORIES,
+                dtype=torch.float32,
+            ))
+            if catmask_mode == "bias"
             else None
         )
+        # Catmask: lora mode — category-conditional low-rank Q/K update
+        C = NUM_BYTE_CATEGORIES
+        head_dim = dim // num_heads if num_heads > 0 else 0
+        kv_dim = num_kv_heads * head_dim
+        r = catmask_rank
+        if catmask_mode == "lora":
+            # down: shared projection (random init — gradient flows via zero-init up)
+            self.cat_lora_down = nn.Parameter(
+                torch.randn(r, dim, dtype=torch.float32) * (1.0 / dim ** 0.5)
+            )
+            # up: per-category projections (zero init — output is zero at start)
+            self.cat_q_up = nn.Parameter(torch.zeros(C, dim, r, dtype=torch.float32))
+            self.cat_k_up = nn.Parameter(torch.zeros(C, kv_dim, r, dtype=torch.float32))
+            self.cat_v_up = (
+                nn.Parameter(torch.zeros(C, kv_dim, r, dtype=torch.float32))
+                if catmask_lora_v
+                else None
+            )
+        else:
+            self.cat_lora_down = None
+            self.cat_q_up = None
+            self.cat_k_up = None
+            self.cat_v_up = None
 
 
 class UTF8Prior(nn.Module):
@@ -1279,7 +1321,9 @@ class GPT(nn.Module):
         conv_shared=False,
         structured_output_logits=False,
         utf8_prior=False,
-        catmask=False,
+        catmask_mode="off",
+        catmask_rank=1,
+        catmask_lora_v=False,
         tok=None,
     ):
         super().__init__()
@@ -1289,6 +1333,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
+        self.catmask_mode = catmask_mode
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1327,15 +1372,17 @@ class GPT(nn.Module):
             ]
         )
 
-        self.catmask = catmask
         self.layer_scalars = nn.ModuleList(
             [
                 LayerScalars(
                     model_dim,
                     num_heads=num_heads,
+                    num_kv_heads=num_kv_heads,
                     conv_kernel_size=per_layer_conv_ks,
                     conv_groups=conv_groups,
-                    catmask=catmask,
+                    catmask_mode=catmask_mode,
+                    catmask_rank=catmask_rank,
+                    catmask_lora_v=catmask_lora_v,
                 )
                 for _ in range(num_layers)
             ]
@@ -1377,12 +1424,12 @@ class GPT(nn.Module):
             self.utf8_prior_mod = UTF8Prior(tok)
         else:
             self.utf8_prior_mod = None
-        # Learnable category attention bias (token→category LUT, no learnable params here)
-        if catmask:
+        # Learnable category attention (token→category LUT, no learnable params here)
+        if catmask_mode != "off":
             assert tok is not None, "catmask requires tok"
-            self.cat_attn_bias = CategoryAttnBias(tok)
+            self.cat_attn_mod = CategoryAttnBias(tok)
         else:
-            self.cat_attn_bias = None
+            self.cat_attn_mod = None
         self._init_weights()
 
     def _init_weights(self):
@@ -1401,10 +1448,16 @@ class GPT(nn.Module):
             return ls.conv, ls.conv_scale
         return None, self.shared_conv_scales[layer_idx]
 
-    def _get_attn_bias(self, ls, input_ids):
-        if self.cat_attn_bias is None or ls.cat_attn_logits is None:
-            return None
-        return self.cat_attn_bias(input_ids, ls.cat_attn_logits)
+    def _get_catmask_args(self, ls, input_ids):
+        """Return (attn_bias, cat_lora) — one or both will be None."""
+        if self.cat_attn_mod is None:
+            return None, None
+        if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
+            return self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits), None
+        if self.catmask_mode == "lora" and ls.cat_lora_down is not None:
+            cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
+            return None, (cat_ids, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
+        return None, None
 
     def forward(self, input_ids, target_ids, doc_mask=None):
         x = self.tok_emb(input_ids)
@@ -1417,7 +1470,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias = self._get_attn_bias(ls, input_ids)
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids)
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1426,6 +1479,7 @@ class GPT(nn.Module):
                 conv_scale=conv_scale,
                 doc_mask=doc_mask,
                 attn_bias=attn_bias,
+                cat_lora=cat_lora,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -1440,7 +1494,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias = self._get_attn_bias(ls, input_ids)
+            attn_bias, cat_lora = self._get_catmask_args(ls, input_ids)
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
@@ -1449,6 +1503,7 @@ class GPT(nn.Module):
                 conv_scale=conv_scale,
                 doc_mask=doc_mask,
                 attn_bias=attn_bias,
+                cat_lora=cat_lora,
             )
         x = self.final_norm(x)
         # Compute UTF-8 prior masks (purely from input_ids, causal)
@@ -1535,7 +1590,7 @@ def main():
         enable_mem_efficient_sdp,
     )
 
-    _needs_explicit_mask = args.pack_doc_mask or args.catmask_enabled
+    _needs_explicit_mask = args.pack_doc_mask or args.catmask_mode == "bias"
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(_needs_explicit_mask)
@@ -1609,10 +1664,10 @@ def main():
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
     if args.utf8_prior:
         log0("utf8_prior:enabled")
-    if args.catmask_enabled:
-        log0("catmask:enabled (per-layer learnable category attention bias)")
+    if args.catmask_mode != "off":
+        log0(f"catmask:mode={args.catmask_mode} rank={args.catmask_rank} lr={args.catmask_lr}")
 
-    _needs_tok = args.structured_output_logits or args.utf8_prior or args.catmask_enabled
+    _needs_tok = args.structured_output_logits or args.utf8_prior or args.catmask_mode != "off"
     base_model = (
         GPT(
             vocab_size=vocab_size,
@@ -1633,7 +1688,9 @@ def main():
             conv_shared=args.conv_shared,
             structured_output_logits=args.structured_output_logits,
             utf8_prior=args.utf8_prior,
-            catmask=args.catmask_enabled,
+            catmask_mode=args.catmask_mode,
+            catmask_rank=args.catmask_rank,
+            catmask_lora_v=args.catmask_lora_v,
             tok=tok if _needs_tok else None,
         )
         .to(device)
@@ -1672,11 +1729,12 @@ def main():
         and id(p) not in conv_weight_ids
     ]
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
-    catmask_param_ids = {
-        id(ls.cat_attn_logits)
-        for ls in base_model.layer_scalars
-        if ls.cat_attn_logits is not None
-    }
+    catmask_param_ids = set()
+    for ls in base_model.layer_scalars:
+        for attr in ("cat_attn_logits", "cat_lora_down", "cat_q_up", "cat_k_up", "cat_v_up"):
+            p = getattr(ls, attr, None)
+            if p is not None:
+                catmask_param_ids.add(id(p))
     catmask_params = []
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
