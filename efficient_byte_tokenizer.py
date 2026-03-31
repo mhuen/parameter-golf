@@ -109,7 +109,10 @@ def _classify_byte(b: int) -> frozenset[ByteCategory]:
     """Determine the inherent categories of a raw byte value (0-255)."""
     cats: set[ByteCategory] = set()
 
-    if 32 <= b < 127:
+    if b in (0x09, 0x0A, 0x0B, 0x0C, 0x0D):  # \t \n \v \f \r
+        cats.add(ByteCategory.ASCII)
+        cats.add(ByteCategory.SEPARATOR)
+    elif 32 <= b < 127:
         cats.add(ByteCategory.ASCII)
         if 48 <= b <= 57:
             cats.add(ByteCategory.DIGIT)
@@ -216,7 +219,8 @@ BYTE_TABLE = ByteTable()
 # ---------------------------------------------------------------------------
 
 # Byte values absent from the FineWeb 10B UTF-8 dataset
-_UNUSED_BYTES = frozenset(range(0, 32)) | {127, 192, 193} | frozenset(range(241, 256))
+_WHITESPACE_CONTROLS = frozenset({0x09, 0x0A, 0x0B, 0x0C, 0x0D})  # \t \n \v \f \r
+_UNUSED_BYTES = (frozenset(range(0, 32)) - _WHITESPACE_CONTROLS) | {127, 192, 193} | frozenset(range(241, 256))
 _ALL_USED_BYTES = tuple(b for b in range(256) if b not in _UNUSED_BYTES)
 
 
