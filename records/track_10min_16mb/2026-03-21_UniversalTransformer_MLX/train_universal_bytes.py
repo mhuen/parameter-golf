@@ -877,16 +877,16 @@ class CategoryAttnBias(nn.Module):
         """(B, S) token IDs → (B, S) category indices."""
         return self.token_to_cat[input_ids]
 
-    def bias_forward(self, input_ids: Tensor, cat_attn_logits: Tensor) -> Tensor:
-        """Compute (B, H, S, S) additive attention bias (bias mode only)."""
-        cat_ids = self.token_to_cat[input_ids]  # (B, S)
-        cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(
-            dtype=cat_attn_logits.dtype
-        )  # (B, S, C)
-        # (B, 1, S, C) @ (1, H, C, C) -> (B, H, S, C)
-        q_contrib = cat_oh.unsqueeze(1) @ cat_attn_logits.unsqueeze(0)
-        # (B, H, S, C) @ (B, 1, C, S) -> (B, H, S, S)
-        return q_contrib @ cat_oh.unsqueeze(1).transpose(-1, -2)
+    def precompute_bias(self, input_ids: Tensor, dtype) -> Tensor:
+        """Precompute (B, 1, S, C) one-hot for reuse across layers."""
+        cat_ids = self.token_to_cat[input_ids]
+        cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=dtype)
+        return cat_oh.unsqueeze(1)  # (B, 1, S, C)
+
+    def bias_forward(self, cat_oh_expanded: Tensor, cat_attn_logits: Tensor) -> Tensor:
+        """Compute (B, H, S, S) bias from precomputed (B, 1, S, C) and per-layer (H, C, C)."""
+        q_contrib = cat_oh_expanded @ cat_attn_logits.unsqueeze(0)  # (B, H, S, C)
+        return q_contrib @ cat_oh_expanded.transpose(-1, -2)  # (B, H, S, S)
 
 
 class StructuralBoundaryBias(nn.Module):
@@ -935,8 +935,8 @@ class StructuralBoundaryBias(nn.Module):
         paragraph_id = self.is_newline[input_ids].cumsum(dim=1) if self.has_newline else None
         return word_id, sentence_id, paragraph_id
 
-    def bias_forward(self, input_ids: Tensor, struct_bias_weights: Tensor) -> Tensor:
-        """Compute (B, H, S, S) structural attention bias."""
+    def precompute_bias(self, input_ids: Tensor) -> Tensor:
+        """Precompute (B, F, S, S) structural features for reuse across layers."""
         word_id, sentence_id, paragraph_id = self.get_boundary_ids(input_ids)
         same_word = (word_id[:, :, None] == word_id[:, None, :]).float()
         same_sentence = (sentence_id[:, :, None] == sentence_id[:, None, :]).float()
@@ -944,9 +944,11 @@ class StructuralBoundaryBias(nn.Module):
         if paragraph_id is not None:
             same_paragraph = (paragraph_id[:, :, None] == paragraph_id[:, None, :]).float()
             features.append(same_paragraph)
-        # (B, F, S, S) @ (H, F) -> (B, H, S, S)
-        features_t = torch.stack(features, dim=1)  # (B, F, S, S)
-        return torch.einsum("bfqk,hf->bhqk", features_t, struct_bias_weights)
+        return torch.stack(features, dim=1)  # (B, F, S, S)
+
+    def bias_forward(self, struct_features: Tensor, struct_bias_weights: Tensor) -> Tensor:
+        """Compute (B, H, S, S) bias from precomputed features and per-layer (H, F) weights."""
+        return torch.einsum("bfqk,hf->bhqk", struct_features, struct_bias_weights)
 
     def get_struct_cat_ids(self, input_ids: Tensor) -> Tensor:
         """(B, S) → (B, S) structural category indices for LoRA mode."""
@@ -992,14 +994,15 @@ class DistanceBias(nn.Module):
         # For LoRA: same bucketing on absolute positions
         self.register_buffer("position_to_bin", bucket_ids)
 
-    def bias_forward(self, seq_len: int, dist_bias_weights: Tensor, device) -> Tensor:
-        """Compute (1, H, S, S) distance bias from per-layer (H, num_buckets) weights."""
+    def precompute_bias(self, seq_len: int, device) -> Tensor:
+        """Precompute (S, S) bucket IDs for reuse across layers."""
         positions = torch.arange(seq_len, device=device)
         rel_dist = (positions[:, None] - positions[None, :]).clamp(min=0, max=self.max_distance)
-        bucket_ids = self.distance_to_bucket[rel_dist]  # (S, S)
-        # Gather: (H, num_buckets) -> (H, S, S)
-        bias = dist_bias_weights[:, bucket_ids]
-        return bias.unsqueeze(0)  # (1, H, S, S)
+        return self.distance_to_bucket[rel_dist]  # (S, S)
+
+    def bias_forward(self, bucket_ids: Tensor, dist_bias_weights: Tensor) -> Tensor:
+        """Compute (1, H, S, S) bias from precomputed (S, S) bucket IDs and per-layer weights."""
+        return dist_bias_weights[:, bucket_ids].unsqueeze(0)  # (1, H, S, S)
 
     def get_pos_bin_ids(self, seq_len: int, device) -> Tensor:
         """(S,) → (1, S) position bin IDs for LoRA mode."""
@@ -1806,22 +1809,23 @@ class GPT(nn.Module):
             return ls.conv, ls.conv_scale
         return None, self.shared_conv_scales[layer_idx]
 
-    def _get_all_attn_args(self, ls, input_ids, cat_oh, struct_oh, dist_oh):
-        """Return (attn_bias, cat_lora, struct_lora, dist_lora)."""
+    def _get_all_attn_args(self, ls, precomputed):
+        """Return (attn_bias, cat_lora, struct_lora, dist_lora) using precomputed tensors."""
+        cat_oh, cat_bias_oh, struct_oh, struct_features, dist_oh, dist_bucket_ids = precomputed
         attn_bias = None
         cat_lora, struct_lora, dist_lora = None, None, None
 
         # Catmask
         if self.cat_attn_mod is not None:
             if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
-                attn_bias = self.cat_attn_mod.bias_forward(input_ids, ls.cat_attn_logits)
+                attn_bias = self.cat_attn_mod.bias_forward(cat_bias_oh, ls.cat_attn_logits)
             elif self.catmask_mode == "lora" and ls.cat_lora_down is not None:
                 cat_lora = (cat_oh, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
 
         # Structural boundary
         if self.struct_bias_mod is not None:
             if self.struct_bias_mode == "bias" and ls.struct_bias_weights is not None:
-                sb = self.struct_bias_mod.bias_forward(input_ids, ls.struct_bias_weights)
+                sb = self.struct_bias_mod.bias_forward(struct_features, ls.struct_bias_weights)
                 attn_bias = sb if attn_bias is None else attn_bias + sb
             elif self.struct_bias_mode == "lora" and ls.struct_lora_down is not None:
                 struct_lora = (struct_oh, ls.struct_lora_down, ls.struct_q_up, ls.struct_k_up, ls.struct_v_up)
@@ -1829,12 +1833,44 @@ class GPT(nn.Module):
         # Distance
         if self.dist_bias_mod is not None:
             if self.dist_bias_mode == "bias" and ls.dist_bias_weights is not None:
-                db = self.dist_bias_mod.bias_forward(input_ids.shape[1], ls.dist_bias_weights, input_ids.device)
+                db = self.dist_bias_mod.bias_forward(dist_bucket_ids, ls.dist_bias_weights)
                 attn_bias = db if attn_bias is None else attn_bias + db
             elif self.dist_bias_mode == "lora" and ls.dist_lora_down is not None:
                 dist_lora = (dist_oh, ls.dist_lora_down, ls.dist_q_up, ls.dist_k_up, ls.dist_v_up)
 
         return attn_bias, cat_lora, struct_lora, dist_lora
+
+    def _precompute_attn_extras(self, input_ids, dtype):
+        """Precompute all input-dependent tensors once for all layers."""
+        # Catmask
+        cat_oh, cat_bias_oh = None, None
+        if self.cat_attn_mod is not None:
+            if self.catmask_mode == "lora":
+                cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
+                cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=dtype)
+            elif self.catmask_mode == "bias":
+                cat_bias_oh = self.cat_attn_mod.precompute_bias(input_ids, dtype)
+
+        # Structural boundary
+        struct_oh, struct_features = None, None
+        if self.struct_bias_mod is not None:
+            if self.struct_bias_mode == "lora":
+                struct_cat_ids = self.struct_bias_mod.get_struct_cat_ids(input_ids)
+                struct_oh = F.one_hot(struct_cat_ids, self.struct_bias_mod.num_struct_cats).to(dtype=dtype)
+            elif self.struct_bias_mode == "bias":
+                struct_features = self.struct_bias_mod.precompute_bias(input_ids)
+
+        # Distance
+        dist_oh, dist_bucket_ids = None, None
+        if self.dist_bias_mod is not None:
+            if self.dist_bias_mode == "lora":
+                dist_bin_ids = self.dist_bias_mod.get_pos_bin_ids(input_ids.shape[1], input_ids.device)
+                dist_bin_ids = dist_bin_ids.expand(input_ids.shape[0], -1)
+                dist_oh = F.one_hot(dist_bin_ids, self.dist_bias_mod.num_buckets).to(dtype=dtype)
+            elif self.dist_bias_mode == "bias":
+                dist_bucket_ids = self.dist_bias_mod.precompute_bias(input_ids.shape[1], input_ids.device)
+
+        return (cat_oh, cat_bias_oh, struct_oh, struct_features, dist_oh, dist_bucket_ids)
 
     def forward(self, input_ids, target_ids, doc_mask=None):
         x = self.tok_emb(input_ids)
@@ -1842,29 +1878,15 @@ class GPT(nn.Module):
         x0 = x
         skips = []
 
-        # Precompute one-hot encodings once for all layers
-        cat_oh = None
-        if self.catmask_mode == "lora" and self.cat_attn_mod is not None:
-            cat_ids = self.cat_attn_mod.get_cat_ids(input_ids)
-            cat_oh = F.one_hot(cat_ids, NUM_BYTE_CATEGORIES).to(dtype=x.dtype)
-        struct_oh = None
-        if self.struct_bias_mode == "lora" and self.struct_bias_mod is not None:
-            struct_cat_ids = self.struct_bias_mod.get_struct_cat_ids(input_ids)
-            struct_oh = F.one_hot(struct_cat_ids, self.struct_bias_mod.num_struct_cats).to(dtype=x.dtype)
-        dist_oh = None
-        if self.dist_bias_mode == "lora" and self.dist_bias_mod is not None:
-            dist_bin_ids = self.dist_bias_mod.get_pos_bin_ids(input_ids.shape[1], input_ids.device)
-            dist_bin_ids = dist_bin_ids.expand(input_ids.shape[0], -1)
-            dist_oh = F.one_hot(dist_bin_ids, self.dist_bias_mod.num_buckets).to(dtype=x.dtype)
+        # Precompute all input-dependent attention extras once for all layers
+        precomputed = self._precompute_attn_extras(input_ids, x.dtype)
 
         for i in range(self.num_encoder_layers):
             ls = self.layer_scalars[i]
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(
-                ls, input_ids, cat_oh, struct_oh, dist_oh
-            )
+            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(ls, precomputed)
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1890,9 +1912,7 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(
-                ls, input_ids, cat_oh, struct_oh, dist_oh
-            )
+            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(ls, precomputed)
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
