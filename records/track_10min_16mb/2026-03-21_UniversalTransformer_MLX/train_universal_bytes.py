@@ -144,6 +144,15 @@ class Hyperparameters:
     dist_bias_buckets = int(os.environ.get("DIST_BIAS_BUCKETS", 32))
     dist_bias_max_distance = int(os.environ.get("DIST_BIAS_MAX_DISTANCE", 128))
 
+    # Semantic RoPE: dimension pairs per boundary type (0=disabled)
+    rope_word_pairs = int(os.environ.get("ROPE_WORD_PAIRS", 0))
+    rope_sent_pairs = int(os.environ.get("ROPE_SENT_PAIRS", 0))
+    rope_para_pairs = int(os.environ.get("ROPE_PARA_PAIRS", 0))
+    # Frequency bases per type (tuned so lowest freq completes ~1 cycle over 2k-5k byte input tokens)
+    rope_word_base = float(os.environ.get("ROPE_WORD_BASE", 1000.0))
+    rope_sent_base = float(os.environ.get("ROPE_SENT_BASE", 50.0))
+    rope_para_base = float(os.environ.get("ROPE_PARA_BASE", 10.0))
+
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
     fold = os.environ.get("FOLD", "")  # comma-separated ByteCategory values
@@ -700,6 +709,44 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat((x_rotated, x_pass), dim=-1)
 
 
+class SemanticRotary(nn.Module):
+    """RoPE driven by semantic boundary IDs (word/sentence/paragraph counts)."""
+
+    def __init__(self, configs):
+        """configs: list of (num_pairs, base) for each boundary type."""
+        super().__init__()
+        self.configs = configs
+        inv_freqs = []
+        for num_pairs, base in configs:
+            dims = num_pairs * 2
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, dims, 2, dtype=torch.float32) / dims)
+            )
+            inv_freqs.append(inv_freq)
+        self.register_buffer("inv_freq", torch.cat(inv_freqs), persistent=False)
+        self._offsets = []
+        pos = 0
+        for num_pairs, _ in configs:
+            self._offsets.append((pos, pos + num_pairs))
+            pos += num_pairs
+        self.total_half = pos  # total cos/sin width
+
+    def forward(self, boundary_ids_list, dtype):
+        """boundary_ids_list: list of (B, S) long tensors, one per boundary type.
+        Returns: cos (B, 1, S, total_half), sin (B, 1, S, total_half)"""
+        parts_cos, parts_sin = [], []
+        for ids, (start, end) in zip(boundary_ids_list, self._offsets):
+            inv_f = self.inv_freq[start:end]  # (num_pairs,)
+            freqs = ids.unsqueeze(-1).float() * inv_f  # (B, S, num_pairs)
+            parts_cos.append(freqs.cos())
+            parts_sin.append(freqs.sin())
+        cos = (
+            torch.cat(parts_cos, dim=-1).unsqueeze(1).to(dtype=dtype)
+        )  # (B, 1, S, total_half)
+        sin = torch.cat(parts_sin, dim=-1).unsqueeze(1).to(dtype=dtype)
+        return cos, sin
+
+
 def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
     """Build a causal block-diagonal attention mask from BOS document boundaries.
     Tokens only attend to earlier tokens within the same document."""
@@ -721,6 +768,7 @@ class CausalSelfAttention(nn.Module):
         rope_base,
         qk_gain_init,
         rope_dim_fraction=1.0,
+        sem_rope_configs=None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -741,12 +789,27 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
         )
+        # Semantic RoPE: dedicate last N head dims to boundary-count rotation
+        self.sem_rope_dims = 0
+        self.sem_rotary = None
+        if sem_rope_configs:
+            self.sem_rotary = SemanticRotary(sem_rope_configs)
+            self.sem_rope_dims = self.sem_rotary.total_half * 2
+        # Position RoPE covers remaining dims
+        pos_rope_dim = self.head_dim - self.sem_rope_dims
         self.rotary = Rotary(
-            self.head_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
+            pos_rope_dim, base=rope_base, rope_dim_fraction=rope_dim_fraction
         )
 
     def forward(
-        self, x, doc_mask=None, attn_bias=None, q_delta=None, k_delta=None, v_delta=None
+        self,
+        x,
+        doc_mask=None,
+        attn_bias=None,
+        q_delta=None,
+        k_delta=None,
+        v_delta=None,
+        boundary_ids=None,
     ):
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
@@ -764,9 +827,33 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+        # Position RoPE (covers first head_dim - sem_rope_dims dimensions)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+        # Semantic RoPE on last sem_rope_dims dimensions
+        if self.sem_rotary is not None and boundary_ids is not None:
+            sem_cos, sem_sin = self.sem_rotary(boundary_ids, q.dtype)
+            sd = self.sem_rope_dims
+            half = sd // 2
+            q1, q2 = q[..., -sd:-half], q[..., -half:]
+            k1, k2 = k[..., -sd:-half], k[..., -half:]
+            q = torch.cat(
+                [
+                    q[..., :-sd],
+                    q1 * sem_cos + q2 * sem_sin,
+                    q1 * (-sem_sin) + q2 * sem_cos,
+                ],
+                dim=-1,
+            )
+            k = torch.cat(
+                [
+                    k[..., :-sd],
+                    k1 * sem_cos + k2 * sem_sin,
+                    k1 * (-sem_sin) + k2 * sem_cos,
+                ],
+                dim=-1,
+            )
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         if doc_mask is not None or attn_bias is not None:
             # Build explicit causal + bias mask for non-flash path
@@ -896,7 +983,9 @@ class StructuralBoundaryBias(nn.Module):
     - lora mode: provides structural category IDs (position-within-word × position-within-sentence).
     """
 
-    def __init__(self, tok: EfficientByteTokenizer, word_bins: int = 4, sent_bins: int = 4):
+    def __init__(
+        self, tok: EfficientByteTokenizer, word_bins: int = 4, sent_bins: int = 4
+    ):
         super().__init__()
         V = tok.vocab_size
         # Build boundary LUTs from tokenizer
@@ -923,8 +1012,8 @@ class StructuralBoundaryBias(nn.Module):
         self.word_bins = word_bins
         self.sent_bins = sent_bins
         self.num_struct_cats = word_bins * sent_bins
-        word_edges = torch.tensor([2, 4, 8], dtype=torch.long)[:word_bins - 1]
-        sent_edges = torch.tensor([4, 16, 64], dtype=torch.long)[:sent_bins - 1]
+        word_edges = torch.tensor([2, 4, 8], dtype=torch.long)[: word_bins - 1]
+        sent_edges = torch.tensor([4, 16, 64], dtype=torch.long)[: sent_bins - 1]
         self.register_buffer("word_bin_edges", word_edges)
         self.register_buffer("sent_bin_edges", sent_edges)
 
@@ -932,7 +1021,9 @@ class StructuralBoundaryBias(nn.Module):
         """(B, S) → (word_id, sentence_id, paragraph_id or None)."""
         word_id = self.is_separator[input_ids].cumsum(dim=1)
         sentence_id = self.is_sentence_end[input_ids].cumsum(dim=1)
-        paragraph_id = self.is_newline[input_ids].cumsum(dim=1) if self.has_newline else None
+        paragraph_id = (
+            self.is_newline[input_ids].cumsum(dim=1) if self.has_newline else None
+        )
         return word_id, sentence_id, paragraph_id
 
     def precompute_bias(self, input_ids: Tensor) -> Tensor:
@@ -942,11 +1033,15 @@ class StructuralBoundaryBias(nn.Module):
         same_sentence = (sentence_id[:, :, None] == sentence_id[:, None, :]).float()
         features = [same_word, same_sentence]
         if paragraph_id is not None:
-            same_paragraph = (paragraph_id[:, :, None] == paragraph_id[:, None, :]).float()
+            same_paragraph = (
+                paragraph_id[:, :, None] == paragraph_id[:, None, :]
+            ).float()
             features.append(same_paragraph)
         return torch.stack(features, dim=1)  # (B, F, S, S)
 
-    def bias_forward(self, struct_features: Tensor, struct_bias_weights: Tensor) -> Tensor:
+    def bias_forward(
+        self, struct_features: Tensor, struct_bias_weights: Tensor
+    ) -> Tensor:
         """Compute (B, H, S, S) bias from precomputed features and per-layer (H, F) weights."""
         return torch.einsum("bfqk,hf->bhqk", struct_features, struct_bias_weights)
 
@@ -956,11 +1051,19 @@ class StructuralBoundaryBias(nn.Module):
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
         # Position within current word
         is_sep = self.is_separator[input_ids].bool()
-        last_sep_pos = torch.where(is_sep, positions, torch.zeros_like(positions)).cummax(dim=1).values
+        last_sep_pos = (
+            torch.where(is_sep, positions, torch.zeros_like(positions))
+            .cummax(dim=1)
+            .values
+        )
         pos_in_word = positions - last_sep_pos
         # Position within current sentence
         is_sent = self.is_sentence_end[input_ids].bool()
-        last_sent_pos = torch.where(is_sent, positions, torch.zeros_like(positions)).cummax(dim=1).values
+        last_sent_pos = (
+            torch.where(is_sent, positions, torch.zeros_like(positions))
+            .cummax(dim=1)
+            .values
+        )
         pos_in_sent = positions - last_sent_pos
         # Bin
         word_bin = torch.bucketize(pos_in_word, self.word_bin_edges)
@@ -985,10 +1088,12 @@ class DistanceBias(nn.Module):
         max_exact = num_buckets // 2
         is_small = distances < max_exact
         # Log-spaced buckets for distances >= max_exact
-        log_ratio = torch.log(distances.float().clamp(min=1) / max_exact) / math.log(max_distance / max_exact)
-        val_if_large = (max_exact + (log_ratio * (num_buckets - max_exact)).long()).clamp(
-            min=max_exact, max=num_buckets - 1
+        log_ratio = torch.log(distances.float().clamp(min=1) / max_exact) / math.log(
+            max_distance / max_exact
         )
+        val_if_large = (
+            max_exact + (log_ratio * (num_buckets - max_exact)).long()
+        ).clamp(min=max_exact, max=num_buckets - 1)
         bucket_ids = torch.where(is_small, distances, val_if_large)
         self.register_buffer("distance_to_bucket", bucket_ids)
         # For LoRA: same bucketing on absolute positions
@@ -997,7 +1102,9 @@ class DistanceBias(nn.Module):
     def precompute_bias(self, seq_len: int, device) -> Tensor:
         """Precompute (S, S) bucket IDs for reuse across layers."""
         positions = torch.arange(seq_len, device=device)
-        rel_dist = (positions[:, None] - positions[None, :]).clamp(min=0, max=self.max_distance)
+        rel_dist = (positions[:, None] - positions[None, :]).clamp(
+            min=0, max=self.max_distance
+        )
         return self.distance_to_bucket[rel_dist]  # (S, S)
 
     def bias_forward(self, bucket_ids: Tensor, dist_bias_weights: Tensor) -> Tensor:
@@ -1026,12 +1133,14 @@ def _compute_lora_deltas(normed_x, one_hot, down, q_up, k_up, v_up):
 
     def _delta(up):
         C, out_dim, r = up.shape
-        selected = one_hot @ up.to(dtype=normed_x.dtype).reshape(C, -1)  # (B, S, out_dim*r)
+        selected = one_hot @ up.to(dtype=normed_x.dtype).reshape(
+            C, -1
+        )  # (B, S, out_dim*r)
         if r == 1:
             return selected * low  # (B, S, out_dim) * (B, S, 1) broadcast
-        return (
-            selected.reshape(-1, out_dim, r) @ low.reshape(-1, r, 1)
-        ).reshape(one_hot.shape[0], one_hot.shape[1], out_dim)
+        return (selected.reshape(-1, out_dim, r) @ low.reshape(-1, r, 1)).reshape(
+            one_hot.shape[0], one_hot.shape[1], out_dim
+        )
 
     return _delta(q_up), _delta(k_up), (_delta(v_up) if v_up is not None else None)
 
@@ -1050,12 +1159,19 @@ class SharedBlock(nn.Module):
         rope_dim_fraction=1.0,
         conv_kernel_size=0,
         conv_groups=0,
+        sem_rope_configs=None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
-            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dim_fraction
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            rope_dim_fraction,
+            sem_rope_configs=sem_rope_configs,
         )
         self.mlp = MLP(dim, mlp_mult)
         self.conv = (
@@ -1077,6 +1193,7 @@ class SharedBlock(nn.Module):
         cat_lora=None,
         struct_lora=None,
         dist_lora=None,
+        boundary_ids=None,
     ):
         conv_mod = conv if conv is not None else self.conv
         if conv_mod is not None and conv_scale is not None:
@@ -1101,6 +1218,7 @@ class SharedBlock(nn.Module):
             q_delta=q_delta,
             k_delta=k_delta,
             v_delta=v_delta,
+            boundary_ids=boundary_ids,
         )
         x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -1185,7 +1303,9 @@ class LayerScalars(nn.Module):
 
         # Structural boundary: bias mode — per-head weight for same-word/sentence/paragraph
         self.struct_bias_weights = (
-            nn.Parameter(torch.zeros(num_heads, num_struct_features, dtype=torch.float32))
+            nn.Parameter(
+                torch.zeros(num_heads, num_struct_features, dtype=torch.float32)
+            )
             if struct_bias_mode == "bias"
             else None
         )
@@ -1196,8 +1316,12 @@ class LayerScalars(nn.Module):
             self.struct_lora_down = nn.Parameter(
                 torch.randn(sr, dim, dtype=torch.float32) * (1.0 / dim**0.5)
             )
-            self.struct_q_up = nn.Parameter(torch.zeros(SC, dim, sr, dtype=torch.float32))
-            self.struct_k_up = nn.Parameter(torch.zeros(SC, kv_dim, sr, dtype=torch.float32))
+            self.struct_q_up = nn.Parameter(
+                torch.zeros(SC, dim, sr, dtype=torch.float32)
+            )
+            self.struct_k_up = nn.Parameter(
+                torch.zeros(SC, kv_dim, sr, dtype=torch.float32)
+            )
             self.struct_v_up = (
                 nn.Parameter(torch.zeros(SC, kv_dim, sr, dtype=torch.float32))
                 if struct_bias_lora_v
@@ -1223,7 +1347,9 @@ class LayerScalars(nn.Module):
                 torch.randn(dr, dim, dtype=torch.float32) * (1.0 / dim**0.5)
             )
             self.dist_q_up = nn.Parameter(torch.zeros(DB, dim, dr, dtype=torch.float32))
-            self.dist_k_up = nn.Parameter(torch.zeros(DB, kv_dim, dr, dtype=torch.float32))
+            self.dist_k_up = nn.Parameter(
+                torch.zeros(DB, kv_dim, dr, dtype=torch.float32)
+            )
             self.dist_v_up = (
                 nn.Parameter(torch.zeros(DB, kv_dim, dr, dtype=torch.float32))
                 if dist_bias_lora_v
@@ -1648,6 +1774,8 @@ class GPT(nn.Module):
         dist_bias_lora_v=False,
         dist_bias_buckets=32,
         dist_bias_max_distance=128,
+        sem_rope_configs=None,
+        sem_rope_types=None,
         tok=None,
     ):
         super().__init__()
@@ -1660,6 +1788,8 @@ class GPT(nn.Module):
         self.catmask_mode = catmask_mode
         self.struct_bias_mode = struct_bias_mode
         self.dist_bias_mode = dist_bias_mode
+        self.sem_rope_configs = sem_rope_configs or []
+        self.sem_rope_types = sem_rope_types or []  # "word", "sent", "para"
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1693,6 +1823,7 @@ class GPT(nn.Module):
                     rope_dim_fraction=rope_dim_fraction,
                     conv_kernel_size=shared_conv_ks,
                     conv_groups=conv_groups,
+                    sem_rope_configs=sem_rope_configs if sem_rope_configs else None,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1769,18 +1900,25 @@ class GPT(nn.Module):
         else:
             self.cat_attn_mod = None
         # Structural boundary bias (word/sentence/paragraph)
-        if struct_bias_mode != "off":
-            assert tok is not None, "struct_bias requires tok"
+        # Also needed when sem_rope is active (for boundary IDs)
+        _needs_struct_mod = struct_bias_mode != "off" or bool(self.sem_rope_configs)
+        if _needs_struct_mod:
+            assert tok is not None, "struct_bias/sem_rope requires tok"
             self.struct_bias_mod = StructuralBoundaryBias(
                 tok, word_bins=struct_bias_word_bins, sent_bins=struct_bias_sent_bins
             )
             # Update layer scalars num_features if module detected fewer features
-            if self.struct_bias_mod.num_features != _num_struct_features:
+            if (
+                struct_bias_mode != "off"
+                and self.struct_bias_mod.num_features != _num_struct_features
+            ):
                 for ls in self.layer_scalars:
                     if ls.struct_bias_weights is not None:
                         nf = self.struct_bias_mod.num_features
                         ls.struct_bias_weights = nn.Parameter(
-                            torch.zeros(ls.struct_bias_weights.shape[0], nf, dtype=torch.float32)
+                            torch.zeros(
+                                ls.struct_bias_weights.shape[0], nf, dtype=torch.float32
+                            )
                         )
         else:
             self.struct_bias_mod = None
@@ -1810,35 +1948,67 @@ class GPT(nn.Module):
         return None, self.shared_conv_scales[layer_idx]
 
     def _get_all_attn_args(self, ls, precomputed):
-        """Return (attn_bias, cat_lora, struct_lora, dist_lora) using precomputed tensors."""
-        cat_oh, cat_bias_oh, struct_oh, struct_features, dist_oh, dist_bucket_ids = precomputed
+        """Return (attn_bias, cat_lora, struct_lora, dist_lora, boundary_ids) using precomputed tensors."""
+        (
+            cat_oh,
+            cat_bias_oh,
+            struct_oh,
+            struct_features,
+            dist_oh,
+            dist_bucket_ids,
+            boundary_ids,
+        ) = precomputed
         attn_bias = None
         cat_lora, struct_lora, dist_lora = None, None, None
 
         # Catmask
         if self.cat_attn_mod is not None:
             if self.catmask_mode == "bias" and ls.cat_attn_logits is not None:
-                attn_bias = self.cat_attn_mod.bias_forward(cat_bias_oh, ls.cat_attn_logits)
+                attn_bias = self.cat_attn_mod.bias_forward(
+                    cat_bias_oh, ls.cat_attn_logits
+                )
             elif self.catmask_mode == "lora" and ls.cat_lora_down is not None:
-                cat_lora = (cat_oh, ls.cat_lora_down, ls.cat_q_up, ls.cat_k_up, ls.cat_v_up)
+                cat_lora = (
+                    cat_oh,
+                    ls.cat_lora_down,
+                    ls.cat_q_up,
+                    ls.cat_k_up,
+                    ls.cat_v_up,
+                )
 
         # Structural boundary
         if self.struct_bias_mod is not None:
             if self.struct_bias_mode == "bias" and ls.struct_bias_weights is not None:
-                sb = self.struct_bias_mod.bias_forward(struct_features, ls.struct_bias_weights)
+                sb = self.struct_bias_mod.bias_forward(
+                    struct_features, ls.struct_bias_weights
+                )
                 attn_bias = sb if attn_bias is None else attn_bias + sb
             elif self.struct_bias_mode == "lora" and ls.struct_lora_down is not None:
-                struct_lora = (struct_oh, ls.struct_lora_down, ls.struct_q_up, ls.struct_k_up, ls.struct_v_up)
+                struct_lora = (
+                    struct_oh,
+                    ls.struct_lora_down,
+                    ls.struct_q_up,
+                    ls.struct_k_up,
+                    ls.struct_v_up,
+                )
 
         # Distance
         if self.dist_bias_mod is not None:
             if self.dist_bias_mode == "bias" and ls.dist_bias_weights is not None:
-                db = self.dist_bias_mod.bias_forward(dist_bucket_ids, ls.dist_bias_weights)
+                db = self.dist_bias_mod.bias_forward(
+                    dist_bucket_ids, ls.dist_bias_weights
+                )
                 attn_bias = db if attn_bias is None else attn_bias + db
             elif self.dist_bias_mode == "lora" and ls.dist_lora_down is not None:
-                dist_lora = (dist_oh, ls.dist_lora_down, ls.dist_q_up, ls.dist_k_up, ls.dist_v_up)
+                dist_lora = (
+                    dist_oh,
+                    ls.dist_lora_down,
+                    ls.dist_q_up,
+                    ls.dist_k_up,
+                    ls.dist_v_up,
+                )
 
-        return attn_bias, cat_lora, struct_lora, dist_lora
+        return attn_bias, cat_lora, struct_lora, dist_lora, boundary_ids
 
     def _precompute_attn_extras(self, input_ids, dtype):
         """Precompute all input-dependent tensors once for all layers."""
@@ -1856,7 +2026,9 @@ class GPT(nn.Module):
         if self.struct_bias_mod is not None:
             if self.struct_bias_mode == "lora":
                 struct_cat_ids = self.struct_bias_mod.get_struct_cat_ids(input_ids)
-                struct_oh = F.one_hot(struct_cat_ids, self.struct_bias_mod.num_struct_cats).to(dtype=dtype)
+                struct_oh = F.one_hot(
+                    struct_cat_ids, self.struct_bias_mod.num_struct_cats
+                ).to(dtype=dtype)
             elif self.struct_bias_mode == "bias":
                 struct_features = self.struct_bias_mod.precompute_bias(input_ids)
 
@@ -1864,13 +2036,38 @@ class GPT(nn.Module):
         dist_oh, dist_bucket_ids = None, None
         if self.dist_bias_mod is not None:
             if self.dist_bias_mode == "lora":
-                dist_bin_ids = self.dist_bias_mod.get_pos_bin_ids(input_ids.shape[1], input_ids.device)
+                dist_bin_ids = self.dist_bias_mod.get_pos_bin_ids(
+                    input_ids.shape[1], input_ids.device
+                )
                 dist_bin_ids = dist_bin_ids.expand(input_ids.shape[0], -1)
-                dist_oh = F.one_hot(dist_bin_ids, self.dist_bias_mod.num_buckets).to(dtype=dtype)
+                dist_oh = F.one_hot(dist_bin_ids, self.dist_bias_mod.num_buckets).to(
+                    dtype=dtype
+                )
             elif self.dist_bias_mode == "bias":
-                dist_bucket_ids = self.dist_bias_mod.precompute_bias(input_ids.shape[1], input_ids.device)
+                dist_bucket_ids = self.dist_bias_mod.precompute_bias(
+                    input_ids.shape[1], input_ids.device
+                )
 
-        return (cat_oh, cat_bias_oh, struct_oh, struct_features, dist_oh, dist_bucket_ids)
+        # Semantic RoPE boundary IDs
+        boundary_ids = None
+        if self.sem_rope_types and self.struct_bias_mod is not None:
+            word_id, sentence_id, paragraph_id = self.struct_bias_mod.get_boundary_ids(
+                input_ids
+            )
+            _id_map = {"word": word_id, "sent": sentence_id, "para": paragraph_id}
+            boundary_ids = [
+                _id_map[t] for t in self.sem_rope_types if _id_map[t] is not None
+            ]
+
+        return (
+            cat_oh,
+            cat_bias_oh,
+            struct_oh,
+            struct_features,
+            dist_oh,
+            dist_bucket_ids,
+            boundary_ids,
+        )
 
     def forward(self, input_ids, target_ids, doc_mask=None):
         x = self.tok_emb(input_ids)
@@ -1886,7 +2083,9 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, i)
-            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(ls, precomputed)
+            attn_bias, cat_lora, struct_lora, dist_lora, boundary_ids = (
+                self._get_all_attn_args(ls, precomputed)
+            )
             x = self.shared_blocks[self.block_map[i]](
                 x,
                 ls.attn_scale,
@@ -1898,6 +2097,7 @@ class GPT(nn.Module):
                 cat_lora=cat_lora,
                 struct_lora=struct_lora,
                 dist_lora=dist_lora,
+                boundary_ids=boundary_ids,
             )
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -1912,7 +2112,9 @@ class GPT(nn.Module):
             mix = ls.resid_mix.to(dtype=x.dtype)
             x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
             conv, conv_scale = self._get_conv_args(ls, layer_idx)
-            attn_bias, cat_lora, struct_lora, dist_lora = self._get_all_attn_args(ls, precomputed)
+            attn_bias, cat_lora, struct_lora, dist_lora, boundary_ids = (
+                self._get_all_attn_args(ls, precomputed)
+            )
             x = self.shared_blocks[self.block_map[layer_idx]](
                 x,
                 ls.attn_scale,
@@ -1924,6 +2126,7 @@ class GPT(nn.Module):
                 cat_lora=cat_lora,
                 struct_lora=struct_lora,
                 dist_lora=dist_lora,
+                boundary_ids=boundary_ids,
             )
         x = self.final_norm(x)
         # Compute UTF-8 prior masks (purely from input_ids, causal)
@@ -2104,11 +2307,34 @@ def main():
             f"dist_bias:mode={args.dist_bias_mode} buckets={args.dist_bias_buckets} lr={args.dist_bias_lr}"
         )
 
+    # Build semantic RoPE configs
+    sem_rope_configs = []
+    sem_rope_types = []
+    if args.rope_word_pairs > 0:
+        sem_rope_configs.append((args.rope_word_pairs, args.rope_word_base))
+        sem_rope_types.append("word")
+    if args.rope_sent_pairs > 0:
+        sem_rope_configs.append((args.rope_sent_pairs, args.rope_sent_base))
+        sem_rope_types.append("sent")
+    if args.rope_para_pairs > 0:
+        sem_rope_configs.append((args.rope_para_pairs, args.rope_para_base))
+        sem_rope_types.append("para")
+    if sem_rope_configs:
+        head_dim = args.model_dim // args.num_heads
+        total_sem = sum(p * 2 for p, _ in sem_rope_configs)
+        log0(
+            f"sem_rope: word={args.rope_word_pairs}pairs(base={args.rope_word_base}) "
+            f"sent={args.rope_sent_pairs}pairs(base={args.rope_sent_base}) "
+            f"para={args.rope_para_pairs}pairs(base={args.rope_para_base}) "
+            f"total_dims={total_sem}/{head_dim}"
+        )
+
     _needs_tok = (
         args.structured_output_logits
         or args.utf8_prior
         or args.catmask_mode != "off"
         or args.struct_bias_mode != "off"
+        or bool(sem_rope_configs)
     )
     base_model = (
         GPT(
@@ -2143,6 +2369,8 @@ def main():
             dist_bias_lora_v=args.dist_bias_lora_v,
             dist_bias_buckets=args.dist_bias_buckets,
             dist_bias_max_distance=args.dist_bias_max_distance,
+            sem_rope_configs=sem_rope_configs if sem_rope_configs else None,
+            sem_rope_types=sem_rope_types if sem_rope_types else None,
             tok=tok if _needs_tok else None,
         )
         .to(device)
@@ -2151,7 +2379,7 @@ def main():
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, nn.Conv1d)):
             module.float()
-        if isinstance(module, Rotary):
+        if isinstance(module, (Rotary, SemanticRotary)):
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -2183,9 +2411,27 @@ def main():
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
     # Collect special param IDs for routing to separate optimizers
     _special_attr_groups = {
-        "catmask": ("cat_attn_logits", "cat_lora_down", "cat_q_up", "cat_k_up", "cat_v_up"),
-        "struct_bias": ("struct_bias_weights", "struct_lora_down", "struct_q_up", "struct_k_up", "struct_v_up"),
-        "dist_bias": ("dist_bias_weights", "dist_lora_down", "dist_q_up", "dist_k_up", "dist_v_up"),
+        "catmask": (
+            "cat_attn_logits",
+            "cat_lora_down",
+            "cat_q_up",
+            "cat_k_up",
+            "cat_v_up",
+        ),
+        "struct_bias": (
+            "struct_bias_weights",
+            "struct_lora_down",
+            "struct_q_up",
+            "struct_k_up",
+            "struct_v_up",
+        ),
+        "dist_bias": (
+            "dist_bias_weights",
+            "dist_lora_down",
+            "dist_q_up",
+            "dist_k_up",
+            "dist_v_up",
+        ),
     }
     _special_param_ids: dict[str, set[int]] = {k: set() for k in _special_attr_groups}
     for ls in base_model.layer_scalars:
@@ -2198,7 +2444,11 @@ def main():
     catmask_params = []
     struct_bias_params = []
     dist_bias_params = []
-    _group_lists = {"catmask": catmask_params, "struct_bias": struct_bias_params, "dist_bias": dist_bias_params}
+    _group_lists = {
+        "catmask": catmask_params,
+        "struct_bias": struct_bias_params,
+        "dist_bias": dist_bias_params,
+    }
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
             if id(p) in conv_weight_ids:
