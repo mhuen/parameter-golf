@@ -36,7 +36,7 @@ import numpy as np
 # Configuration defaults
 # ---------------------------------------------------------------------------
 DATA_PATH_SP1024 = "./data/datasets/fineweb10B_sp1024"
-DATA_PATH_BYTES = "./data/datasets/fineweb10B_bytes"
+DATA_PATH_BYTES = "./data/datasets/fineweb10B_byte260"
 TOKENIZER_PATH = "./data/tokenizers/fineweb_1024_bpe.model"
 KENLM_BIN = (
     "/private/var/lib/persistent-storage/mirco/test_bed/language_models/kenlm/build/bin"
@@ -468,7 +468,7 @@ def main():
         print(f"  Loaded {train_tokens.size:,} tokens")
         if args.efficient_byte_mode:
             train_tokens = eff_tok.filter_stream(
-                eff_tok.remap_byte_array(train_tokens.astype(np.uint8))
+                eff_tok.remap_byte260_shard(train_tokens)
             )
             print(f"  Remapped + filtered: {train_tokens.size:,} tokens (vocab {eff_tok.vocab_size})")
 
@@ -509,7 +509,7 @@ def main():
         val_tokens = load_all_tokens(val_pattern)
         if args.efficient_byte_mode:
             val_tokens = eff_tok.filter_stream(
-                eff_tok.remap_byte_array(val_tokens.astype(np.uint8))
+                eff_tok.remap_byte260_shard(val_tokens)
             )
         print(f"  Loaded {val_tokens.size:,} validation tokens")
         if any_byte_mode:

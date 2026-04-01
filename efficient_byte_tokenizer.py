@@ -267,6 +267,9 @@ class EfficientByteTokenizer:
             for entry in BYTE_TABLE.entries:
                 if entry.lowercase_byte is not None:
                     fold_map[entry.byte_value] = entry.lowercase_byte
+        if ByteCategory.SEPARATOR in fold:
+            for b in _WHITESPACE_CONTROLS:
+                fold_map[b] = 0x20  # fold \t \n \v \f \r → space
         self._fold_map = fold_map
 
         # --- Step 2: After folding, which bytes get their own token ID? ---
@@ -436,6 +439,23 @@ class EfficientByteTokenizer:
         """
         raw_bytes = np.asarray(raw_bytes, dtype=np.uint8)
         return self._byte_to_id[raw_bytes]
+
+    def remap_byte260_shard(self, tokens: np.ndarray) -> np.ndarray:
+        """Convert byte260 (PureByteTokenizer) shard tokens to this tokenizer's IDs.
+
+        byte260 layout: pad=0, bos=1, eos=2, unk=3, byte_0=4, ..., byte_255=259.
+        BOS tokens are preserved as self.bos_id; byte tokens are folded/filtered
+        through the same mapping as remap_byte_array.
+        """
+        if not hasattr(self, "_byte260_lut"):
+            lut = np.full(260, _DROP_MARKER, dtype=np.uint16)
+            lut[0] = self.pad_id   # pad → pad
+            lut[1] = self.bos_id   # bos → bos
+            # eos(2) and unk(3) left as DROP_MARKER
+            for raw_byte in range(256):
+                lut[4 + raw_byte] = self._byte_to_id[raw_byte]
+            self._byte260_lut = lut
+        return self._byte260_lut[np.asarray(tokens, dtype=np.uint16)]
 
     # --- Description ---
 

@@ -59,7 +59,7 @@ from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
 
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_bytes")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     run_id = (
@@ -396,9 +396,13 @@ def load_data_shard(file):
 
 
 def remap_shard_tokens(
-    raw_bytes: np.ndarray, tok: EfficientByteTokenizer
+    shard_tokens: np.ndarray, tok: EfficientByteTokenizer
 ) -> torch.Tensor:
-    remapped = tok.remap_byte_array(raw_bytes)
+    """Convert byte260 shard tokens to EfficientByteTokenizer IDs.
+
+    BOS tokens at document boundaries are preserved.
+    """
+    remapped = tok.remap_byte260_shard(shard_tokens)
     remapped = tok.filter_stream(remapped)
     return torch.from_numpy(remapped)
 

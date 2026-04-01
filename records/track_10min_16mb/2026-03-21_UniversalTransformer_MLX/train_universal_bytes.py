@@ -10,8 +10,9 @@ Tokenizer configs (via env vars):
     DISCARD_UNUSED_BYTES=0           all 256 bytes, vocab=258
     FOLD=uppercase                   fold uppercase->lowercase, vocab=182
 
-Data: expects raw UTF-8 byte shards (byte values 0-255 as uint16, no special tokens).
-Byte values are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
+Data: expects byte260 shards (PureByteTokenizer format: bos=1, bytes=4..259 as uint16).
+Tokens are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
+BOS tokens at document boundaries are preserved for PACK_DOC_MASK support.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
 
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_bytes")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     run_id = (
@@ -542,8 +543,8 @@ def dequantize_state_dict_int8(obj):
 # DATA LOADING
 # -----------------------------
 
-# Byte shard format: raw UTF-8 byte values (0-255) stored as uint16, no special tokens.
-# We use tok.remap_byte_array() + tok.filter_stream() to convert to token IDs.
+# Byte260 shard format: PureByteTokenizer IDs (bos=1, bytes=4..259) stored as uint16.
+# We use tok.remap_byte260_shard() + tok.filter_stream() to convert to token IDs.
 
 
 def load_data_shard(file):
@@ -563,14 +564,15 @@ def load_data_shard(file):
 
 
 def remap_shard_tokens(
-    raw_bytes: np.ndarray, tok: EfficientByteTokenizer
+    shard_tokens: np.ndarray, tok: EfficientByteTokenizer
 ) -> torch.Tensor:
-    """Convert raw byte values to EfficientByteTokenizer IDs.
+    """Convert byte260 shard tokens to EfficientByteTokenizer IDs.
 
-    Uses tok.remap_byte_array() for the LUT lookup, then tok.filter_stream()
-    to apply the OtherTokenStrategy (e.g. drop unused bytes).
+    Uses tok.remap_byte260_shard() (byte260 format: bos=1, bytes=4..259),
+    then tok.filter_stream() to apply the OtherTokenStrategy.
+    BOS tokens at document boundaries are preserved.
     """
-    remapped = tok.remap_byte_array(raw_bytes)
+    remapped = tok.remap_byte260_shard(shard_tokens)
     remapped = tok.filter_stream(remapped)
     return torch.from_numpy(remapped)
 
@@ -2283,12 +2285,7 @@ def main():
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
 
     if args.pack_doc_mask:
-        raise NotImplementedError(
-            "PACK_DOC_MASK is broken with byte shards: BOS tokens are stripped "
-            "during remap_byte_array (byte value 1 is in _UNUSED_BYTES) so "
-            "build_doc_mask never finds document boundaries. The mask collapses "
-            "to a plain causal mask, adding overhead with no effect."
-        )
+        log0("pack_doc_mask:enabled (byte260 shards preserve BOS at document boundaries)")
     if args.structured_output_logits:
         args.tie_embeddings = False
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")

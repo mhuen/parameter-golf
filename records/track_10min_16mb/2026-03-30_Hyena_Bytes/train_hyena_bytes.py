@@ -11,8 +11,8 @@ Tokenizer configs (via env vars):
     DISCARD_UNUSED_BYTES=0           all 256 bytes, vocab=258
     FOLD=uppercase                   fold uppercase->lowercase, vocab=182
 
-Data: expects raw UTF-8 byte shards (byte values 0-255 as uint16, no special tokens).
-Byte values are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
+Data: expects byte260 shards (PureByteTokenizer format: bos=1, bytes=4..259 as uint16).
+Tokens are remapped on-the-fly to EfficientByteTokenizer IDs at load time.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
 
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_bytes")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_byte260")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     run_id = (
@@ -427,8 +427,8 @@ def dequantize_state_dict_int8(obj):
 # DATA LOADING
 # -----------------------------
 
-# Byte shard format: raw UTF-8 byte values (0-255) stored as uint16, no special tokens.
-# We use tok.remap_byte_array() + tok.filter_stream() to convert to token IDs.
+# Byte260 shard format: PureByteTokenizer IDs (bos=1, bytes=4..259) stored as uint16.
+# We use tok.remap_byte260_shard() + tok.filter_stream() to convert to token IDs.
 
 
 def load_data_shard(file):
@@ -448,10 +448,13 @@ def load_data_shard(file):
 
 
 def remap_shard_tokens(
-    raw_bytes: np.ndarray, tok: EfficientByteTokenizer
+    shard_tokens: np.ndarray, tok: EfficientByteTokenizer
 ) -> torch.Tensor:
-    """Convert raw byte values to EfficientByteTokenizer IDs."""
-    remapped = tok.remap_byte_array(raw_bytes)
+    """Convert byte260 shard tokens to EfficientByteTokenizer IDs.
+
+    BOS tokens at document boundaries are preserved.
+    """
+    remapped = tok.remap_byte260_shard(shard_tokens)
     remapped = tok.filter_stream(remapped)
     return torch.from_numpy(remapped)
 
