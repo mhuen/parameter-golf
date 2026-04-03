@@ -161,7 +161,6 @@ class Hyperparameters:
     ngram_confidence_c = float(os.environ.get("NGRAM_CONFIDENCE_C", 3.0))
     ngram_scale_init = float(os.environ.get("NGRAM_SCALE_INIT", 1.0))
     ngram_max_data_bytes = int(os.environ.get("NGRAM_MAX_DATA_BYTES", 500_000_000))
-    ngram_prune_threshold = int(os.environ.get("NGRAM_PRUNE_THRESHOLD", 50_000_000))
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -654,43 +653,40 @@ class DistributedTokenLoader:
 # -----------------------------
 
 
-def _encode_ngram_contexts_np(tokens, ctx_len, base):
-    """Vectorized n-gram context encoding (numpy).
+def _encode_ngram_keys_np(tokens: np.ndarray, order: int, base: int) -> np.ndarray:
+    """Encode full n-grams of length ``order`` as unique int64 keys.
 
-    For each position j, encode tokens[j:j+ctx_len] as a unique int64 key
-    via mixed-radix: key = Σ tokens[j+i] * base^i.
-    Memory-efficient: O(n) peak regardless of ctx_len.
+    key[j] = tokens[j]*base^0 + tokens[j+1]*base^1 + ... + tokens[j+order-1]*base^(order-1)
 
-    Returns (keys, next_bytes) arrays of length len(tokens) - ctx_len.
+    Returns array of length ``len(tokens) - order + 1``.
     """
-    n = len(tokens) - ctx_len
+    n = len(tokens) - order + 1
     keys = np.zeros(n, dtype=np.int64)
-    for i in range(ctx_len):
+    for i in range(order):
         keys += tokens[i : i + n].astype(np.int64) * int(base**i)
-    next_bytes = tokens[ctx_len : ctx_len + n]
-    return keys, next_bytes
+    return keys
 
 
 def build_ngram_tables(
     train_pattern: str,
     tok: "EfficientByteTokenizer",
     max_order: int = 8,
-    top_n: int = 1_000_000,
+    top_n: int = 5_000_000,
     confidence_c: float = 3.0,
     max_data_bytes: int = 500_000_000,
-    prune_threshold: int = 20_000_000,
     cache_dir: str | None = None,
     master_process: bool = True,
 ) -> dict[int, tuple[Tensor, Tensor]]:
     """Build byte-level n-gram lookup tables with backoff smoothing.
 
-    Two-phase approach per order for memory efficiency:
-      Phase 1: count context frequencies (chunked np.unique + Counter with pruning).
-      Phase 2: collect next-byte distributions for top-N contexts (searchsorted scatter).
+    Fully vectorized approach (following explore_bytes_ngram.ipynb):
+      1. Encode full n-grams as int64 keys.
+      2. ``np.unique`` to get all unique n-grams + counts in one shot.
+      3. Extract context keys via integer modulo, next bytes via integer division.
+      4. Select top-N contexts by total count, build conditional distributions.
 
     Smoothing: seen bytes keep their empirical count; unseen bytes receive
     ``confidence_c`` pseudo-counts (rule-of-three: c=3 ≈ 95 % CI upper bound).
-    The distribution is then normalized to proper log-probabilities.
 
     Returns dict mapping order → (sorted_keys [int64], log_probs [float16, (N, V)]).
     """
@@ -732,11 +728,10 @@ def build_ngram_tables(
         print(f"ngram: loaded {len(all_tokens):,} tokens")
 
     tables: dict[int, tuple[Tensor, Tensor]] = {}
-    FREQ_CHUNK = 10_000_000
 
     for order in range(1, max_order + 1):
         ctx_len = order - 1
-        if len(all_tokens) <= ctx_len:
+        if len(all_tokens) < order:
             continue
 
         t_start = time.time()
@@ -754,63 +749,58 @@ def build_ngram_tables(
                 print(f"  order {order}: unigram ({time.time() - t_start:.1f}s)")
             continue
 
-        # ---- Higher orders ----
+        # ---- Higher orders: fully vectorized ----
         if master_process:
-            print(f"  order {order}: encoding contexts (ctx_len={ctx_len})...")
-        keys, next_bytes = _encode_ngram_contexts_np(all_tokens, ctx_len, base)
-        n_positions = len(keys)
+            print(f"  order {order}: encoding {order}-grams...")
 
-        # Phase 1: count context frequencies via chunked np.unique + Counter
+        # Step 1: encode full n-grams and np.unique (single vectorized pass)
+        full_keys = _encode_ngram_keys_np(all_tokens, order, base)
+        n_positions = len(full_keys)
         if master_process:
-            print(
-                f"  order {order}: counting frequencies ({n_positions:,} positions)..."
-            )
-        context_freq: Counter = Counter()
-        for i in range(0, n_positions, FREQ_CHUNK):
-            chunk_keys = keys[i : i + FREQ_CHUNK]
-            unique, counts = np.unique(chunk_keys, return_counts=True)
-            for k, c in zip(unique.tolist(), counts.tolist()):
-                context_freq[k] += c
-            if len(context_freq) > prune_threshold:
-                before = len(context_freq)
-                context_freq = Counter({k: v for k, v in context_freq.items() if v > 1})
-                if master_process:
-                    print(f"    pruned {before:,} → {len(context_freq):,}")
+            print(f"  order {order}: np.unique on {n_positions:,} keys...")
+        ngram_ids, ngram_counts = np.unique(full_keys, return_counts=True)
+        del full_keys
 
-        n_unique = len(context_freq)
-        if master_process:
-            print(f"  order {order}: {n_unique:,} unique contexts")
+        # Step 2: extract context and next_byte via integer arithmetic
+        ctx_divisor = int(base**ctx_len)
+        context_keys = ngram_ids % ctx_divisor
+        next_bytes_arr = ngram_ids // ctx_divisor
+        del ngram_ids
 
-        # Select top-N by total count
-        if n_unique > top_n:
-            top_items = context_freq.most_common(top_n)
+        # Step 3: aggregate per-context totals
+        unique_contexts, ctx_inverse = np.unique(context_keys, return_inverse=True)
+        ctx_totals = np.zeros(len(unique_contexts), dtype=np.int64)
+        np.add.at(ctx_totals, ctx_inverse, ngram_counts)
+        n_unique_ctx = len(unique_contexts)
+
+        # Step 4: select top-N contexts by total count
+        if n_unique_ctx > top_n:
+            top_ctx_idx = np.argpartition(ctx_totals, -top_n)[-top_n:]
         else:
-            top_items = context_freq.most_common()
-        actual_n = len(top_items)
+            top_ctx_idx = np.arange(n_unique_ctx)
+        actual_n = len(top_ctx_idx)
+        coverage = ctx_totals[top_ctx_idx].sum() / n_positions
 
-        sorted_top_keys_np = np.array(sorted(k for k, _ in top_items), dtype=np.int64)
-        coverage_count = sum(c for _, c in top_items)
-        coverage = coverage_count / n_positions
-        del context_freq
+        # Build sorted selected context keys
+        selected_ctx = unique_contexts[top_ctx_idx]
+        sort_order = np.argsort(selected_ctx)
+        sorted_ctx = selected_ctx[sort_order]
 
-        # Phase 2: collect next-byte distributions for selected contexts
-        if master_process:
-            print(
-                f"  order {order}: collecting distributions for {actual_n:,} contexts "
-                f"(coverage={coverage:.1%})..."
-            )
+        # Step 5: map unique n-grams → selected contexts, build count matrix
+        sel_idx = np.searchsorted(sorted_ctx, context_keys)
+        sel_idx = np.clip(sel_idx, 0, actual_n - 1)
+        sel_found = sorted_ctx[sel_idx] == context_keys
+
         count_matrix = np.zeros((actual_n, vocab_size), dtype=np.int64)
-        for i in range(0, n_positions, FREQ_CHUNK):
-            chunk_keys = keys[i : i + FREQ_CHUNK]
-            chunk_next = next_bytes[i : i + FREQ_CHUNK]
-            idx = np.searchsorted(sorted_top_keys_np, chunk_keys)
-            idx = np.clip(idx, 0, len(sorted_top_keys_np) - 1)
-            found = sorted_top_keys_np[idx] == chunk_keys
-            np.add.at(count_matrix, (idx[found], chunk_next[found]), 1)
+        np.add.at(
+            count_matrix,
+            (sel_idx[sel_found], next_bytes_arr[sel_found].astype(np.int64)),
+            ngram_counts[sel_found],
+        )
+        del context_keys, next_bytes_arr, ngram_counts, ctx_inverse
+        del unique_contexts, ctx_totals, sel_idx, sel_found
 
-        del keys, next_bytes
-
-        # Smooth and convert to log-probs
+        # Step 6: smooth and convert to log-probs
         smoothed = np.where(
             count_matrix > 0,
             count_matrix.astype(np.float64),
@@ -819,17 +809,17 @@ def build_ngram_tables(
         log_probs = np.log(smoothed) - np.log(smoothed.sum(axis=1, keepdims=True))
 
         tables[order] = (
-            torch.tensor(sorted_top_keys_np, dtype=torch.int64),
+            torch.tensor(sorted_ctx, dtype=torch.int64),
             torch.tensor(log_probs, dtype=torch.float16),
         )
 
-        size_mb = (sorted_top_keys_np.nbytes + log_probs.size * 2) / 1e6  # float16
+        size_mb = (sorted_ctx.nbytes + log_probs.size * 2) / 1e6
         if master_process:
             print(
-                f"  order {order}: {actual_n:,} contexts, ~{size_mb:.0f} MB "
-                f"({time.time() - t_start:.1f}s)"
+                f"  order {order}: {actual_n:,} contexts, coverage={coverage:.1%}, "
+                f"~{size_mb:.0f} MB ({time.time() - t_start:.1f}s)"
             )
-        del count_matrix, smoothed, log_probs, sorted_top_keys_np
+        del count_matrix, smoothed, log_probs, sorted_ctx
 
     del all_tokens
 
@@ -2008,22 +1998,43 @@ class StructuredOutputHead(nn.Module):
         )  # (num_levels, V)
         self.register_buffer("level_masks", torch.stack(all_masks))  # (num_levels, V)
 
-    def forward(self, x, cat_prior=None, token_prior=None):
+        # ---- Precompute n-gram marginalization matrices (static) ----
+        # margin_i: (V, H_i) maps token probs → level-output probs via matmul.
+        # margin_i[t, j] = 1.0 iff token t is active at level i and maps to output j.
+        for i, head in enumerate(heads):
+            H = head.out_features
+            margin = torch.zeros(vocab_size, H)
+            margin.scatter_(1, all_indices[i].unsqueeze(1), all_masks[i].unsqueeze(1))
+            self.register_buffer(f"margin_{i}", margin)
+
+    def forward(self, x, cat_prior=None, token_prior=None, ngram_logp=None):
         """Return (B, S, V) log-probabilities assembled from the hierarchy.
 
         Args:
             x: (B, S, D) hidden states.
             cat_prior: (B, S, num_categories) additive mask for level-0 logits.
-            token_prior: (B, S, V) additive mask for final log-probs.
+            token_prior: (B, S, V) additive mask for final log-probs (e.g. UTF-8).
+            ngram_logp: (B, S, V) token-level n-gram log-probs.  Marginalized into
+                per-level conditional priors and added to each head's logits before
+                log_softmax.
         """
         B, S, _ = x.shape
         log_p = torch.zeros(B, S, self.vocab_size, device=x.device, dtype=x.dtype)
+        # Precompute n-gram probs once for all levels (float32 for log/exp precision)
+        ngram_probs = ngram_logp.float().exp() if ngram_logp is not None else None
         for i, head in enumerate(self.heads):
             logits = head(x)
             if i == 0 and cat_prior is not None:
                 logits = logits + cat_prior
             if self._is_leaf[i]:
                 logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            # Per-level n-gram prior: marginalize token probs → level conditional
+            if ngram_probs is not None:
+                margin = getattr(self, f"margin_{i}")  # (V, H_i)
+                level_probs = ngram_probs @ margin  # (B, S, H_i)
+                level_prior = level_probs.clamp(min=1e-30).log()
+                level_prior = level_prior - level_prior.logsumexp(dim=-1, keepdim=True)
+                logits = logits + level_prior.to(dtype=logits.dtype)
             lp = F.log_softmax(logits, dim=-1)
             log_p = log_p + lp[..., self.level_indices[i]] * self.level_masks[i]
         if token_prior is not None:
@@ -2435,22 +2446,30 @@ class GPT(nn.Module):
         cat_prior, token_prior = None, None
         if self.utf8_prior_mod is not None:
             cat_prior, token_prior = self.utf8_prior_mod(input_ids)
-        # N-gram prior: additive log-prob bias (merged into token_prior)
+        # N-gram prior
+        ngram_logp = None
         if self.ngram_prior_mod is not None:
-            ngram_bias = self.ngram_prior_mod(input_ids)
-            if token_prior is not None:
-                token_prior = token_prior + ngram_bias
-            else:
-                token_prior = ngram_bias
+            ngram_logp = self.ngram_prior_mod(input_ids)
         if self.structured_output_logits:
+            # Hierarchical: n-gram marginalized per level inside the head.
+            # token_prior here is UTF-8 hard masks only (no n-gram, avoids double-count).
             log_p = self.structured_head(
-                x, cat_prior=cat_prior, token_prior=token_prior
+                x,
+                cat_prior=cat_prior,
+                token_prior=token_prior,
+                ngram_logp=ngram_logp,
             )
             return F.nll_loss(
                 log_p.float().reshape(-1, log_p.size(-1)),
                 target_ids.reshape(-1),
                 reduction="mean",
             )
+        # Flat head: merge n-gram into token_prior at token level
+        if ngram_logp is not None:
+            if token_prior is not None:
+                token_prior = token_prior + ngram_logp
+            else:
+                token_prior = ngram_logp
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
         else:
@@ -2645,8 +2664,7 @@ def main():
             top_n=args.ngram_top_n,
             confidence_c=args.ngram_confidence_c,
             max_data_bytes=args.ngram_max_data_bytes,
-            prune_threshold=args.ngram_prune_threshold,
-            cache_dir=run_dir if master_process else None,
+            cache_dir=str(Path(run_dir).parent) if master_process else None,
             master_process=master_process,
         )
         log0(
