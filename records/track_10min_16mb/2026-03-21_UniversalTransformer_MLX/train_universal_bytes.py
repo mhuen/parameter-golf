@@ -894,15 +894,19 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, mlp_mult):
+    def __init__(self, dim, mlp_mult, leaky_relu_negative_slope: float | None = 0.5):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.leaky_relu_negative_slope = leaky_relu_negative_slope
 
     def forward(self, x):
-        x = torch.relu(self.fc(x))
+        if self.leaky_relu_negative_slope is None:
+            x = torch.relu(self.fc(x))
+        else:
+            x = F.leaky_relu(self.fc(x), negative_slope=self.leaky_relu_negative_slope)
         return self.proj(x.square())
 
 
@@ -2285,7 +2289,9 @@ def main():
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
 
     if args.pack_doc_mask:
-        log0("pack_doc_mask:enabled (byte260 shards preserve BOS at document boundaries)")
+        log0(
+            "pack_doc_mask:enabled (byte260 shards preserve BOS at document boundaries)"
+        )
     if args.structured_output_logits:
         args.tie_embeddings = False
         log0("structured_output_logits:enabled (forcing tie_embeddings=False)")
