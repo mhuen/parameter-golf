@@ -154,6 +154,15 @@ class Hyperparameters:
     rope_sent_base = float(os.environ.get("ROPE_SENT_BASE", 50.0))
     rope_para_base = float(os.environ.get("ROPE_PARA_BASE", 10.0))
 
+    # N-gram prior (additive logit bias from byte-level n-gram statistics)
+    ngram_prior = bool(int(os.environ.get("NGRAM_PRIOR", "0")))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 8))
+    ngram_top_n = int(os.environ.get("NGRAM_TOP_N", 5_000_000))
+    ngram_confidence_c = float(os.environ.get("NGRAM_CONFIDENCE_C", 3.0))
+    ngram_scale_init = float(os.environ.get("NGRAM_SCALE_INIT", 1.0))
+    ngram_max_data_bytes = int(os.environ.get("NGRAM_MAX_DATA_BYTES", 500_000_000))
+    ngram_prune_threshold = int(os.environ.get("NGRAM_PRUNE_THRESHOLD", 50_000_000))
+
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
     fold = os.environ.get("FOLD", "")  # comma-separated ByteCategory values
@@ -638,6 +647,284 @@ class DistributedTokenLoader:
             .to(device=self.device, dtype=torch.int64, non_blocking=True)
         )
         return x, y
+
+
+# -----------------------------
+# N-GRAM PRIOR
+# -----------------------------
+
+
+def _encode_ngram_contexts_np(tokens, ctx_len, base):
+    """Vectorized n-gram context encoding (numpy).
+
+    For each position j, encode tokens[j:j+ctx_len] as a unique int64 key
+    via mixed-radix: key = Σ tokens[j+i] * base^i.
+    Memory-efficient: O(n) peak regardless of ctx_len.
+
+    Returns (keys, next_bytes) arrays of length len(tokens) - ctx_len.
+    """
+    n = len(tokens) - ctx_len
+    keys = np.zeros(n, dtype=np.int64)
+    for i in range(ctx_len):
+        keys += tokens[i : i + n].astype(np.int64) * int(base**i)
+    next_bytes = tokens[ctx_len : ctx_len + n]
+    return keys, next_bytes
+
+
+def build_ngram_tables(
+    train_pattern: str,
+    tok: "EfficientByteTokenizer",
+    max_order: int = 8,
+    top_n: int = 1_000_000,
+    confidence_c: float = 3.0,
+    max_data_bytes: int = 500_000_000,
+    prune_threshold: int = 20_000_000,
+    cache_dir: str | None = None,
+    master_process: bool = True,
+) -> dict[int, tuple[Tensor, Tensor]]:
+    """Build byte-level n-gram lookup tables with backoff smoothing.
+
+    Two-phase approach per order for memory efficiency:
+      Phase 1: count context frequencies (chunked np.unique + Counter with pruning).
+      Phase 2: collect next-byte distributions for top-N contexts (searchsorted scatter).
+
+    Smoothing: seen bytes keep their empirical count; unseen bytes receive
+    ``confidence_c`` pseudo-counts (rule-of-three: c=3 ≈ 95 % CI upper bound).
+    The distribution is then normalized to proper log-probabilities.
+
+    Returns dict mapping order → (sorted_keys [int64], log_probs [float16, (N, V)]).
+    """
+    # Check cache
+    if cache_dir is not None:
+        cache_path = (
+            Path(cache_dir)
+            / f"ngram_o{max_order}_n{top_n}_c{confidence_c}_d{max_data_bytes}.pt"
+        )
+        if cache_path.exists():
+            if master_process:
+                print(f"ngram: loading cached tables from {cache_path}")
+            return torch.load(cache_path, map_location="cpu")
+
+    files = [Path(p) for p in sorted(glob.glob(train_pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
+
+    vocab_size = tok.vocab_size
+    base = vocab_size
+
+    # Load training tokens
+    if master_process:
+        print(f"ngram: loading training tokens (max={max_data_bytes:,})...")
+    token_chunks: list[np.ndarray] = []
+    total = 0
+    for f in files:
+        shard = load_data_shard(f)
+        toks = remap_shard_tokens(shard, tok).numpy().astype(np.int64)
+        token_chunks.append(toks)
+        total += len(toks)
+        if max_data_bytes > 0 and total >= max_data_bytes:
+            break
+    all_tokens = np.concatenate(token_chunks)
+    if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
+        all_tokens = all_tokens[:max_data_bytes]
+    del token_chunks
+    if master_process:
+        print(f"ngram: loaded {len(all_tokens):,} tokens")
+
+    tables: dict[int, tuple[Tensor, Tensor]] = {}
+    FREQ_CHUNK = 10_000_000
+
+    for order in range(1, max_order + 1):
+        ctx_len = order - 1
+        if len(all_tokens) <= ctx_len:
+            continue
+
+        t_start = time.time()
+
+        # ---- Unigram (order 1): just byte counts ----
+        if ctx_len == 0:
+            counts = np.bincount(all_tokens, minlength=vocab_size).astype(np.float64)
+            smoothed = np.maximum(counts, confidence_c)
+            logp = np.log(smoothed) - np.log(smoothed.sum())
+            tables[order] = (
+                torch.zeros(1, dtype=torch.int64),
+                torch.tensor(logp, dtype=torch.float16).unsqueeze(0),
+            )
+            if master_process:
+                print(f"  order {order}: unigram ({time.time() - t_start:.1f}s)")
+            continue
+
+        # ---- Higher orders ----
+        if master_process:
+            print(f"  order {order}: encoding contexts (ctx_len={ctx_len})...")
+        keys, next_bytes = _encode_ngram_contexts_np(all_tokens, ctx_len, base)
+        n_positions = len(keys)
+
+        # Phase 1: count context frequencies via chunked np.unique + Counter
+        if master_process:
+            print(
+                f"  order {order}: counting frequencies ({n_positions:,} positions)..."
+            )
+        context_freq: Counter = Counter()
+        for i in range(0, n_positions, FREQ_CHUNK):
+            chunk_keys = keys[i : i + FREQ_CHUNK]
+            unique, counts = np.unique(chunk_keys, return_counts=True)
+            for k, c in zip(unique.tolist(), counts.tolist()):
+                context_freq[k] += c
+            if len(context_freq) > prune_threshold:
+                before = len(context_freq)
+                context_freq = Counter({k: v for k, v in context_freq.items() if v > 1})
+                if master_process:
+                    print(f"    pruned {before:,} → {len(context_freq):,}")
+
+        n_unique = len(context_freq)
+        if master_process:
+            print(f"  order {order}: {n_unique:,} unique contexts")
+
+        # Select top-N by total count
+        if n_unique > top_n:
+            top_items = context_freq.most_common(top_n)
+        else:
+            top_items = context_freq.most_common()
+        actual_n = len(top_items)
+
+        sorted_top_keys_np = np.array(sorted(k for k, _ in top_items), dtype=np.int64)
+        coverage_count = sum(c for _, c in top_items)
+        coverage = coverage_count / n_positions
+        del context_freq
+
+        # Phase 2: collect next-byte distributions for selected contexts
+        if master_process:
+            print(
+                f"  order {order}: collecting distributions for {actual_n:,} contexts "
+                f"(coverage={coverage:.1%})..."
+            )
+        count_matrix = np.zeros((actual_n, vocab_size), dtype=np.int64)
+        for i in range(0, n_positions, FREQ_CHUNK):
+            chunk_keys = keys[i : i + FREQ_CHUNK]
+            chunk_next = next_bytes[i : i + FREQ_CHUNK]
+            idx = np.searchsorted(sorted_top_keys_np, chunk_keys)
+            idx = np.clip(idx, 0, len(sorted_top_keys_np) - 1)
+            found = sorted_top_keys_np[idx] == chunk_keys
+            np.add.at(count_matrix, (idx[found], chunk_next[found]), 1)
+
+        del keys, next_bytes
+
+        # Smooth and convert to log-probs
+        smoothed = np.where(
+            count_matrix > 0,
+            count_matrix.astype(np.float64),
+            confidence_c,
+        )
+        log_probs = np.log(smoothed) - np.log(smoothed.sum(axis=1, keepdims=True))
+
+        tables[order] = (
+            torch.tensor(sorted_top_keys_np, dtype=torch.int64),
+            torch.tensor(log_probs, dtype=torch.float16),
+        )
+
+        size_mb = (sorted_top_keys_np.nbytes + log_probs.size * 2) / 1e6  # float16
+        if master_process:
+            print(
+                f"  order {order}: {actual_n:,} contexts, ~{size_mb:.0f} MB "
+                f"({time.time() - t_start:.1f}s)"
+            )
+        del count_matrix, smoothed, log_probs, sorted_top_keys_np
+
+    del all_tokens
+
+    # Cache to disk
+    if cache_dir is not None and master_process:
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.save(tables, cache_path)
+        total_mb = (
+            sum(
+                k.numel() * k.element_size() + v.numel() * v.element_size()
+                for k, v in tables.values()
+            )
+            / 1e6
+        )
+        print(f"ngram: cached to {cache_path} ({total_mb:.1f} MB)")
+
+    return tables
+
+
+class NgramPrior(nn.Module):
+    """Byte-level n-gram prior with stupid backoff for logit biasing.
+
+    Stores sorted (context_key, log_prob_vector) tables for orders 1..max_order.
+    At each position, encodes the byte context via collision-free mixed-radix
+    int64 keys, looks up via ``searchsorted``, and backs off through decreasing
+    orders.  Unigram (order 1) is the universal fallback.
+
+    Table buffers are **non-persistent** (not saved in checkpoints — rebuild or
+    load from cache at startup).  The only learnable parameter is ``scale``.
+    """
+
+    def __init__(
+        self,
+        tables: dict[int, tuple[Tensor, Tensor]],
+        vocab_size: int,
+        scale_init: float = 1.0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.base = vocab_size
+        orders = sorted(tables.keys())
+        self.max_order = max(orders)
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        for order in orders:
+            keys, logp = tables[order]
+            self.register_buffer(f"keys_{order}", keys, persistent=False)
+            self.register_buffer(f"logp_{order}", logp, persistent=False)
+        # Ascending order: higher orders overwrite lower (highest priority last)
+        self._orders_asc: list[int] = sorted(orders)
+
+    def _encode_contexts(self, input_ids: Tensor, ctx_len: int) -> Tensor:
+        """(B, S) token IDs → (B, S) int64 context keys.
+
+        For position t the context is ``input_ids[:, t-ctx_len+1 : t+1]`` —
+        the last ``ctx_len`` tokens up to and including position t.  Left-padded
+        with a sentinel (= vocab_size) so early positions get keys that won't
+        match any table entry and naturally back off.
+        """
+        B, S = input_ids.shape
+        if ctx_len == 0:
+            return torch.zeros(B, S, device=input_ids.device, dtype=torch.int64)
+        padded = F.pad(input_ids.long(), (ctx_len, 0), value=self.base)
+        windows = padded[:, 1:].unfold(1, ctx_len, 1)  # (B, S, ctx_len)
+        powers = self.base ** torch.arange(
+            ctx_len, device=input_ids.device, dtype=torch.int64
+        )
+        return (windows * powers).sum(dim=-1)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        """(B, S) → (B, S, V) additive log-prob bias (float32).
+
+        Starts from unigram, then overwrites with each higher order where found.
+        """
+        B, S = input_ids.shape
+        V = self.vocab_size
+        # Unigram fallback (always present)
+        result = (
+            getattr(self, "logp_1")[0]
+            .to(dtype=torch.float32)
+            .view(1, 1, V)
+            .expand(B, S, V)
+        )
+        for order in self._orders_asc:
+            if order <= 1:
+                continue
+            keys_tbl = getattr(self, f"keys_{order}")
+            logp_tbl = getattr(self, f"logp_{order}")
+            ctx_keys = self._encode_contexts(input_ids, order - 1).reshape(-1)
+            idx = torch.searchsorted(keys_tbl, ctx_keys).clamp(
+                max=keys_tbl.shape[0] - 1
+            )
+            found = keys_tbl[idx] == ctx_keys  # (B*S,)
+            looked_up = logp_tbl[idx].to(dtype=torch.float32).reshape(B, S, V)
+            result = torch.where(found.reshape(B, S, 1), looked_up, result)
+        return result * self.scale
 
 
 # -----------------------------
@@ -1783,6 +2070,8 @@ class GPT(nn.Module):
         sem_rope_configs=None,
         sem_rope_types=None,
         tok=None,
+        ngram_tables=None,
+        ngram_scale_init=1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1935,6 +2224,13 @@ class GPT(nn.Module):
             )
         else:
             self.dist_bias_mod = None
+        # N-gram prior
+        if ngram_tables is not None:
+            self.ngram_prior_mod = NgramPrior(
+                ngram_tables, vocab_size, scale_init=ngram_scale_init
+            )
+        else:
+            self.ngram_prior_mod = None
         self._init_weights()
 
     def _init_weights(self):
@@ -2139,6 +2435,13 @@ class GPT(nn.Module):
         cat_prior, token_prior = None, None
         if self.utf8_prior_mod is not None:
             cat_prior, token_prior = self.utf8_prior_mod(input_ids)
+        # N-gram prior: additive log-prob bias (merged into token_prior)
+        if self.ngram_prior_mod is not None:
+            ngram_bias = self.ngram_prior_mod(input_ids)
+            if token_prior is not None:
+                token_prior = token_prior + ngram_bias
+            else:
+                token_prior = ngram_bias
         if self.structured_output_logits:
             log_p = self.structured_head(
                 x, cat_prior=cat_prior, token_prior=token_prior
@@ -2332,6 +2635,25 @@ def main():
             f"total_dims={total_sem}/{head_dim}"
         )
 
+    # Build n-gram tables (before model creation)
+    ngram_tables = None
+    if args.ngram_prior:
+        ngram_tables = build_ngram_tables(
+            args.train_files,
+            tok,
+            max_order=args.ngram_order,
+            top_n=args.ngram_top_n,
+            confidence_c=args.ngram_confidence_c,
+            max_data_bytes=args.ngram_max_data_bytes,
+            prune_threshold=args.ngram_prune_threshold,
+            cache_dir=run_dir if master_process else None,
+            master_process=master_process,
+        )
+        log0(
+            f"ngram_prior:enabled order={args.ngram_order} top_n={args.ngram_top_n} "
+            f"scale_init={args.ngram_scale_init}"
+        )
+
     _needs_tok = (
         args.structured_output_logits
         or args.utf8_prior
@@ -2375,6 +2697,8 @@ def main():
             sem_rope_configs=sem_rope_configs if sem_rope_configs else None,
             sem_rope_types=sem_rope_types if sem_rope_types else None,
             tok=tok if _needs_tok else None,
+            ngram_tables=ngram_tables,
+            ngram_scale_init=args.ngram_scale_init,
         )
         .to(device)
         .bfloat16()
@@ -2468,6 +2792,8 @@ def main():
     if base_model.shared_conv_scales is not None:
         for p in base_model.shared_conv_scales:
             scalar_params.append(p)
+    if base_model.ngram_prior_mod is not None:
+        scalar_params.append(base_model.ngram_prior_mod.scale)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
