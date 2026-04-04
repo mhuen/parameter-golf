@@ -166,6 +166,7 @@ class Hyperparameters:
     linear_mode = os.environ.get("LINEAR_MODE", "dense")
     kronecker_terms = int(os.environ.get("KRONECKER_TERMS", 4))
     monarch_nblocks = int(os.environ.get("MONARCH_NBLOCKS", 0))  # 0 = auto (sqrt(n))
+    compressed_muon = bool(int(os.environ.get("COMPRESSED_MUON", "0")))  # route factor params to Muon
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -311,10 +312,19 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    # For 3D+ params (e.g. Kronecker/Monarch factors), reshape
+                    # to 2D by stacking dim-0 slices: (K, M, N) -> (K*M, N).
+                    # This applies NS jointly across all slices, encouraging
+                    # inter-slice diversity (e.g. distinct Kronecker terms).
+                    orig_shape = g.shape
+                    if g.ndim > 2:
+                        g = g.reshape(-1, g.shape[-1])
                     g = zeropower_via_newtonschulz5(
                         g, steps=backend_steps, gram_ns=gram_ns
                     )
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    if g.shape != orig_shape:
+                        g = g.reshape(orig_shape)
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
             if distributed:
@@ -988,41 +998,62 @@ class CastedLinear(nn.Linear):
 
 
 class KroneckerLinear(nn.Module):
-    """W = sum_k A_k ⊗ B_k. Uses reshape trick: (A⊗B)vec(X) = vec(B X A^T)."""
+    """W = sum_k A_k ⊗ B_k. Materializes W then uses F.linear for speed.
+
+    Factor params (A, B) are 3D. When compressed_muon is enabled, Muon reshapes
+    them to 2D (stacking the K term slices) for NS orthogonalization in factor space.
+    NOTE: if per-factor NS underperforms, consider NS on the full materialized W
+    gradient instead (requires capturing ∂L/∂W via hooks outside torch.compile and
+    a custom optimizer step to chain-rule the orthogonalized update back to factors).
+    """
 
     def __init__(self, in_features, out_features, bias=False, num_terms=4):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        # Factor dimensions: pick largest divisor near sqrt for balanced blocks.
         self.p_in, self.q_in = _balanced_factors(in_features)
         self.p_out, self.q_out = _balanced_factors(out_features)
         self.num_terms = num_terms
-        # Each term: A_k is (p_out, p_in), B_k is (q_out, q_in)
         self.A = nn.Parameter(torch.randn(num_terms, self.p_out, self.p_in))
         self.B = nn.Parameter(torch.randn(num_terms, self.q_out, self.q_in))
         scale = (in_features * out_features) ** -0.5
         nn.init.normal_(self.A, std=scale)
         nn.init.normal_(self.B, std=scale)
+        self._W_cache = None
+
+    def materialize(self):
+        """Build W = Σ_k kron(A_k, B_k) and cache. Stays in autograd graph."""
+        A = self.A.to(torch.bfloat16)
+        B = self.B.to(torch.bfloat16)
+        W = torch.einsum("kij,kmn->imjn", A, B)
+        self._W_cache = W.reshape(self.out_features, self.in_features)
+
+    def clear_cache(self):
+        self._W_cache = None
 
     def forward(self, x):
-        # x: (..., in_features) -> (..., out_features)
-        leading = x.shape[:-1]
-        x = x.reshape(-1, self.q_in, self.p_in)
-        # Vectorized sum over K Kronecker terms: out[b,i,j] = Σ_k B[k,i,m] x[b,m,n] A[k,j,n]
-        out = torch.einsum("kim,bmn,kjn->bij", self.B.to(x.dtype), x, self.A.to(x.dtype))
-        return out.reshape(*leading, self.out_features)
+        if self._W_cache is not None:
+            return F.linear(x, self._W_cache)
+        A = self.A.to(x.dtype)
+        B = self.B.to(x.dtype)
+        W = torch.einsum("kij,kmn->imjn", A, B).reshape(
+            self.out_features, self.in_features
+        )
+        return F.linear(x, W)
 
 
 class MonarchLinear(nn.Module):
-    """Monarch: two block-diagonal matmuls with a reshape (permutation) between them.
-    Handles rectangular in->out via asymmetric block structure."""
+    """Monarch: two block-diagonal matmuls with a shuffle between them.
+    Materializes W then uses F.linear for speed.
+
+    See KroneckerLinear docstring for notes on compressed_muon and the
+    alternative of NS on the full materialized W gradient.
+    """
 
     def __init__(self, in_features, out_features, bias=False, nblocks=0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        # Auto nblocks: sqrt of the smaller dimension, rounded to nearest divisor.
         if nblocks <= 0:
             nblocks = _nearest_divisor(min(in_features, out_features),
                                        int(math.sqrt(min(in_features, out_features))))
@@ -1032,10 +1063,7 @@ class MonarchLinear(nn.Module):
                 f"in_features ({in_features}) must be divisible by nblocks ({nblocks})"
             )
         self.blk_in = in_features // nblocks
-        # Stage 1: nblocks blocks of (blk_in x blk_in)
         self.w1 = nn.Parameter(torch.randn(nblocks, self.blk_in, self.blk_in))
-        # After monarch shuffle: (blk_in, nblocks)
-        # Stage 2: blk_in blocks of (nblocks -> blk_out2)
         if out_features % self.blk_in != 0:
             raise ValueError(
                 f"out_features ({out_features}) must be divisible by blk_in={self.blk_in} "
@@ -1046,18 +1074,27 @@ class MonarchLinear(nn.Module):
         scale = (in_features * out_features) ** -0.25
         nn.init.normal_(self.w1, std=scale)
         nn.init.normal_(self.w2, std=scale)
+        self._W_cache = None
+
+    def materialize(self):
+        """Build full W from Monarch factors and cache. Stays in autograd graph."""
+        w1 = self.w1.to(torch.bfloat16)
+        w2 = self.w2.to(torch.bfloat16)
+        W = torch.einsum("jno,njk->jonk", w2, w1)
+        self._W_cache = W.reshape(self.out_features, self.in_features)
+
+    def clear_cache(self):
+        self._W_cache = None
 
     def forward(self, x):
-        # x: (..., in_features) -> (..., out_features)
-        leading = x.shape[:-1]
-        x = x.reshape(-1, self.nblocks, self.blk_in)
-        # Stage 1: block-diagonal matmul (nblocks independent transforms)
-        x = torch.einsum("bni,nij->bnj", x, self.w1.to(x.dtype))
-        # Monarch shuffle: transpose block structure
-        x = x.transpose(1, 2).contiguous()  # (batch, blk_in, nblocks)
-        # Stage 2: block-diagonal matmul (blk_in independent transforms)
-        x = torch.einsum("bin,ino->bio", x, self.w2.to(x.dtype))
-        return x.reshape(*leading, self.out_features)
+        if self._W_cache is not None:
+            return F.linear(x, self._W_cache)
+        w1 = self.w1.to(x.dtype)
+        w2 = self.w2.to(x.dtype)
+        W = torch.einsum("jno,njk->jonk", w2, w1).reshape(
+            self.out_features, self.in_features
+        )
+        return F.linear(x, W)
 
 
 def _balanced_factors(n):
@@ -2429,6 +2466,18 @@ class GPT(nn.Module):
                 for p in module.parameters():
                     nn.init.zeros_(p)
 
+    def _materialize_weights(self):
+        """Materialize cached W for all KroneckerLinear/MonarchLinear in shared blocks."""
+        for m in self.shared_blocks.modules():
+            if isinstance(m, (KroneckerLinear, MonarchLinear)):
+                m.materialize()
+
+    def _clear_weight_caches(self):
+        """Clear materialized W caches to free memory."""
+        for m in self.shared_blocks.modules():
+            if isinstance(m, (KroneckerLinear, MonarchLinear)):
+                m.clear_cache()
+
     def _get_conv_args(self, ls, layer_idx):
         if not self.conv_enabled:
             return None, None
@@ -2564,6 +2613,9 @@ class GPT(nn.Module):
         x0 = x
         skips = []
 
+        # Materialize Kronecker/Monarch weights once for all shared-block reuses
+        self._materialize_weights()
+
         # Precompute all input-dependent attention extras once for all layers
         precomputed = self._precompute_attn_extras(input_ids, x.dtype)
 
@@ -2617,6 +2669,9 @@ class GPT(nn.Module):
                 dist_lora=dist_lora,
                 boundary_ids=boundary_ids,
             )
+        # Free materialized weight caches after all layers are done
+        self._clear_weight_caches()
+
         x = self.final_norm(x)
         # Compute UTF-8 prior masks (purely from input_ids, causal)
         cat_prior, token_prior = None, None
@@ -2922,16 +2977,27 @@ def main():
         if isinstance(m, nn.Conv1d)
         for p in m.parameters()
     }
+    # When compressed_muon is enabled, route >=2D Kronecker/Monarch factor params
+    # to Muon (which reshapes 3D->2D for NS). Otherwise only 2D params go to Muon.
+    _compressed_param_ids = set()
+    if args.compressed_muon:
+        for m in base_model.shared_blocks.modules():
+            if isinstance(m, (KroneckerLinear, MonarchLinear)):
+                for p in m.parameters():
+                    _compressed_param_ids.add(id(p))
     shared_blocks_named = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
         for n, p in shared_blocks_named
-        if p.ndim == 2 and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim == 2 or id(p) in _compressed_param_ids)
+        and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        and id(p) not in conv_weight_ids
     ]
+    _matrix_param_ids = {id(p) for p in matrix_params}
     scalar_params = [
         p
         for n, p in shared_blocks_named
-        if (p.ndim != 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS))
+        if id(p) not in _matrix_param_ids
         and id(p) not in conv_weight_ids
     ]
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
@@ -3127,7 +3193,7 @@ def main():
             f"kronecker_terms:{args.kronecker_terms}" if args.linear_mode == "kronecker"
             else f"monarch_nblocks:{args.monarch_nblocks}"
         )
-        log0(f"linear_mode:{args.linear_mode} {_lm_extra}")
+        log0(f"linear_mode:{args.linear_mode} {_lm_extra} compressed_muon:{args.compressed_muon}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}"
@@ -3280,11 +3346,12 @@ def main():
             if args.muon_momentum_warmup_steps > 0
             else 1.0
         )
+        warmed_momentum = (
+            (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        )
         if optimizer_muon is not None:
             for group in optimizer_muon.param_groups:
-                group["momentum"] = (
-                    1 - frac
-                ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+                group["momentum"] = warmed_momentum
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
