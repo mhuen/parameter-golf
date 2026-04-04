@@ -905,7 +905,11 @@ class NgramPrior(nn.Module):
         self.base = vocab_size
         orders = sorted(tables.keys())
         self.max_order = max(orders)
-        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
+        # Sigmoid gate: sigmoid(gate_logit) ∈ [0,1].  Initialised so that
+        # sigmoid(gate_logit) ≈ scale_init (clamped to (ε, 1-ε) for invertibility).
+        _si = max(min(scale_init, 1.0 - 1e-4), 1e-4)
+        _gate_init = math.log(_si / (1.0 - _si))  # inverse sigmoid
+        self.gate_logit = nn.Parameter(torch.tensor(_gate_init, dtype=torch.float32))
         for order in orders:
             keys, logp = tables[order]
             self.register_buffer(f"keys_{order}", keys, persistent=False)
@@ -957,7 +961,7 @@ class NgramPrior(nn.Module):
             found = keys_tbl[idx] == ctx_keys  # (B*S,)
             looked_up = logp_tbl[idx].to(dtype=torch.float32).reshape(B, S, V)
             result = torch.where(found.reshape(B, S, 1), looked_up, result)
-        return result * self.scale
+        return result * torch.sigmoid(self.gate_logit)
 
 
 # -----------------------------
@@ -2988,7 +2992,7 @@ def main():
         for p in base_model.shared_conv_scales:
             scalar_params.append(p)
     if base_model.ngram_prior_mod is not None:
-        scalar_params.append(base_model.ngram_prior_mod.scale)
+        scalar_params.append(base_model.ngram_prior_mod.gate_logit)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
