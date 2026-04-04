@@ -677,7 +677,7 @@ def build_ngram_tables(
     cache_dir: str | None = None,
     master_process: bool = True,
 ) -> dict[int, tuple[Tensor, Tensor]]:
-    """Build byte-level n-gram lookup tables with backoff smoothing.
+    """Build byte-level n-gram lookup tables with chained backoff.
 
     Fully vectorized approach (following explore_bytes_ngram.ipynb):
       1. Encode full n-grams as int64 keys.
@@ -685,8 +685,13 @@ def build_ngram_tables(
       3. Extract context keys via integer modulo, next bytes via integer division.
       4. Select top-N contexts by total count, build conditional distributions.
 
-    Smoothing: seen bytes keep their empirical count; unseen bytes receive
-    ``confidence_c`` pseudo-counts (rule-of-three: c=3 ≈ 95 % CI upper bound).
+    Backoff: for each context at order k, seen bytes use MLE (count/total).
+    Unseen bytes are filled with the (k-1)-gram distribution for the shorter
+    context (last k-2 tokens), chained down to unigram.  The combined
+    distribution is renormalized so rows sum to 1.  This avoids the dilution
+    problem of additive pseudo-count smoothing.
+
+    Unigram level uses ``confidence_c`` floor for any truly unseen bytes.
 
     Returns dict mapping order → (sorted_keys [int64], log_probs [float16, (N, V)]).
     """
@@ -694,7 +699,7 @@ def build_ngram_tables(
     if cache_dir is not None:
         cache_path = (
             Path(cache_dir)
-            / f"ngram_o{max_order}_n{top_n}_c{confidence_c}_d{max_data_bytes}.pt"
+            / f"ngram_v2_o{max_order}_n{top_n}_c{confidence_c}_d{max_data_bytes}.pt"
         )
         if cache_path.exists():
             if master_process:
@@ -728,6 +733,10 @@ def build_ngram_tables(
         print(f"ngram: loaded {len(all_tokens):,} tokens")
 
     tables: dict[int, tuple[Tensor, Tensor]] = {}
+    # Keep numpy versions of previous order for chained backoff lookups
+    prev_np_keys: np.ndarray | None = None  # sorted context keys
+    prev_np_logp: np.ndarray | None = None  # log-prob matrix (N, V)
+    unigram_logp: np.ndarray | None = None  # (V,) ultimate fallback
 
     for order in range(1, max_order + 1):
         ctx_len = order - 1
@@ -741,10 +750,14 @@ def build_ngram_tables(
             counts = np.bincount(all_tokens, minlength=vocab_size).astype(np.float64)
             smoothed = np.maximum(counts, confidence_c)
             logp = np.log(smoothed) - np.log(smoothed.sum())
+            unigram_logp = logp
             tables[order] = (
                 torch.zeros(1, dtype=torch.int64),
                 torch.tensor(logp, dtype=torch.float16).unsqueeze(0),
             )
+            # Store for chained backoff (unigram: single row, key=0)
+            prev_np_keys = np.zeros(1, dtype=np.int64)
+            prev_np_logp = logp.reshape(1, -1)
             if master_process:
                 print(f"  order {order}: unigram ({time.time() - t_start:.1f}s)")
             continue
@@ -800,18 +813,43 @@ def build_ngram_tables(
         del context_keys, next_bytes_arr, ngram_counts, ctx_inverse
         del unique_contexts, ctx_totals, sel_idx, sel_found
 
-        # Step 6: smooth and convert to log-probs
-        smoothed = np.where(
-            count_matrix > 0,
-            count_matrix.astype(np.float64),
-            confidence_c,
+        # Step 6: MLE for seen bytes + chained backoff for unseen bytes
+        seen = count_matrix > 0
+        row_totals = count_matrix.sum(axis=1, keepdims=True).astype(np.float64)
+        row_totals = np.maximum(row_totals, 1.0)
+        mle_probs = count_matrix.astype(np.float64) / row_totals
+        del count_matrix
+
+        # Build fallback: look up shorter context in (k-1) table
+        # shorter_key = context_key // base  (drops oldest token from context)
+        shorter_keys = sorted_ctx // base
+        assert prev_np_keys is not None and prev_np_logp is not None
+        fb_idx = np.searchsorted(prev_np_keys, shorter_keys)
+        fb_idx = np.clip(fb_idx, 0, len(prev_np_keys) - 1)
+        fb_found = prev_np_keys[fb_idx] == shorter_keys
+        # Use (k-1) row where found, else unigram
+        fallback_logp = np.where(
+            fb_found[:, None],
+            prev_np_logp[fb_idx],
+            unigram_logp[None, :],
         )
-        log_probs = np.log(smoothed) - np.log(smoothed.sum(axis=1, keepdims=True))
+        fallback_probs = np.exp(fallback_logp)
+        del fallback_logp, fb_idx, fb_found, shorter_keys
+
+        # Combine: MLE for seen, fallback for unseen, then renormalize
+        combined = np.where(seen, mle_probs, fallback_probs)
+        combined /= combined.sum(axis=1, keepdims=True)
+        log_probs = np.log(np.maximum(combined, 1e-30))
+        del seen, mle_probs, fallback_probs, combined, row_totals
 
         tables[order] = (
             torch.tensor(sorted_ctx, dtype=torch.int64),
             torch.tensor(log_probs, dtype=torch.float16),
         )
+
+        # Store for next order's chained backoff (replace previous)
+        prev_np_keys = sorted_ctx
+        prev_np_logp = log_probs.astype(np.float32)
 
         size_mb = (sorted_ctx.nbytes + log_probs.size * 2) / 1e6
         if master_process:
@@ -819,9 +857,9 @@ def build_ngram_tables(
                 f"  order {order}: {actual_n:,} contexts, coverage={coverage:.1%}, "
                 f"~{size_mb:.0f} MB ({time.time() - t_start:.1f}s)"
             )
-        del count_matrix, smoothed, log_probs, sorted_ctx
+        del log_probs, sorted_ctx
 
-    del all_tokens
+    del all_tokens, prev_np_keys, prev_np_logp
 
     # Cache to disk
     if cache_dir is not None and master_process:
