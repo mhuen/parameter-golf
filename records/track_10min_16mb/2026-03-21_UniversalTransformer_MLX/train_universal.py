@@ -678,10 +678,13 @@ class MonarchLinear(nn.Module):
     def forward(self, x):
         leading = x.shape[:-1]
         x = x.reshape(-1, self.nblocks, self.blk_in)
-        x = torch.einsum("bni,nij->bnj", x, self.w1.to(x.dtype))
-        x = x.transpose(1, 2).contiguous()
-        x = torch.einsum("bin,ino->bio", x, self.w2.to(x.dtype))
-        return x.reshape(*leading, self.out_features)
+        # Stage 1: block-diagonal bmm (nblocks as batch dim)
+        x = torch.bmm(x.permute(1, 0, 2), self.w1.to(x.dtype))  # (nblocks, batch, blk_in)
+        # Monarch shuffle fused into permute: (nblocks, batch, blk_in) -> (blk_in, batch, nblocks)
+        x = x.permute(2, 1, 0).contiguous()
+        # Stage 2: block-diagonal bmm (blk_in as batch dim)
+        x = torch.bmm(x, self.w2.to(x.dtype))  # (blk_in, batch, blk_out2)
+        return x.permute(1, 0, 2).reshape(*leading, self.out_features)
 
 
 def _balanced_factors(n):
