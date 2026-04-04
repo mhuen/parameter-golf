@@ -1004,13 +1004,9 @@ class KroneckerLinear(nn.Module):
     def forward(self, x):
         # x: (..., in_features) -> (..., out_features)
         leading = x.shape[:-1]
-        x = x.reshape(-1, self.q_in, self.p_in).to(x.dtype)
-        # Sum over K Kronecker terms: y = sum_k B_k @ X @ A_k^T
-        out = torch.zeros(
-            x.shape[0], self.q_out, self.p_out, device=x.device, dtype=x.dtype
-        )
-        for k in range(self.num_terms):
-            out = out + self.B[k].to(x.dtype) @ x @ self.A[k].to(x.dtype).T
+        x = x.reshape(-1, self.q_in, self.p_in)
+        # Vectorized sum over K Kronecker terms: out[b,i,j] = Σ_k B[k,i,m] x[b,m,n] A[k,j,n]
+        out = torch.einsum("kim,bmn,kjn->bij", self.B.to(x.dtype), x, self.A.to(x.dtype))
         return out.reshape(*leading, self.out_features)
 
 
