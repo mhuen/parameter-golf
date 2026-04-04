@@ -163,7 +163,10 @@ class Hyperparameters:
     ngram_max_data_bytes = int(os.environ.get("NGRAM_MAX_DATA_BYTES", 500_000_000))
 
     # Compressed linear layer mode: dense (default CastedLinear), kronecker, monarch
+    # LINEAR_MODE sets the default; LINEAR_MODE_ATTN / LINEAR_MODE_MLP override per-component
     linear_mode = os.environ.get("LINEAR_MODE", "dense")
+    linear_mode_attn = os.environ.get("LINEAR_MODE_ATTN", "")  # "" = use LINEAR_MODE
+    linear_mode_mlp = os.environ.get("LINEAR_MODE_MLP", "")  # "" = use LINEAR_MODE
     kronecker_terms = int(os.environ.get("KRONECKER_TERMS", 4))
     monarch_nblocks = int(os.environ.get("MONARCH_NBLOCKS", 0))  # 0 = auto (sqrt(n))
     muon_optimize_factors = bool(int(os.environ.get("MUON_OPTIMIZE_FACTORS", "0")))  # Kronecker/Monarch factors
@@ -1646,9 +1649,13 @@ class SharedBlock(nn.Module):
         conv_groups=0,
         sem_rope_configs=None,
         linear_mode="dense",
+        linear_mode_attn="",
+        linear_mode_mlp="",
         linear_kwargs=None,
     ):
         super().__init__()
+        _attn_mode = linear_mode_attn or linear_mode
+        _mlp_mode = linear_mode_mlp or linear_mode
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
@@ -1659,10 +1666,10 @@ class SharedBlock(nn.Module):
             qk_gain_init,
             rope_dim_fraction,
             sem_rope_configs=sem_rope_configs,
-            linear_mode=linear_mode,
+            linear_mode=_attn_mode,
             linear_kwargs=linear_kwargs,
         )
-        self.mlp = MLP(dim, mlp_mult, linear_mode=linear_mode, linear_kwargs=linear_kwargs)
+        self.mlp = MLP(dim, mlp_mult, linear_mode=_mlp_mode, linear_kwargs=linear_kwargs)
         self.conv = (
             GatedCausalConv(dim, conv_kernel_size, conv_groups)
             if conv_kernel_size > 0
@@ -2290,6 +2297,8 @@ class GPT(nn.Module):
         ngram_tables=None,
         ngram_scale_init=1.0,
         linear_mode="dense",
+        linear_mode_attn="",
+        linear_mode_mlp="",
         linear_kwargs=None,
     ):
         super().__init__()
@@ -2339,6 +2348,8 @@ class GPT(nn.Module):
                     conv_groups=conv_groups,
                     sem_rope_configs=sem_rope_configs if sem_rope_configs else None,
                     linear_mode=linear_mode,
+                    linear_mode_attn=linear_mode_attn,
+                    linear_mode_mlp=linear_mode_mlp,
                     linear_kwargs=linear_kwargs,
                 )
                 for _ in range(num_blocks)
@@ -2951,6 +2962,8 @@ def main():
             ngram_tables=ngram_tables,
             ngram_scale_init=args.ngram_scale_init,
             linear_mode=args.linear_mode,
+            linear_mode_attn=args.linear_mode_attn,
+            linear_mode_mlp=args.linear_mode_mlp,
             linear_kwargs={
                 "kronecker_terms": args.kronecker_terms,
                 "monarch_nblocks": args.monarch_nblocks,
@@ -3204,12 +3217,13 @@ def main():
     n_params = sum(p.numel() for p in base_model.parameters())
     num_blocks = len(base_model.shared_blocks)
     log0(f"model_params:{n_params}")
-    if args.linear_mode != "dense":
-        _lm_extra = (
-            f"kronecker_terms:{args.kronecker_terms}" if args.linear_mode == "kronecker"
-            else f"monarch_nblocks:{args.monarch_nblocks}"
-        )
-        log0(f"linear_mode:{args.linear_mode} {_lm_extra} muon_factors:{args.muon_optimize_factors}")
+    _attn_mode = args.linear_mode_attn or args.linear_mode
+    _mlp_mode = args.linear_mode_mlp or args.linear_mode
+    if _attn_mode != "dense" or _mlp_mode != "dense":
+        _lm_extra = f"kronecker_terms:{args.kronecker_terms}" if "kronecker" in (_attn_mode, _mlp_mode) else ""
+        if "monarch" in (_attn_mode, _mlp_mode):
+            _lm_extra += f" monarch_nblocks:{args.monarch_nblocks}"
+        log0(f"linear_mode attn:{_attn_mode} mlp:{_mlp_mode} {_lm_extra.strip()} muon_factors:{args.muon_optimize_factors}")
     _muon_extras = []
     if args.muon_optimize_lm_head:
         _muon_extras.append("lm_head")
