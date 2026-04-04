@@ -157,7 +157,7 @@ class Hyperparameters:
     # N-gram prior (additive logit bias from byte-level n-gram statistics)
     ngram_prior = bool(int(os.environ.get("NGRAM_PRIOR", "0")))
     ngram_order = int(os.environ.get("NGRAM_ORDER", 8))
-    ngram_top_n = int(os.environ.get("NGRAM_TOP_N", 5_000_000))
+    ngram_top_n = int(os.environ.get("NGRAM_TOP_N", 20_000_000))
     ngram_confidence_c = float(os.environ.get("NGRAM_CONFIDENCE_C", 3.0))
     ngram_scale_init = float(os.environ.get("NGRAM_SCALE_INIT", 1.0))
     ngram_max_data_bytes = int(os.environ.get("NGRAM_MAX_DATA_BYTES", 500_000_000))
