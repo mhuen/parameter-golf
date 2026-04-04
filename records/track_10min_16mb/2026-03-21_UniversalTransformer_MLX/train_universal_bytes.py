@@ -162,6 +162,11 @@ class Hyperparameters:
     ngram_scale_init = float(os.environ.get("NGRAM_SCALE_INIT", 1.0))
     ngram_max_data_bytes = int(os.environ.get("NGRAM_MAX_DATA_BYTES", 500_000_000))
 
+    # Compressed linear layer mode: dense (default CastedLinear), kronecker, monarch
+    linear_mode = os.environ.get("LINEAR_MODE", "dense")
+    kronecker_terms = int(os.environ.get("KRONECKER_TERMS", 4))
+    monarch_nblocks = int(os.environ.get("MONARCH_NBLOCKS", 0))  # 0 = auto (sqrt(n))
+
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
     fold = os.environ.get("FOLD", "")  # comma-separated ByteCategory values
@@ -978,6 +983,121 @@ class CastedLinear(nn.Linear):
         )
 
 
+class KroneckerLinear(nn.Module):
+    """W = sum_k A_k ⊗ B_k. Uses reshape trick: (A⊗B)vec(X) = vec(B X A^T)."""
+
+    def __init__(self, in_features, out_features, bias=False, num_terms=4):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Factor dimensions: pick largest divisor near sqrt for balanced blocks.
+        self.p_in, self.q_in = _balanced_factors(in_features)
+        self.p_out, self.q_out = _balanced_factors(out_features)
+        self.num_terms = num_terms
+        # Each term: A_k is (p_out, p_in), B_k is (q_out, q_in)
+        self.A = nn.Parameter(torch.randn(num_terms, self.p_out, self.p_in))
+        self.B = nn.Parameter(torch.randn(num_terms, self.q_out, self.q_in))
+        scale = (in_features * out_features) ** -0.5
+        nn.init.normal_(self.A, std=scale)
+        nn.init.normal_(self.B, std=scale)
+
+    def forward(self, x):
+        # x: (..., in_features) -> (..., out_features)
+        leading = x.shape[:-1]
+        x = x.reshape(-1, self.q_in, self.p_in).to(x.dtype)
+        # Sum over K Kronecker terms: y = sum_k B_k @ X @ A_k^T
+        out = torch.zeros(
+            x.shape[0], self.q_out, self.p_out, device=x.device, dtype=x.dtype
+        )
+        for k in range(self.num_terms):
+            out = out + self.B[k].to(x.dtype) @ x @ self.A[k].to(x.dtype).T
+        return out.reshape(*leading, self.out_features)
+
+
+class MonarchLinear(nn.Module):
+    """Monarch: two block-diagonal matmuls with a reshape (permutation) between them.
+    Handles rectangular in->out via asymmetric block structure."""
+
+    def __init__(self, in_features, out_features, bias=False, nblocks=0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Auto nblocks: sqrt of the smaller dimension, rounded to nearest divisor.
+        if nblocks <= 0:
+            nblocks = _nearest_divisor(min(in_features, out_features),
+                                       int(math.sqrt(min(in_features, out_features))))
+        self.nblocks = nblocks
+        if in_features % nblocks != 0:
+            raise ValueError(
+                f"in_features ({in_features}) must be divisible by nblocks ({nblocks})"
+            )
+        self.blk_in = in_features // nblocks
+        # Stage 1: nblocks blocks of (blk_in x blk_in)
+        self.w1 = nn.Parameter(torch.randn(nblocks, self.blk_in, self.blk_in))
+        # After monarch shuffle: (blk_in, nblocks)
+        # Stage 2: blk_in blocks of (nblocks -> blk_out2)
+        if out_features % self.blk_in != 0:
+            raise ValueError(
+                f"out_features ({out_features}) must be divisible by blk_in={self.blk_in} "
+                f"(= in_features // nblocks)"
+            )
+        self.blk_out2 = out_features // self.blk_in
+        self.w2 = nn.Parameter(torch.randn(self.blk_in, nblocks, self.blk_out2))
+        scale = (in_features * out_features) ** -0.25
+        nn.init.normal_(self.w1, std=scale)
+        nn.init.normal_(self.w2, std=scale)
+
+    def forward(self, x):
+        # x: (..., in_features) -> (..., out_features)
+        leading = x.shape[:-1]
+        x = x.reshape(-1, self.nblocks, self.blk_in)
+        # Stage 1: block-diagonal matmul via einsum (nblocks independent transforms)
+        x = torch.einsum("bni,nij->bnj", x, self.w1.to(x.dtype))
+        # Monarch shuffle: transpose block structure
+        x = x.transpose(1, 2).contiguous()  # (batch, blk_in, nblocks)
+        # Stage 2: block-diagonal matmul (blk_in independent transforms)
+        x = torch.einsum("bin,ino->bio", x, self.w2.to(x.dtype))
+        return x.reshape(*leading, self.out_features)
+
+
+def _balanced_factors(n):
+    """Find two factors of n closest to sqrt(n)."""
+    s = int(math.sqrt(n))
+    while n % s != 0:
+        s -= 1
+    return s, n // s
+
+
+def _nearest_divisor(n, target):
+    """Find the divisor of n closest to target."""
+    best, best_dist = 1, abs(1 - target)
+    for d in range(1, int(math.sqrt(n)) + 1):
+        if n % d == 0:
+            for candidate in (d, n // d):
+                dist = abs(candidate - target)
+                if dist < best_dist:
+                    best, best_dist = candidate, dist
+    return best
+
+
+def make_linear(in_features, out_features, bias=False, mode="dense", **kwargs):
+    """Factory: create a CastedLinear, KroneckerLinear, or MonarchLinear."""
+    if mode == "dense":
+        return CastedLinear(in_features, out_features, bias=bias)
+    elif mode == "kronecker":
+        return KroneckerLinear(
+            in_features, out_features, bias=bias,
+            num_terms=kwargs.get("kronecker_terms", 4),
+        )
+    elif mode == "monarch":
+        return MonarchLinear(
+            in_features, out_features, bias=bias,
+            nblocks=kwargs.get("monarch_nblocks", 0),
+        )
+    else:
+        raise ValueError(f"Unknown linear_mode: {mode!r}")
+
+
 def restore_low_dim_params_to_fp32(module):
     with torch.no_grad():
         for name, param in module.named_parameters():
@@ -1086,6 +1206,8 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init,
         rope_dim_fraction=1.0,
         sem_rope_configs=None,
+        linear_mode="dense",
+        linear_kwargs=None,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1098,10 +1220,11 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        _lkw = linear_kwargs or {}
+        self.c_q = make_linear(dim, dim, bias=False, mode=linear_mode, **_lkw)
+        self.c_k = make_linear(dim, kv_dim, bias=False, mode=linear_mode, **_lkw)
+        self.c_v = make_linear(dim, kv_dim, bias=False, mode=linear_mode, **_lkw)
+        self.proj = make_linear(dim, dim, bias=False, mode=linear_mode, **_lkw)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
@@ -1209,11 +1332,13 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, mlp_mult, leaky_relu_negative_slope: float | None = 0.5):
+    def __init__(self, dim, mlp_mult, leaky_relu_negative_slope: float | None = 0.5,
+                 linear_mode="dense", linear_kwargs=None):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        _lkw = linear_kwargs or {}
+        self.fc = make_linear(dim, hidden, bias=False, mode=linear_mode, **_lkw)
+        self.proj = make_linear(hidden, dim, bias=False, mode=linear_mode, **_lkw)
         self.proj._zero_init = True
         self.leaky_relu_negative_slope = leaky_relu_negative_slope
 
@@ -1481,6 +1606,8 @@ class SharedBlock(nn.Module):
         conv_kernel_size=0,
         conv_groups=0,
         sem_rope_configs=None,
+        linear_mode="dense",
+        linear_kwargs=None,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -1493,8 +1620,10 @@ class SharedBlock(nn.Module):
             qk_gain_init,
             rope_dim_fraction,
             sem_rope_configs=sem_rope_configs,
+            linear_mode=linear_mode,
+            linear_kwargs=linear_kwargs,
         )
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, linear_mode=linear_mode, linear_kwargs=linear_kwargs)
         self.conv = (
             GatedCausalConv(dim, conv_kernel_size, conv_groups)
             if conv_kernel_size > 0
@@ -2121,6 +2250,8 @@ class GPT(nn.Module):
         tok=None,
         ngram_tables=None,
         ngram_scale_init=1.0,
+        linear_mode="dense",
+        linear_kwargs=None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2168,6 +2299,8 @@ class GPT(nn.Module):
                     conv_kernel_size=shared_conv_ks,
                     conv_groups=conv_groups,
                     sem_rope_configs=sem_rope_configs if sem_rope_configs else None,
+                    linear_mode=linear_mode,
+                    linear_kwargs=linear_kwargs,
                 )
                 for _ in range(num_blocks)
             ]
@@ -2290,6 +2423,11 @@ class GPT(nn.Module):
                 module, "_zero_init", False
             ):
                 nn.init.zeros_(module.weight)
+            elif isinstance(module, (KroneckerLinear, MonarchLinear)) and getattr(
+                module, "_zero_init", False
+            ):
+                for p in module.parameters():
+                    nn.init.zeros_(p)
 
     def _get_conv_args(self, ls, layer_idx):
         if not self.conv_enabled:
@@ -2755,12 +2893,17 @@ def main():
             tok=tok if _needs_tok else None,
             ngram_tables=ngram_tables,
             ngram_scale_init=args.ngram_scale_init,
+            linear_mode=args.linear_mode,
+            linear_kwargs={
+                "kronecker_terms": args.kronecker_terms,
+                "monarch_nblocks": args.monarch_nblocks,
+            },
         )
         .to(device)
         .bfloat16()
     )
     for module in base_model.modules():
-        if isinstance(module, (CastedLinear, nn.Conv1d)):
+        if isinstance(module, (CastedLinear, KroneckerLinear, MonarchLinear, nn.Conv1d)):
             module.float()
         if isinstance(module, (Rotary, SemanticRotary)):
             module.inv_freq.data = module.inv_freq.data.float()
@@ -2974,6 +3117,12 @@ def main():
     n_params = sum(p.numel() for p in base_model.parameters())
     num_blocks = len(base_model.shared_blocks)
     log0(f"model_params:{n_params}")
+    if args.linear_mode != "dense":
+        _lm_extra = (
+            f"kronecker_terms:{args.kronecker_terms}" if args.linear_mode == "kronecker"
+            else f"monarch_nblocks:{args.monarch_nblocks}"
+        )
+        log0(f"linear_mode:{args.linear_mode} {_lm_extra}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}"
