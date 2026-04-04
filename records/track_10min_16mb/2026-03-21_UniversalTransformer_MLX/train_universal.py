@@ -1354,22 +1354,27 @@ def main():
         eps=args.adam_eps,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        gram_ns=args.muon_gram_ns,
-    )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
+    if matrix_params:
+        optimizer_muon = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            gram_ns=args.muon_gram_ns,
+        )
+        for group in optimizer_muon.param_groups:
+            group["base_lr"] = args.matrix_lr
+    else:
+        optimizer_muon = None
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
     )
-    optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers = [optimizer_tok, optimizer_scalar]
+    if optimizer_muon is not None:
+        optimizers.append(optimizer_muon)
     if conv_params:
         optimizer_conv = torch.optim.Adam(
             [{"params": conv_params, "lr": args.conv_lr, "base_lr": args.conv_lr}],
@@ -1568,10 +1573,11 @@ def main():
             if args.muon_momentum_warmup_steps > 0
             else 1.0
         )
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = (
-                1 - frac
-            ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        if optimizer_muon is not None:
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = (
+                    1 - frac
+                ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
