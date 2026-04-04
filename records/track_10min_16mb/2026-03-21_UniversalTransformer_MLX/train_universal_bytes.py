@@ -166,7 +166,9 @@ class Hyperparameters:
     linear_mode = os.environ.get("LINEAR_MODE", "dense")
     kronecker_terms = int(os.environ.get("KRONECKER_TERMS", 4))
     monarch_nblocks = int(os.environ.get("MONARCH_NBLOCKS", 0))  # 0 = auto (sqrt(n))
-    compressed_muon = bool(int(os.environ.get("COMPRESSED_MUON", "0")))  # route factor params to Muon
+    muon_optimize_factors = bool(int(os.environ.get("MUON_OPTIMIZE_FACTORS", "0")))  # Kronecker/Monarch factors
+    muon_optimize_lm_head = bool(int(os.environ.get("MUON_OPTIMIZE_LM_HEAD", "0")))
+    muon_optimize_conv = bool(int(os.environ.get("MUON_OPTIMIZE_CONV", "0")))  # non-depthwise only
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -1000,7 +1002,7 @@ class CastedLinear(nn.Linear):
 class KroneckerLinear(nn.Module):
     """W = sum_k A_k ⊗ B_k. Materializes W then uses F.linear for speed.
 
-    Factor params (A, B) are 3D. When compressed_muon is enabled, Muon reshapes
+    Factor params (A, B) are 3D. When muon_optimize_factors is enabled, Muon reshapes
     them to 2D (stacking the K term slices) for NS orthogonalization in factor space.
     NOTE: if per-factor NS underperforms, consider NS on the full materialized W
     gradient instead (requires capturing ∂L/∂W via hooks outside torch.compile and
@@ -1046,7 +1048,7 @@ class MonarchLinear(nn.Module):
     """Monarch: two block-diagonal matmuls with a shuffle between them.
     Materializes W then uses F.linear for speed.
 
-    See KroneckerLinear docstring for notes on compressed_muon and the
+    See KroneckerLinear docstring for notes on muon_optimize_factors and the
     alternative of NS on the full materialized W gradient.
     """
 
@@ -2971,25 +2973,31 @@ def main():
     )
 
     # Optimizer: shared_blocks 2D (non-conv) -> Muon, everything else -> Adam
-    conv_weight_ids = {
-        id(p)
-        for m in base_model.modules()
-        if isinstance(m, nn.Conv1d)
-        for p in m.parameters()
-    }
-    # When compressed_muon is enabled, route >=2D Kronecker/Monarch factor params
+    # Collect conv weight IDs. When muon_optimize_conv is enabled, non-depthwise
+    # conv weights go to Muon (reshaped 3D->2D); depthwise stays on Adam (each
+    # filter is 1xK, so NS orthogonalization is meaningless).
+    conv_weight_ids = set()
+    _muon_conv_ids = set()
+    for m in base_model.modules():
+        if isinstance(m, nn.Conv1d):
+            for p in m.parameters():
+                if args.muon_optimize_conv and m.groups < m.out_channels:
+                    _muon_conv_ids.add(id(p))
+                else:
+                    conv_weight_ids.add(id(p))
+    # When muon_optimize_factors is enabled, route >=2D Kronecker/Monarch factor params
     # to Muon (which reshapes 3D->2D for NS). Otherwise only 2D params go to Muon.
-    _compressed_param_ids = set()
-    if args.compressed_muon:
+    _extra_muon_ids = set(_muon_conv_ids)
+    if args.muon_optimize_factors:
         for m in base_model.shared_blocks.modules():
             if isinstance(m, (KroneckerLinear, MonarchLinear)):
                 for p in m.parameters():
-                    _compressed_param_ids.add(id(p))
+                    _extra_muon_ids.add(id(p))
     shared_blocks_named = list(base_model.shared_blocks.named_parameters())
     matrix_params = [
         p
         for n, p in shared_blocks_named
-        if (p.ndim == 2 or id(p) in _compressed_param_ids)
+        if (p.ndim == 2 or id(p) in _extra_muon_ids)
         and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
         and id(p) not in conv_weight_ids
     ]
@@ -3043,7 +3051,9 @@ def main():
     }
     for ls in base_model.layer_scalars:
         for p in ls.parameters():
-            if id(p) in conv_weight_ids:
+            if id(p) in _muon_conv_ids:
+                matrix_params.append(p)
+            elif id(p) in conv_weight_ids:
                 conv_params.append(p)
             elif id(p) in all_special_ids:
                 for group_name, ids in _special_param_ids.items():
@@ -3139,26 +3149,13 @@ def main():
         )
         optimizers.append(optimizer_dist_bias)
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [
-                {
-                    "params": [base_model.lm_head.weight],
-                    "lr": args.head_lr,
-                    "base_lr": args.head_lr,
-                }
-            ],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
-        optimizers.insert(1, optimizer_head)
-    if base_model.structured_head is not None:
-        structured_params = list(base_model.structured_head.parameters())
-        if structured_params:
-            optimizer_structured = torch.optim.Adam(
+        if args.muon_optimize_lm_head:
+            matrix_params.append(base_model.lm_head.weight)
+        else:
+            optimizer_head = torch.optim.Adam(
                 [
                     {
-                        "params": structured_params,
+                        "params": [base_model.lm_head.weight],
                         "lr": args.head_lr,
                         "base_lr": args.head_lr,
                     }
@@ -3167,7 +3164,26 @@ def main():
                 eps=args.adam_eps,
                 fused=True,
             )
-            optimizers.insert(1, optimizer_structured)
+            optimizers.insert(1, optimizer_head)
+    if base_model.structured_head is not None:
+        structured_params = list(base_model.structured_head.parameters())
+        if structured_params:
+            if args.muon_optimize_lm_head:
+                matrix_params.extend(structured_params)
+            else:
+                optimizer_structured = torch.optim.Adam(
+                    [
+                        {
+                            "params": structured_params,
+                            "lr": args.head_lr,
+                            "base_lr": args.head_lr,
+                        }
+                    ],
+                    betas=(args.beta1, args.beta2),
+                    eps=args.adam_eps,
+                    fused=True,
+                )
+                optimizers.insert(1, optimizer_structured)
 
     # Verify every trainable parameter is in exactly one optimizer.
     optimized_ids: set[int] = set()
@@ -3193,7 +3209,14 @@ def main():
             f"kronecker_terms:{args.kronecker_terms}" if args.linear_mode == "kronecker"
             else f"monarch_nblocks:{args.monarch_nblocks}"
         )
-        log0(f"linear_mode:{args.linear_mode} {_lm_extra} compressed_muon:{args.compressed_muon}")
+        log0(f"linear_mode:{args.linear_mode} {_lm_extra} muon_factors:{args.muon_optimize_factors}")
+    _muon_extras = []
+    if args.muon_optimize_lm_head:
+        _muon_extras.append("lm_head")
+    if args.muon_optimize_conv:
+        _muon_extras.append("conv")
+    if _muon_extras:
+        log0(f"muon_optimize: {' '.join(_muon_extras)}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(
         f"sdp_backends:cudnn=False flash=True mem_efficient={_needs_explicit_mask} math={_needs_explicit_mask}"
