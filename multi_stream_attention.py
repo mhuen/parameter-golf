@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from enum import StrEnum
 from dataclasses import dataclass
 
-from modules import RMSNorm, CastedLinear
+from modules import RMSNorm, CastedLinear, make_linear
 
 
 class Stream(StrEnum):
@@ -71,6 +71,9 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         num_kv_heads: int,
         stream_config: MultiStreamConfig,
         mixing_config: StreamMixingConfig = StreamMixingConfig(),
+        qk_gain_init: float = 0.0,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -89,34 +92,41 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         self._stream_lookup: dict[Stream, StreamConfig] = {
             s.name: s for s in stream_config.streams
         }
+        _lkw = linear_kwargs or {}
 
         # --- Per-stream Q/K/V projections ---
         self.W_q = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=stream.dim,
-                    out_features=self.num_heads * self.head_dim,
+                stream.name: make_linear(
+                    stream.dim,
+                    self.num_heads * self.head_dim,
                     bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in self.stream_config.streams
             },
         )
         self.W_k = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=stream.dim,
-                    out_features=self.num_kv_heads * self.head_dim,
+                stream.name: make_linear(
+                    stream.dim,
+                    self.num_kv_heads * self.head_dim,
                     bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in self.stream_config.streams
             }
         )
         self.W_v = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=stream.dim,
-                    out_features=self.num_kv_heads * self.head_dim,
+                stream.name: make_linear(
+                    stream.dim,
+                    self.num_kv_heads * self.head_dim,
                     bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in self.stream_config.streams
             }
@@ -159,9 +169,12 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
                 bias=False,
             )
 
-        # --- QK normalization after mixing ---
+        # --- QK normalization and gain after mixing ---
         self.q_norm = RMSNorm()
         self.k_norm = RMSNorm()
+        self.q_gain = nn.Parameter(
+            torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
+        )
 
         # --- Output projection (gated write-back per writable stream) ---
         self.alpha_pre_sigmoid = nn.ParameterDict(
@@ -173,10 +186,12 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         )
         self.W_o_value = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=self.num_heads * self.head_dim,
-                    out_features=stream.dim,
+                stream.name: make_linear(
+                    self.num_heads * self.head_dim,
+                    stream.dim,
                     bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in self.stream_config.streams
                 if not stream.read_only
@@ -184,10 +199,12 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         )
         self.W_o_gate = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=self.num_heads * self.head_dim,
-                    out_features=stream.dim,
+                stream.name: make_linear(
+                    self.num_heads * self.head_dim,
+                    stream.dim,
                     bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in self.stream_config.streams
                 if not stream.read_only
@@ -334,9 +351,10 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         k_mixed = self._apply_mixing(k_stack, k_logits, self.num_kv_heads, is_qk=True)
         v_mixed = self._apply_mixing(v_stack, v_logits, self.num_kv_heads, is_qk=False)
 
-        # Step 4: QK normalization
+        # Step 4: QK normalization + per-head gain
         q_mixed = self.q_norm(q_mixed)
         k_mixed = self.k_norm(k_mixed)
+        q_mixed = q_mixed * self.q_gain[None, :, None, None].to(q_mixed.dtype)
 
         # Step 5: Standard causal SDPA
         attn_out = F.scaled_dot_product_attention(
@@ -388,6 +406,9 @@ class CausualMultiStreamAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         stream_config: MultiStreamConfig,
+        qk_gain_init: float = 0.0,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -403,19 +424,28 @@ class CausualMultiStreamAttention(nn.Module):
         self._stream_lookup: dict[Stream, StreamConfig] = {
             s.name: s for s in stream_config.streams
         }
+        _lkw = linear_kwargs or {}
 
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
 
-        self.W_q = CastedLinear(sum_stream_dims, num_heads * self.head_dim, bias=False)
-        self.W_k = CastedLinear(
-            sum_stream_dims, num_kv_heads * self.head_dim, bias=False
+        self.W_q = make_linear(
+            sum_stream_dims, num_heads * self.head_dim, bias=False,
+            mode=linear_mode, **_lkw,
         )
-        self.W_v = CastedLinear(
-            sum_stream_dims, num_kv_heads * self.head_dim, bias=False
+        self.W_k = make_linear(
+            sum_stream_dims, num_kv_heads * self.head_dim, bias=False,
+            mode=linear_mode, **_lkw,
+        )
+        self.W_v = make_linear(
+            sum_stream_dims, num_kv_heads * self.head_dim, bias=False,
+            mode=linear_mode, **_lkw,
         )
 
         self.q_norm = RMSNorm()
         self.k_norm = RMSNorm()
+        self.q_gain = nn.Parameter(
+            torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
+        )
 
         self.alpha_pre_sigmoid = nn.ParameterDict(
             {
@@ -426,10 +456,9 @@ class CausualMultiStreamAttention(nn.Module):
         )
         self.W_o_value = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=num_heads * self.head_dim,
-                    out_features=stream.dim,
-                    bias=False,
+                stream.name: make_linear(
+                    num_heads * self.head_dim, stream.dim, bias=False,
+                    mode=linear_mode, **_lkw,
                 )
                 for stream in stream_config.streams
                 if not stream.read_only
@@ -437,10 +466,9 @@ class CausualMultiStreamAttention(nn.Module):
         )
         self.W_o_gate = nn.ModuleDict(
             {
-                stream.name: CastedLinear(
-                    in_features=num_heads * self.head_dim,
-                    out_features=stream.dim,
-                    bias=False,
+                stream.name: make_linear(
+                    num_heads * self.head_dim, stream.dim, bias=False,
+                    mode=linear_mode, **_lkw,
                 )
                 for stream in stream_config.streams
                 if not stream.read_only
@@ -486,6 +514,7 @@ class CausualMultiStreamAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        q = q * self.q_gain[None, :, None, None].to(q.dtype)
 
         # Standard causal SDPA
         attn_out = F.scaled_dot_product_attention(
@@ -538,18 +567,25 @@ class MultiStreamMLP(nn.Module):
         hidden_dim: int,
         gated_output: bool = True,
         leaky_relu_slope: float = 0.5,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
         self.leaky_relu_slope = leaky_relu_slope
+        _lkw = linear_kwargs or {}
 
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
-        self.fc_up = CastedLinear(sum_stream_dims, hidden_dim, bias=False)
+        self.fc_up = make_linear(
+            sum_stream_dims, hidden_dim, bias=False, mode=linear_mode, **_lkw,
+        )
 
         self.proj_value = nn.ModuleDict(
             {
-                s.name: CastedLinear(hidden_dim, s.dim, bias=False)
+                s.name: make_linear(
+                    hidden_dim, s.dim, bias=False, mode=linear_mode, **_lkw,
+                )
                 for s in stream_config.streams
                 if not s.read_only
             }
@@ -557,7 +593,9 @@ class MultiStreamMLP(nn.Module):
         if gated_output:
             self.proj_gate = nn.ModuleDict(
                 {
-                    s.name: CastedLinear(hidden_dim, s.dim, bias=False)
+                    s.name: make_linear(
+                        hidden_dim, s.dim, bias=False, mode=linear_mode, **_lkw,
+                    )
                     for s in stream_config.streams
                     if not s.read_only
                 }
@@ -604,6 +642,9 @@ class MultiStreamBlock(nn.Module):
         mlp_hidden_dim: int | None = None,
         gated_mlp_output: bool = True,
         leaky_relu_slope: float = 0.5,
+        qk_gain_init: float = 0.0,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -622,6 +663,9 @@ class MultiStreamBlock(nn.Module):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             stream_config=stream_config,
+            qk_gain_init=qk_gain_init,
+            linear_mode=linear_mode,
+            linear_kwargs=linear_kwargs,
         )
         if mixing_config is not None:
             self.attn = CausualMultiStreamAttentionViaMixing(
@@ -639,6 +683,8 @@ class MultiStreamBlock(nn.Module):
             hidden_dim=mlp_hidden_dim,
             gated_output=gated_mlp_output,
             leaky_relu_slope=leaky_relu_slope,
+            linear_mode=linear_mode,
+            linear_kwargs=linear_kwargs,
         )
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)
