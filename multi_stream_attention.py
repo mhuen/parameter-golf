@@ -5,13 +5,7 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from modules import RMSNorm, CastedLinear, LearnableShift, make_linear
-
-
-class Stream(StrEnum):
-    LOGIT = "logit"
-    CONTEXT = "context"
-    TOKENS = "tokens"
-    STRUCTURAL = "structural"
+from multi_streams import Stream, StreamConfig, MultiStreamConfig
 
 
 class MixingMode(StrEnum):
@@ -23,18 +17,6 @@ class MixingSource(StrEnum):
     STATIC = "static"
     DYNAMIC = "dynamic"
     DYNAMIC_BOTTLENECK = "dynamic_bottleneck"
-
-
-@dataclass
-class StreamConfig:
-    name: Stream
-    dim: int
-    read_only: bool = False
-
-
-@dataclass
-class MultiStreamConfig:
-    streams: list[StreamConfig]
 
 
 @dataclass
