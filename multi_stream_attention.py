@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from enum import StrEnum
 from dataclasses import dataclass
 
-from modules import RMSNorm, CastedLinear, make_linear
+from modules import RMSNorm, CastedLinear, LearnableShift, make_linear
 
 
 class Stream(StrEnum):
@@ -72,6 +72,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         stream_config: MultiStreamConfig,
         mixing_config: StreamMixingConfig = StreamMixingConfig(),
         qk_gain_init: float = 0.0,
+        k_shift: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
     ):
@@ -174,6 +175,9 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         self.k_norm = RMSNorm()
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
+        )
+        self.k_shift_mod = (
+            LearnableShift(num_channels=num_kv_heads) if k_shift else None
         )
 
         # --- Output projection (gated write-back per writable stream) ---
@@ -351,9 +355,11 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         k_mixed = self._apply_mixing(k_stack, k_logits, self.num_kv_heads, is_qk=True)
         v_mixed = self._apply_mixing(v_stack, v_logits, self.num_kv_heads, is_qk=False)
 
-        # Step 4: QK normalization + per-head gain
+        # Step 4: QK normalization + per-head gain + optional K shift
         q_mixed = self.q_norm(q_mixed)
         k_mixed = self.k_norm(k_mixed)
+        if self.k_shift_mod is not None:
+            k_mixed = self.k_shift_mod(k_mixed)
         q_mixed = q_mixed * self.q_gain[None, :, None, None].to(q_mixed.dtype)
 
         # Step 5: Standard causal SDPA
@@ -407,6 +413,7 @@ class CausualMultiStreamAttention(nn.Module):
         num_kv_heads: int,
         stream_config: MultiStreamConfig,
         qk_gain_init: float = 0.0,
+        k_shift: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
     ):
@@ -429,22 +436,34 @@ class CausualMultiStreamAttention(nn.Module):
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
 
         self.W_q = make_linear(
-            sum_stream_dims, num_heads * self.head_dim, bias=False,
-            mode=linear_mode, **_lkw,
+            sum_stream_dims,
+            num_heads * self.head_dim,
+            bias=False,
+            mode=linear_mode,
+            **_lkw,
         )
         self.W_k = make_linear(
-            sum_stream_dims, num_kv_heads * self.head_dim, bias=False,
-            mode=linear_mode, **_lkw,
+            sum_stream_dims,
+            num_kv_heads * self.head_dim,
+            bias=False,
+            mode=linear_mode,
+            **_lkw,
         )
         self.W_v = make_linear(
-            sum_stream_dims, num_kv_heads * self.head_dim, bias=False,
-            mode=linear_mode, **_lkw,
+            sum_stream_dims,
+            num_kv_heads * self.head_dim,
+            bias=False,
+            mode=linear_mode,
+            **_lkw,
         )
 
         self.q_norm = RMSNorm()
         self.k_norm = RMSNorm()
         self.q_gain = nn.Parameter(
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
+        )
+        self.k_shift_mod = (
+            LearnableShift(num_channels=num_kv_heads) if k_shift else None
         )
 
         self.alpha_pre_sigmoid = nn.ParameterDict(
@@ -457,8 +476,11 @@ class CausualMultiStreamAttention(nn.Module):
         self.W_o_value = nn.ModuleDict(
             {
                 stream.name: make_linear(
-                    num_heads * self.head_dim, stream.dim, bias=False,
-                    mode=linear_mode, **_lkw,
+                    num_heads * self.head_dim,
+                    stream.dim,
+                    bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in stream_config.streams
                 if not stream.read_only
@@ -467,8 +489,11 @@ class CausualMultiStreamAttention(nn.Module):
         self.W_o_gate = nn.ModuleDict(
             {
                 stream.name: make_linear(
-                    num_heads * self.head_dim, stream.dim, bias=False,
-                    mode=linear_mode, **_lkw,
+                    num_heads * self.head_dim,
+                    stream.dim,
+                    bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for stream in stream_config.streams
                 if not stream.read_only
@@ -514,6 +539,8 @@ class CausualMultiStreamAttention(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
+        if self.k_shift_mod is not None:
+            k = self.k_shift_mod(k)
         q = q * self.q_gain[None, :, None, None].to(q.dtype)
 
         # Standard causal SDPA
@@ -578,13 +605,21 @@ class MultiStreamMLP(nn.Module):
 
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
         self.fc_up = make_linear(
-            sum_stream_dims, hidden_dim, bias=False, mode=linear_mode, **_lkw,
+            sum_stream_dims,
+            hidden_dim,
+            bias=False,
+            mode=linear_mode,
+            **_lkw,
         )
 
         self.proj_value = nn.ModuleDict(
             {
                 s.name: make_linear(
-                    hidden_dim, s.dim, bias=False, mode=linear_mode, **_lkw,
+                    hidden_dim,
+                    s.dim,
+                    bias=False,
+                    mode=linear_mode,
+                    **_lkw,
                 )
                 for s in stream_config.streams
                 if not s.read_only
@@ -594,7 +629,11 @@ class MultiStreamMLP(nn.Module):
             self.proj_gate = nn.ModuleDict(
                 {
                     s.name: make_linear(
-                        hidden_dim, s.dim, bias=False, mode=linear_mode, **_lkw,
+                        hidden_dim,
+                        s.dim,
+                        bias=False,
+                        mode=linear_mode,
+                        **_lkw,
                     )
                     for s in stream_config.streams
                     if not s.read_only
@@ -645,6 +684,7 @@ class MultiStreamBlock(nn.Module):
         qk_gain_init: float = 0.0,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        k_shift: bool = True,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -666,6 +706,7 @@ class MultiStreamBlock(nn.Module):
             qk_gain_init=qk_gain_init,
             linear_mode=linear_mode,
             linear_kwargs=linear_kwargs,
+            k_shift=k_shift,
         )
         if mixing_config is not None:
             self.attn = CausualMultiStreamAttentionViaMixing(
@@ -847,3 +888,25 @@ if __name__ == "__main__":
             n = sum(p.numel() for p in block.parameters())
             tag = f"{label}/gated_mlp={gated_mlp}"
             print(f"  {tag:40s}: OK  ({n:,} params)")
+
+    # Test k_shift integration
+    for label, mix_cfg in [
+        ("standard", None),
+        (
+            "glu_dyn_bn",
+            StreamMixingConfig(MixingMode.GLU, MixingSource.DYNAMIC_BOTTLENECK, 16),
+        ),
+    ]:
+        block = MultiStreamBlock(
+            **kwargs,
+            mixing_config=mix_cfg,
+            mlp_hidden_dim=320,
+            k_shift=True,
+        )
+        inp = {s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams}
+        out = block(inp)
+        loss = sum(v.sum() for v in out.values() if v.requires_grad)
+        loss.backward()
+        n = sum(p.numel() for p in block.parameters())
+        tag = f"{label}/k_shift=True"
+        print(f"  {tag:40s}: OK  ({n:,} params)")

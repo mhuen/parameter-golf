@@ -357,6 +357,59 @@ class CompositeStream(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Learnable causal shift
+# ---------------------------------------------------------------------------
+
+
+class LearnableShift(nn.Module):
+    """Learnable fractional causal shift along a sequence dimension.
+
+    Interpolates between identity (d=0) and a full one-position shift (d=1):
+        out[t] = (1 - d) * x[t] + d * x[t-1]
+
+    Zero-padded at t=0 to maintain causality.
+
+    Typical use: shift K before attention so that Q[t] matching K[j]
+    effectively matches against position j-1 but reads V from position j
+    (single-head induction).
+
+    Args:
+        num_channels: independent shift parameters (e.g., num_kv_heads).
+            Broadcasts along the dim immediately before seq_dim.
+        seq_dim: sequence dimension index (default -2, matching (B, H, S, D)).
+        init: pre-sigmoid init. -5.0 → d ≈ 0.007 (near identity).
+    """
+
+    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -5.0):
+        super().__init__()
+        self.num_channels = num_channels
+        self.seq_dim = seq_dim
+        self.shift_logit = nn.Parameter(
+            torch.full((num_channels,), init, dtype=torch.float32)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        d = torch.sigmoid(self.shift_logit)  # (C,) in [0, 1]
+        sd = self.seq_dim % x.ndim
+
+        # x_prev: x shifted right by 1 along seq_dim, zero-padded at start
+        zero_shape = list(x.shape)
+        zero_shape[sd] = 1
+        x_prev = torch.cat(
+            [x.new_zeros(zero_shape), x.narrow(sd, 0, x.shape[sd] - 1)], dim=sd
+        )
+
+        # Broadcast d to match x: expand along channel dim (one before seq_dim)
+        shape = [1] * x.ndim
+        if self.num_channels > 1:
+            cd = (sd - 1) % x.ndim
+            shape[cd] = self.num_channels
+        d = d.view(shape).to(x.dtype)
+
+        return (1 - d) * x + d * x_prev
+
+
+# ---------------------------------------------------------------------------
 # Attention utilities
 # ---------------------------------------------------------------------------
 

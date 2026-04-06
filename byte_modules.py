@@ -1203,11 +1203,15 @@ class ByteHashComponent(nn.Module):
         window: int = 12,
         num_hashes: int = 2,
         boundary: str | None = "word",
+        track_hits: bool = True,
+        hit_bucket_size: int = 251,
     ):
         super().__init__()
         self.window = window
         self.num_hashes = num_hashes
         self.boundary = boundary
+        self.track_hits = track_hits
+        self.hit_bucket_size = hit_bucket_size
         V = tok.vocab_size
 
         # Byte value lookup (+1 so real byte 0x00 ≠ masked-out zeros)
@@ -1266,7 +1270,7 @@ class ByteHashComponent(nn.Module):
 
     @property
     def dim(self) -> int:
-        return 2 * self.num_hashes
+        return 2 * self.num_hashes + (2 if self.track_hits else 0)
 
     def _effective_lookback(self, input_ids: Tensor) -> Tensor:
         """Per-position lookback depth. -1 means inactive (hash = 0)."""
@@ -1336,12 +1340,30 @@ class ByteHashComponent(nn.Module):
 
         # Compute independent polynomial hashes
         parts = []
+        hit_bucket = None
         for h in range(self.num_hashes):
             powers = getattr(self, f"powers_{h}")  # (W,)
             hash_val = ((gathered * powers) % P).sum(dim=-1) % P  # (B, S) long
             # Project to small range for stable sin/cos encoding
             q = self.PROJ_PRIMES[h]
-            angle = (hash_val % q).float() * (2 * math.pi / q)
+            projected = hash_val % q
+            angle = projected.float() * (2 * math.pi / q)
             parts.append(torch.stack([angle.sin(), angle.cos()], dim=-1))
+            if h == 0 and self.track_hits:
+                hit_bucket = projected  # reuse first hash's projection
+
+        # Hit count: how many previous positions share the same hash bucket
+        if self.track_hits:
+            Q = self.hit_bucket_size
+            bucket = hit_bucket % Q  # (B, S), values in [0, Q)
+            one_hot = F.one_hot(bucket, Q).float()  # (B, S, Q)
+            cumcount = one_hot.cumsum(dim=1)  # (B, S, Q), causal
+            hits = cumcount.gather(2, bucket.unsqueeze(-1)).squeeze(-1) - 1  # exclude self
+            # Segment count so far (for fraction): cumsum of active positions
+            is_active = (eff_lb >= 0).float()
+            seg_count = is_active.cumsum(dim=1).clamp(min=1)
+            hit_frac = hits / seg_count
+            hit_log = hits.clamp(min=0).log1p()
+            parts.append(torch.stack([hit_log, hit_frac], dim=-1))
 
         return torch.cat(parts, dim=-1).to(dtype=dtype)
