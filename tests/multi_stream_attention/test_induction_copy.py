@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, BoundaryComponent
+from byte_modules import ByteHashComponent, BoundaryComponent, HashBoundary
 from modules import RMSNorm, LearnableShift
 from multi_streams import (
     Stream,
@@ -108,23 +108,23 @@ def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
     return MultiStreamBuilder(
         writable_dim=tok.vocab_size,
         structural_components=[
-            SinCosPositionComponent(num_freqs=4),  # 8d
+            # SinCosPositionComponent(num_freqs=4),  # 8d
             ByteHashComponent(
                 tok,
                 window=12,
                 num_hashes=2,
-                boundary="word",
+                boundary=HashBoundary.WORD,
                 track_hits=True,
             ),  # 6d
-            BoundaryComponent(
-                tok,
-                word_pos_freqs=2,
-                word_id_freqs=2,
-                sent_pos_freqs=0,
-                sent_id_freqs=0,
-                para_pos_freqs=0,
-                para_id_freqs=0,
-            ),  # 8d
+            # BoundaryComponent(
+            #     tok,
+            #     word_pos_freqs=2,
+            #     word_id_freqs=2,
+            #     sent_pos_freqs=0,
+            #     sent_id_freqs=0,
+            #     para_pos_freqs=0,
+            #     para_id_freqs=0,
+            # ),  # 8d
         ],
     )
 
@@ -349,8 +349,8 @@ if __name__ == "__main__":
     train_kwargs = dict(
         tok=tok,
         steps=2000,
-        batch_size=32,
-        lr=3e-3,
+        batch_size=64,
+        lr=3e-2,
         min_code_len=4,
         max_code_len=16,
         eval_every=400,
@@ -367,7 +367,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print(f"{name}")
         print("=" * 60)
-        model = ModelClass(tok, head_dim=64)
+        model = ModelClass(tok, head_dim=8)
         model = train(model, **train_kwargs)
 
         print("\n  Final evaluation:")

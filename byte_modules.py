@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
+from enum import StrEnum
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,14 @@ from modules import (
     CastedLinear,
     sincos_encode,
 )
+
+
+class HashBoundary(StrEnum):
+    """Boundary mode for ByteHashComponent rolling hash."""
+
+    WORD = "word"  # reset at separators
+    DIGIT = "digit"  # digit runs only
+    CODEPOINT = "codepoint"  # multibyte sequences only
 
 NUM_BYTE_CATEGORIES = 8
 _BYTE_CATEGORY_DEFS = [
@@ -921,9 +930,7 @@ class CaseComponent(nn.Module):
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         case_type = self.token_case[input_ids]  # (B, S), 0/1/2
-        state = torch.where(
-            case_type == 1, 1.0, torch.where(case_type == 2, -1.0, 0.0)
-        )
+        state = torch.where(case_type == 1, 1.0, torch.where(case_type == 2, -1.0, 0.0))
         run_len = _run_length(case_type)
         return torch.stack([state, run_len], dim=-1).to(dtype=dtype)
 
@@ -957,9 +964,7 @@ class VowelConsonantComponent(nn.Module):
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         vc_type = self.token_vc[input_ids]  # (B, S), 0/1/2
-        state = torch.where(
-            vc_type == 1, 1.0, torch.where(vc_type == 2, -1.0, 0.0)
-        )
+        state = torch.where(vc_type == 1, 1.0, torch.where(vc_type == 2, -1.0, 0.0))
         run_len = _run_length(vc_type)
         return torch.stack([state, run_len], dim=-1).to(dtype=dtype)
 
@@ -1112,7 +1117,7 @@ class PunctuationDepthComponent(nn.Module):
         return 2
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        opens = self.is_open[input_ids].cumsum(dim=1)   # causal
+        opens = self.is_open[input_ids].cumsum(dim=1)  # causal
         closes = self.is_close[input_ids].cumsum(dim=1)  # causal
         bracket_depth = (opens - closes).float()
 
@@ -1187,8 +1192,10 @@ class ByteHashComponent(nn.Module):
         tok: byte tokenizer for byte value lookup.
         window: max lookback window (12 covers most English words).
         num_hashes: number of independent hash functions (output = 2 * num_hashes dims).
-        boundary: "word" (reset at separators), "digit" (digit runs only),
-                  "codepoint" (multibyte sequences only), or None (last N bytes).
+        boundary: HashBoundary.WORD (reset at separators),
+                  HashBoundary.DIGIT (digit runs only),
+                  HashBoundary.CODEPOINT (multibyte sequences only),
+                  or None (last N bytes).
 
     Causal: only looks at positions ≤ t.
     """
@@ -1202,7 +1209,7 @@ class ByteHashComponent(nn.Module):
         tok: EfficientByteTokenizer,
         window: int = 12,
         num_hashes: int = 2,
-        boundary: str | None = "word",
+        boundary: HashBoundary | None = HashBoundary.WORD,
         track_hits: bool = True,
         hit_bucket_size: int = 251,
     ):
@@ -1232,21 +1239,21 @@ class ByteHashComponent(nn.Module):
             self.register_buffer(f"powers_{h}", powers)
 
         # Boundary detection buffers
-        if boundary == "word":
+        if boundary == HashBoundary.WORD:
             is_sep = torch.zeros(V, dtype=torch.bool)
             sep_mask = tok.mask(ByteCategory.SEPARATOR)
             for tid in range(V):
                 if sep_mask[tid]:
                     is_sep[tid] = True
             self.register_buffer("is_separator", is_sep)
-        elif boundary == "digit":
+        elif boundary == HashBoundary.DIGIT:
             is_dig = torch.zeros(V, dtype=torch.bool)
             d_mask = tok.mask(ByteCategory.DIGIT)
             for tid in range(V):
                 if d_mask[tid]:
                     is_dig[tid] = True
             self.register_buffer("is_digit_buf", is_dig)
-        elif boundary == "codepoint":
+        elif boundary == HashBoundary.CODEPOINT:
             is_mb = torch.zeros(V, dtype=torch.bool)
             is_lead = torch.zeros(V, dtype=torch.bool)
             for tid in range(V):
@@ -1281,7 +1288,7 @@ class ByteHashComponent(nn.Module):
         if self.boundary is None:
             return positions  # full window always
 
-        elif self.boundary == "word":
+        elif self.boundary == HashBoundary.WORD:
             is_sep = self.is_separator[input_ids]
             # Use -1 sentinel so first word (before any separator) is included
             last_sep = (
@@ -1294,7 +1301,7 @@ class ByteHashComponent(nn.Module):
             pos_in_word = positions - last_sep
             return pos_in_word - 1  # -1 at separator → inactive
 
-        elif self.boundary == "digit":
+        elif self.boundary == HashBoundary.DIGIT:
             is_dig = self.is_digit_buf[input_ids]
             run_start = torch.zeros_like(is_dig)
             run_start[:, 0] = is_dig[:, 0]
@@ -1307,7 +1314,7 @@ class ByteHashComponent(nn.Module):
             pos_in_run = positions - last_start
             return torch.where(is_dig, pos_in_run, torch.full_like(positions, -1))
 
-        elif self.boundary == "codepoint":
+        elif self.boundary == HashBoundary.CODEPOINT:
             is_mb = self.is_multibyte[input_ids]
             is_lead = self.is_lead_byte[input_ids]
             last_lead = (
@@ -1332,7 +1339,9 @@ class ByteHashComponent(nn.Module):
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
         offsets = torch.arange(self.window, device=device)  # (W,)
         gather_pos = (positions.unsqueeze(-1) - offsets).clamp(min=0)  # (B, S, W)
-        gathered = byte_vals.gather(1, gather_pos.reshape(B, -1)).reshape(B, S, self.window)
+        gathered = byte_vals.gather(1, gather_pos.reshape(B, -1)).reshape(
+            B, S, self.window
+        )
 
         # Mask: zero out bytes outside segment boundary
         mask = eff_lb.unsqueeze(-1) >= offsets  # (B, S, W) bool
@@ -1358,7 +1367,9 @@ class ByteHashComponent(nn.Module):
             bucket = hit_bucket % Q  # (B, S), values in [0, Q)
             one_hot = F.one_hot(bucket, Q).float()  # (B, S, Q)
             cumcount = one_hot.cumsum(dim=1)  # (B, S, Q), causal
-            hits = cumcount.gather(2, bucket.unsqueeze(-1)).squeeze(-1) - 1  # exclude self
+            hits = (
+                cumcount.gather(2, bucket.unsqueeze(-1)).squeeze(-1) - 1
+            )  # exclude self
             # Segment count so far (for fraction): cumsum of active positions
             is_active = (eff_lb >= 0).float()
             seg_count = is_active.cumsum(dim=1).clamp(min=1)

@@ -287,7 +287,6 @@ def sincos_encode(ids: Tensor, num_freqs: int, base: float = 10000.0) -> Tensor:
     return torch.cat([angles.sin(), angles.cos()], dim=-1)
 
 
-
 # Stream components (SinCosPositionComponent, DocBoundaryComponent, CompositeStream)
 # have moved to multi_streams.py.  sincos_encode remains here as a shared utility.
 
@@ -316,7 +315,7 @@ class LearnableShift(nn.Module):
         init: pre-sigmoid init. -5.0 → d ≈ 0.007 (near identity).
     """
 
-    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -5.0):
+    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -2.0):
         super().__init__()
         self.num_channels = num_channels
         self.seq_dim = seq_dim
