@@ -267,6 +267,96 @@ class SemanticRotary(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Stream components (composable read-only stream builders)
+# ---------------------------------------------------------------------------
+
+
+def sincos_encode(ids: Tensor, num_freqs: int, base: float = 10000.0) -> Tensor:
+    """Encode integer IDs as sin/cos features.  (...,) → (..., num_freqs*2).
+
+    All operations are element-wise on the input IDs — causality is determined
+    by how the IDs themselves are computed (e.g. cumsum, cummax).
+    """
+    if num_freqs == 0:
+        return ids.new_zeros(*ids.shape, 0)
+    dim = num_freqs * 2
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=ids.device) / dim)
+    )
+    angles = ids.unsqueeze(-1).float() * inv_freq  # (..., num_freqs)
+    return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+
+class SinCosPositionComponent(nn.Module):
+    """Absolute position sin/cos encoding as a stream component.
+
+    No learnable params. Equivalent to the positional information RoPE provides,
+    but as explicit features the attention can read.
+    """
+
+    def __init__(self, num_freqs: int = 8, base: float = 10000.0):
+        super().__init__()
+        self.num_freqs = num_freqs
+        self.base = base
+        self._dim = num_freqs * 2
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        B, S = input_ids.shape
+        positions = torch.arange(S, device=input_ids.device)
+        enc = sincos_encode(positions, self.num_freqs, self.base)  # (S, dim)
+        return enc.unsqueeze(0).expand(B, -1, -1).to(dtype=dtype)
+
+
+class DocBoundaryComponent(nn.Module):
+    """Document boundary (BOS cumsum) encoded as sin/cos.
+
+    Causal: uses cumsum over BOS markers (only depends on positions ≤ t).
+    With 1-3 docs per sequence, 1 frequency pair (2 dims) suffices.
+    """
+
+    def __init__(self, bos_id: int, num_freqs: int = 1, base: float = 10000.0):
+        super().__init__()
+        self.bos_id = bos_id
+        self.num_freqs = num_freqs
+        self.base = base
+        self._dim = num_freqs * 2
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        doc_ids = (input_ids == self.bos_id).cumsum(dim=1)  # (B, S), causal
+        return sincos_encode(doc_ids, self.num_freqs, self.base).to(dtype=dtype)
+
+
+class CompositeStream(nn.Module):
+    """Concatenates stream components into a single read-only stream.
+
+    Each component must implement:
+      .dim -> int
+      .forward(input_ids: Tensor, dtype: torch.dtype) -> Tensor  # (B, S, component_dim)
+    """
+
+    def __init__(self, components: list[nn.Module]):
+        super().__init__()
+        self.components = nn.ModuleList(components)
+        self._dim = sum(c.dim for c in components)
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        parts = [c(input_ids, dtype) for c in self.components]
+        return torch.cat(parts, dim=-1)
+
+
+# ---------------------------------------------------------------------------
 # Attention utilities
 # ---------------------------------------------------------------------------
 
