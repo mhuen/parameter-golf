@@ -2,7 +2,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from enum import StrEnum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from modules import RMSNorm, CastedLinear
 

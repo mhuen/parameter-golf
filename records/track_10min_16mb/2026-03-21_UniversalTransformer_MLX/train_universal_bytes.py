@@ -46,6 +46,29 @@ if _PROJECT_ROOT not in sys.path:
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
+import optim as _optim_mod
+from optim import Muon, _GRAM_NS_LIB
+from data import (
+    load_raw_shard,
+    load_shard_byte260,
+    load_validation_tokens_byte260,
+    TokenStreamByte260,
+    DistributedTokenLoaderByte260,
+)
+from modules import (
+    RMSNorm,
+    CastedLinear,
+    KroneckerLinear,
+    MonarchLinear,
+    make_linear,
+    GatedCausalConv,
+    MLP,
+    Rotary,
+    apply_rotary_emb,
+    build_doc_mask,
+    restore_low_dim_params_to_fp32,
+)
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -169,179 +192,17 @@ class Hyperparameters:
     linear_mode_mlp = os.environ.get("LINEAR_MODE_MLP", "")  # "" = use LINEAR_MODE
     kronecker_terms = int(os.environ.get("KRONECKER_TERMS", 4))
     monarch_nblocks = int(os.environ.get("MONARCH_NBLOCKS", 0))  # 0 = auto (sqrt(n))
-    muon_optimize_factors = bool(int(os.environ.get("MUON_OPTIMIZE_FACTORS", "0")))  # Kronecker/Monarch factors
+    muon_optimize_factors = bool(
+        int(os.environ.get("MUON_OPTIMIZE_FACTORS", "0"))
+    )  # Kronecker/Monarch factors
     muon_optimize_lm_head = bool(int(os.environ.get("MUON_OPTIMIZE_LM_HEAD", "0")))
-    muon_optimize_conv = bool(int(os.environ.get("MUON_OPTIMIZE_CONV", "0")))  # non-depthwise only
+    muon_optimize_conv = bool(
+        int(os.environ.get("MUON_OPTIMIZE_CONV", "0"))
+    )  # non-depthwise only
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
     fold = os.environ.get("FOLD", "")  # comma-separated ByteCategory values
-
-
-# -----------------------------
-# MUON OPTIMIZER
-# -----------------------------
-# Gram Newton-Schulz: https://dao-lab.ai/blog/2026/gram-newton-schulz/
-
-# Try to import Dao-AILab's optimized Gram Newton-Schulz (requires Hopper/Blackwell + CUDA 12.9+)
-try:
-    from gram_newton_schulz import GramNewtonSchulz, POLAR_EXPRESS_COEFFICIENTS
-
-    _gram_ns_op = GramNewtonSchulz(
-        ns_coefficients=POLAR_EXPRESS_COEFFICIENTS,
-        gram_newton_schulz_reset_iterations=[2],
-    )
-    print("Imported optimized Gram Newton-Schulz from Dao-AILab.")
-    _GRAM_NS_LIB = True
-except ImportError:
-    _GRAM_NS_LIB = False
-    print(
-        "Could not import optimized Gram Newton-Schulz from Dao-AILab; falling back to pure PyTorch implementation."
-    )
-
-# Polar Express coefficients for pure-PyTorch Gram NS fallback.
-_GRAM_NS_COEFFS = [
-    (8.123737, -22.232240, 16.373715),
-    (4.026529, -2.776323, 0.514551),
-    (3.870284, -2.739120, 0.520999),
-    (3.253351, -2.343223, 0.481420),
-    (2.300652, -1.668904, 0.418807),
-]
-
-
-def _zeropower_standard_ns5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
-    if transposed:
-        X = X.T
-    for _ in range(steps):
-        A = X @ X.T
-        B = b * A + c * A @ A
-        X = a * X + B @ X
-    return X.T if transposed else X
-
-
-def _zeropower_gram_ns5(G: Tensor, eps: float = 1e-7) -> Tensor:
-    """Stabilized Gram Newton-Schulz: iterates on the n×n Gram matrix instead of
-    the full n×m rectangle.  ~42-58 % fewer FLOPs for rectangular matrices.
-    Falls back to standard NS for square matrices (no benefit)."""
-    if G.size(0) == G.size(1):
-        return _zeropower_standard_ns5(G, eps=eps)
-    X = G.half()  # Gram NS uses fp16, not bf16
-    X /= X.norm() + eps
-    transposed = X.size(0) > X.size(1)
-    if transposed:
-        X = X.T
-    n = X.size(0)
-    R = X @ X.T
-    Q = torch.eye(n, device=X.device, dtype=X.dtype)
-    for t in range(5):
-        if t == 2:  # restart after iteration 2 for numerical stability
-            X = Q @ X
-            R = X @ X.T
-            Q = torch.eye(n, device=X.device, dtype=X.dtype)
-        a, b, c = _GRAM_NS_COEFFS[t]
-        Z = b * R + c * R @ R
-        Q = Q @ Z + a * Q
-        RZ = R @ Z + a * R
-        R = Z @ RZ + a * RZ
-    X = Q @ X
-    return X.T if transposed else X
-
-
-def zeropower_via_newtonschulz5(
-    G: Tensor, steps: int = 10, eps: float = 1e-7, gram_ns: bool = False
-) -> Tensor:
-    if gram_ns and G.size(0) != G.size(1):
-        if _GRAM_NS_LIB:
-            return _gram_ns_op(G)
-        return _zeropower_gram_ns5(G, eps=eps)
-    return _zeropower_standard_ns5(G, steps=steps, eps=eps)
-
-
-class Muon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        nesterov: bool = True,
-        gram_ns: bool = False,
-    ):
-        super().__init__(
-            params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                nesterov=nesterov,
-                gram_ns=gram_ns,
-            ),
-        )
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
-        for group in self.param_groups:
-            params = group["params"]
-            if not params:
-                continue
-            lr, momentum, backend_steps, nesterov, gram_ns = (
-                group["lr"],
-                group["momentum"],
-                group["backend_steps"],
-                group["nesterov"],
-                group["gram_ns"],
-            )
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(
-                total_params, device=params[0].device, dtype=torch.bfloat16
-            )
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    # For 3D+ params (e.g. Kronecker/Monarch factors), reshape
-                    # to 2D by stacking dim-0 slices: (K, M, N) -> (K*M, N).
-                    # This applies NS jointly across all slices, encouraging
-                    # inter-slice diversity (e.g. distinct Kronecker terms).
-                    orig_shape = g.shape
-                    if g.ndim > 2:
-                        g = g.reshape(-1, g.shape[-1])
-                    g = zeropower_via_newtonschulz5(
-                        g, steps=backend_steps, gram_ns=gram_ns
-                    )
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    if g.shape != orig_shape:
-                        g = g.reshape(orig_shape)
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-            curr = 0
-            for p in params:
-                p.data.add_(
-                    updates_flat[curr : curr + p.numel()].reshape(p.shape).to(p.dtype),
-                    alpha=-lr,
-                )
-                curr += p.numel()
-        return loss
 
 
 # -----------------------------
@@ -356,17 +217,7 @@ def build_byte_bpb_lut(tok: EfficientByteTokenizer, device: torch.device):
     return torch.tensor(base_bytes, dtype=torch.int16, device=device)
 
 
-def load_validation_tokens(pattern, seq_len, max_tokens=0):
-    files = [Path(p) for p in sorted(glob.glob(pattern))]
-    if not files:
-        raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    raw_bytes = np.concatenate([load_data_shard(file) for file in files])
-    if max_tokens > 0:
-        raw_bytes = raw_bytes[: max_tokens + 1]
-    usable = ((len(raw_bytes) - 1) // seq_len) * seq_len
-    if usable <= 0:
-        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return raw_bytes[: usable + 1]
+# load_validation_byte260 imported from data.py
 
 
 def eval_val(
@@ -573,22 +424,8 @@ def dequantize_state_dict_int8(obj):
 
 # Byte260 shard format: PureByteTokenizer IDs (bos=1, bytes=4..259) stored as uint16.
 # We use tok.remap_byte260_shard() + tok.filter_stream() to convert to token IDs.
-
-
-def load_data_shard(file):
-    header_bytes = 256 * np.dtype("<i4").itemsize
-    token_bytes = np.dtype("<u2").itemsize
-    header = np.fromfile(file, dtype="<i4", count=256)
-    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
-        raise ValueError(f"Unexpected shard header for {file}")
-    num_tokens = int(header[2])
-    expected_size = header_bytes + num_tokens * token_bytes
-    if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}")
-    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    if tokens_np.size != num_tokens:
-        raise ValueError(f"Short read for {file}")
-    return tokens_np
+# Shard I/O: load_raw_shard imported from data.py
+load_data_shard = load_raw_shard  # alias for backward compat
 
 
 def remap_shard_tokens(
@@ -605,67 +442,9 @@ def remap_shard_tokens(
     return torch.from_numpy(remapped)
 
 
-class TokenStream:
-    def __init__(self, pattern, tok: EfficientByteTokenizer):
-        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
-        if not self.files:
-            raise FileNotFoundError(f"No files found for pattern: {pattern}")
-        self.tok = tok
-        self.file_idx = 0
-        self.tokens = remap_shard_tokens(load_data_shard(self.files[0]), tok)
-        self.pos = 0
-
-    def _advance_file(self):
-        self.file_idx = (self.file_idx + 1) % len(self.files)
-        self.tokens = remap_shard_tokens(
-            load_data_shard(self.files[self.file_idx]), self.tok
-        )
-        self.pos = 0
-
-    def take(self, n):
-        chunks = []
-        remaining = n
-        while remaining > 0:
-            avail = self.tokens.numel() - self.pos
-            if avail <= 0:
-                self._advance_file()
-                continue
-            k = min(remaining, avail)
-            chunks.append(self.tokens[self.pos : self.pos + k])
-            self.pos += k
-            remaining -= k
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-
-class DistributedTokenLoader:
-    def __init__(self, pattern, tok, rank, world_size, device):
-        self.rank, self.world_size, self.device = rank, world_size, device
-        self.stream = TokenStream(pattern, tok)
-
-    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
-        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
-        if local_tokens < seq_len:
-            raise ValueError("TRAIN_BATCH_TOKENS too small for this world_size/seq_len")
-        local_seqs = local_tokens // seq_len
-        n = local_seqs * seq_len + 1
-        # Skip other ranks' tokens.
-        for _ in range(self.rank):
-            self.stream.take(local_seqs * seq_len)
-        local = self.stream.take(n)
-        # Skip remaining ranks' tokens.
-        for _ in range(self.rank + 1, self.world_size):
-            self.stream.take(local_seqs * seq_len)
-        x = (
-            local[:-1]
-            .reshape(local_seqs, seq_len)
-            .to(device=self.device, dtype=torch.int64, non_blocking=True)
-        )
-        y = (
-            local[1:]
-            .reshape(local_seqs, seq_len)
-            .to(device=self.device, dtype=torch.int64, non_blocking=True)
-        )
-        return x, y
+# TokenStreamByte260, DistributedTokenLoaderByte260 imported from data.py
+TokenStream = TokenStreamByte260  # alias for local references
+DistributedTokenLoader = DistributedTokenLoaderByte260  # alias for local references
 
 
 # -----------------------------
@@ -984,210 +763,6 @@ class NgramPrior(nn.Module):
 # -----------------------------
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, eps=None):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x):
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
-class CastedLinear(nn.Linear):
-    def forward(self, x):
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            self.bias.to(x.dtype) if self.bias is not None else None,
-        )
-
-
-class KroneckerLinear(nn.Module):
-    """W = sum_k A_k ⊗ B_k. Materializes W then uses F.linear for speed.
-
-    Factor params (A, B) are 3D. When muon_optimize_factors is enabled, Muon reshapes
-    them to 2D (stacking the K term slices) for NS orthogonalization in factor space.
-    NOTE: if per-factor NS underperforms, consider NS on the full materialized W
-    gradient instead (requires capturing ∂L/∂W via hooks outside torch.compile and
-    a custom optimizer step to chain-rule the orthogonalized update back to factors).
-    """
-
-    def __init__(self, in_features, out_features, bias=False, num_terms=4):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.p_in, self.q_in = _balanced_factors(in_features)
-        self.p_out, self.q_out = _balanced_factors(out_features)
-        self.num_terms = num_terms
-        self.A = nn.Parameter(torch.randn(num_terms, self.p_out, self.p_in))
-        self.B = nn.Parameter(torch.randn(num_terms, self.q_out, self.q_in))
-        scale = (in_features * out_features) ** -0.5
-        nn.init.normal_(self.A, std=scale)
-        nn.init.normal_(self.B, std=scale)
-        self._W_cache = None
-
-    def materialize(self):
-        """Build W = Σ_k kron(A_k, B_k) and cache. Stays in autograd graph."""
-        A = self.A.to(torch.bfloat16)
-        B = self.B.to(torch.bfloat16)
-        W = torch.einsum("kij,kmn->imjn", A, B)
-        self._W_cache = W.reshape(self.out_features, self.in_features)
-
-    def clear_cache(self):
-        self._W_cache = None
-
-    def forward(self, x):
-        if self._W_cache is not None:
-            return F.linear(x, self._W_cache)
-        A = self.A.to(x.dtype)
-        B = self.B.to(x.dtype)
-        W = torch.einsum("kij,kmn->imjn", A, B).reshape(
-            self.out_features, self.in_features
-        )
-        return F.linear(x, W)
-
-
-class MonarchLinear(nn.Module):
-    """Monarch: two block-diagonal matmuls with a shuffle between them.
-    Materializes W then uses F.linear for speed.
-
-    See KroneckerLinear docstring for notes on muon_optimize_factors and the
-    alternative of NS on the full materialized W gradient.
-    """
-
-    def __init__(self, in_features, out_features, bias=False, nblocks=0):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        if nblocks <= 0:
-            nblocks = _nearest_divisor(min(in_features, out_features),
-                                       int(math.sqrt(min(in_features, out_features))))
-        self.nblocks = nblocks
-        if in_features % nblocks != 0:
-            raise ValueError(
-                f"in_features ({in_features}) must be divisible by nblocks ({nblocks})"
-            )
-        self.blk_in = in_features // nblocks
-        self.w1 = nn.Parameter(torch.randn(nblocks, self.blk_in, self.blk_in))
-        if out_features % self.blk_in != 0:
-            raise ValueError(
-                f"out_features ({out_features}) must be divisible by blk_in={self.blk_in} "
-                f"(= in_features // nblocks)"
-            )
-        self.blk_out2 = out_features // self.blk_in
-        self.w2 = nn.Parameter(torch.randn(self.blk_in, nblocks, self.blk_out2))
-        scale = (in_features * out_features) ** -0.25
-        nn.init.normal_(self.w1, std=scale)
-        nn.init.normal_(self.w2, std=scale)
-        self._W_cache = None
-
-    def materialize(self):
-        """Build full W from Monarch factors and cache. Stays in autograd graph."""
-        w1 = self.w1.to(torch.bfloat16)
-        w2 = self.w2.to(torch.bfloat16)
-        W = torch.einsum("jno,njk->jonk", w2, w1)
-        self._W_cache = W.reshape(self.out_features, self.in_features)
-
-    def clear_cache(self):
-        self._W_cache = None
-
-    def forward(self, x):
-        if self._W_cache is not None:
-            return F.linear(x, self._W_cache)
-        w1 = self.w1.to(x.dtype)
-        w2 = self.w2.to(x.dtype)
-        W = torch.einsum("jno,njk->jonk", w2, w1).reshape(
-            self.out_features, self.in_features
-        )
-        return F.linear(x, W)
-
-
-def _balanced_factors(n):
-    """Find two factors of n closest to sqrt(n)."""
-    s = int(math.sqrt(n))
-    while n % s != 0:
-        s -= 1
-    return s, n // s
-
-
-def _nearest_divisor(n, target):
-    """Find the divisor of n closest to target."""
-    best, best_dist = 1, abs(1 - target)
-    for d in range(1, int(math.sqrt(n)) + 1):
-        if n % d == 0:
-            for candidate in (d, n // d):
-                dist = abs(candidate - target)
-                if dist < best_dist:
-                    best, best_dist = candidate, dist
-    return best
-
-
-def make_linear(in_features, out_features, bias=False, mode="dense", **kwargs):
-    """Factory: create a CastedLinear, KroneckerLinear, or MonarchLinear."""
-    if mode == "dense":
-        return CastedLinear(in_features, out_features, bias=bias)
-    elif mode == "kronecker":
-        return KroneckerLinear(
-            in_features, out_features, bias=bias,
-            num_terms=kwargs.get("kronecker_terms", 4),
-        )
-    elif mode == "monarch":
-        return MonarchLinear(
-            in_features, out_features, bias=bias,
-            nblocks=kwargs.get("monarch_nblocks", 0),
-        )
-    else:
-        raise ValueError(f"Unknown linear_mode: {mode!r}")
-
-
-def restore_low_dim_params_to_fp32(module):
-    with torch.no_grad():
-        for name, param in module.named_parameters():
-            if (
-                param.ndim < 2 or any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
-            ) and param.dtype != torch.float32:
-                param.data = param.data.float()
-
-
-class Rotary(nn.Module):
-    def __init__(self, dim, base=10000.0, rope_dim_fraction=1.0):
-        super().__init__()
-        rope_dims = max(2, 2 * (int(dim * rope_dim_fraction) // 2))
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self._seq_len_cached = 0
-        self._cos_cached = None
-        self._sin_cached = None
-
-    def forward(self, seq_len, device, dtype):
-        if (
-            self._cos_cached is None
-            or self._seq_len_cached != seq_len
-            or self._cos_cached.device != device
-        ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self._cos_cached = freqs.cos()[None, None, :, :]
-            self._sin_cached = freqs.sin()[None, None, :, :]
-            self._seq_len_cached = seq_len
-        return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-
-
-def apply_rotary_emb(x, cos, sin):
-    rope_dims = cos.size(-1) * 2
-    if rope_dims >= x.size(-1):
-        half = x.size(-1) // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-    x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
-    half = rope_dims // 2
-    x1, x2 = x_rope[..., :half], x_rope[..., half:]
-    x_rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-    return torch.cat((x_rotated, x_pass), dim=-1)
-
-
 class SemanticRotary(nn.Module):
     """RoPE driven by semantic boundary IDs (word/sentence/paragraph counts)."""
 
@@ -1224,18 +799,6 @@ class SemanticRotary(nn.Module):
         )  # (B, 1, S, total_half)
         sin = torch.cat(parts_sin, dim=-1).unsqueeze(1).to(dtype=dtype)
         return cos, sin
-
-
-def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
-    """Build a causal block-diagonal attention mask from BOS document boundaries.
-    Tokens only attend to earlier tokens within the same document."""
-    bsz, seq_len = input_ids.shape
-    doc_ids = (input_ids == bos_id).cumsum(dim=1)  # (B, S)
-    same_doc = doc_ids.unsqueeze(2) == doc_ids.unsqueeze(1)  # (B, S, S)
-    causal = torch.tril(
-        torch.ones(seq_len, seq_len, dtype=torch.bool, device=input_ids.device)
-    )
-    return (same_doc & causal).unsqueeze(1)  # (B, 1, S, S)
 
 
 class CausalSelfAttention(nn.Module):
@@ -1371,50 +934,6 @@ class CausalSelfAttention(nn.Module):
                 enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         return self.proj(y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim))
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, mlp_mult, leaky_relu_negative_slope: float | None = 0.5,
-                 linear_mode="dense", linear_kwargs=None):
-        super().__init__()
-        hidden = mlp_mult * dim
-        _lkw = linear_kwargs or {}
-        self.fc = make_linear(dim, hidden, bias=False, mode=linear_mode, **_lkw)
-        self.proj = make_linear(hidden, dim, bias=False, mode=linear_mode, **_lkw)
-        self.proj._zero_init = True
-        self.leaky_relu_negative_slope = leaky_relu_negative_slope
-
-    def forward(self, x):
-        if self.leaky_relu_negative_slope is None:
-            x = torch.relu(self.fc(x))
-        else:
-            x = F.leaky_relu(self.fc(x), negative_slope=self.leaky_relu_negative_slope)
-        return self.proj(x.square())
-
-
-class GatedCausalConv(nn.Module):
-    """Gated causal conv1d for local n-gram mixing.
-    gate = sigmoid(conv_gate(x)), value = SiLU(conv_value(x)), out = gate * value.
-    Uses causal (left) padding so output[t] only depends on input[t-k+1..t]."""
-
-    def __init__(self, dim, kernel_size=4, groups=0):
-        super().__init__()
-        groups = dim if groups <= 0 else groups
-        if dim % groups != 0:
-            raise ValueError(
-                f"model_dim ({dim}) must be divisible by conv_groups ({groups})"
-            )
-        self.pad = kernel_size - 1
-        self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
-        self.conv_value = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
-        self.conv_value._zero_init = True
-
-    def forward(self, x):
-        h = x.transpose(1, 2)
-        h = F.pad(h, (self.pad, 0))
-        gate = torch.sigmoid(self.conv_gate(h))
-        value = F.silu(self.conv_value(h))
-        return (gate * value).transpose(1, 2)
 
 
 NUM_BYTE_CATEGORIES = 8
@@ -1669,7 +1188,9 @@ class SharedBlock(nn.Module):
             linear_mode=_attn_mode,
             linear_kwargs=linear_kwargs,
         )
-        self.mlp = MLP(dim, mlp_mult, linear_mode=_mlp_mode, linear_kwargs=linear_kwargs)
+        self.mlp = MLP(
+            dim, mlp_mult, linear_mode=_mlp_mode, linear_kwargs=linear_kwargs
+        )
         self.conv = (
             GatedCausalConv(dim, conv_kernel_size, conv_groups)
             if conv_kernel_size > 0
@@ -2749,12 +2270,13 @@ def _build_tokenizer(args: Hyperparameters) -> EfficientByteTokenizer:
 
 
 def main():
-    global zeropower_via_newtonschulz5, _zeropower_standard_ns5, _zeropower_gram_ns5
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    _zeropower_standard_ns5 = torch.compile(_zeropower_standard_ns5)
+    _optim_mod._zeropower_standard_ns5 = torch.compile(
+        _optim_mod._zeropower_standard_ns5
+    )
     if args.muon_gram_ns and not _GRAM_NS_LIB:
-        _zeropower_gram_ns5 = torch.compile(_zeropower_gram_ns5)
+        _optim_mod._zeropower_gram_ns5 = torch.compile(_optim_mod._zeropower_gram_ns5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -2843,11 +2365,10 @@ def main():
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
 
-    # Remap validation tokens: raw byte values -> EfficientByteTokenizer IDs
-    raw_val_bytes = load_validation_tokens(
-        args.val_files, args.train_seq_len, args.val_max_tokens
+    # Load and remap validation tokens (byte260 -> EfficientByteTokenizer IDs)
+    val_tokens = load_validation_tokens_byte260(
+        args.val_files, args.train_seq_len, tok, args.val_max_tokens
     )
-    val_tokens = remap_shard_tokens(raw_val_bytes, tok)
 
     base_bytes_lut = build_byte_bpb_lut(tok, device)
     log0(f"val_bpb:enabled tokenizer_kind=efficient_byte vocab_size={vocab_size}")
@@ -2973,11 +2494,15 @@ def main():
         .bfloat16()
     )
     for module in base_model.modules():
-        if isinstance(module, (CastedLinear, KroneckerLinear, MonarchLinear, nn.Conv1d)):
+        if isinstance(
+            module, (CastedLinear, KroneckerLinear, MonarchLinear, nn.Conv1d)
+        ):
             module.float()
         if isinstance(module, (Rotary, SemanticRotary)):
             module.inv_freq.data = module.inv_freq.data.float()
-    restore_low_dim_params_to_fp32(base_model)
+    restore_low_dim_params_to_fp32(
+        base_model, control_patterns=CONTROL_TENSOR_NAME_PATTERNS
+    )
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
@@ -3018,8 +2543,7 @@ def main():
     scalar_params = [
         p
         for n, p in shared_blocks_named
-        if id(p) not in _matrix_param_ids
-        and id(p) not in conv_weight_ids
+        if id(p) not in _matrix_param_ids and id(p) not in conv_weight_ids
     ]
     conv_params = [p for n, p in shared_blocks_named if id(p) in conv_weight_ids]
     # Collect special param IDs for routing to separate optimizers
@@ -3097,6 +2621,7 @@ def main():
             momentum=args.muon_momentum,
             backend_steps=args.muon_backend_steps,
             gram_ns=args.muon_gram_ns,
+            reshape_3d=True,
         )
         for group in optimizer_muon.param_groups:
             group["base_lr"] = args.matrix_lr
@@ -3220,10 +2745,16 @@ def main():
     _attn_mode = args.linear_mode_attn or args.linear_mode
     _mlp_mode = args.linear_mode_mlp or args.linear_mode
     if _attn_mode != "dense" or _mlp_mode != "dense":
-        _lm_extra = f"kronecker_terms:{args.kronecker_terms}" if "kronecker" in (_attn_mode, _mlp_mode) else ""
+        _lm_extra = (
+            f"kronecker_terms:{args.kronecker_terms}"
+            if "kronecker" in (_attn_mode, _mlp_mode)
+            else ""
+        )
         if "monarch" in (_attn_mode, _mlp_mode):
             _lm_extra += f" monarch_nblocks:{args.monarch_nblocks}"
-        log0(f"linear_mode attn:{_attn_mode} mlp:{_mlp_mode} {_lm_extra.strip()} muon_factors:{args.muon_optimize_factors}")
+        log0(
+            f"linear_mode attn:{_attn_mode} mlp:{_mlp_mode} {_lm_extra.strip()} muon_factors:{args.muon_optimize_factors}"
+        )
     _muon_extras = []
     if args.muon_optimize_lm_head:
         _muon_extras.append("lm_head")
@@ -3384,8 +2915,8 @@ def main():
             else 1.0
         )
         warmed_momentum = (
-            (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        )
+            1 - frac
+        ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         if optimizer_muon is not None:
             for group in optimizer_muon.param_groups:
                 group["momentum"] = warmed_momentum

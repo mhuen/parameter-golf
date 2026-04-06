@@ -9,6 +9,7 @@ followed by num_tokens uint16 values.
 """
 
 import glob
+from functools import partial
 from pathlib import Path
 from typing import Callable
 
@@ -32,7 +33,9 @@ def load_raw_shard(file: Path) -> np.ndarray:
     num_tokens = int(header[2])
     expected_size = header_bytes + num_tokens * token_bytes
     if file.stat().st_size != expected_size:
-        raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
+        raise ValueError(
+            f"Shard size mismatch for {file}: expected {expected_size} bytes"
+        )
     tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
@@ -67,7 +70,9 @@ class TokenStream:
             or load_shard_sp1024 for sentencepiece data.
     """
 
-    def __init__(self, pattern: str, load_fn: Callable[[Path], Tensor] = load_shard_sp1024):
+    def __init__(
+        self, pattern: str, load_fn: Callable[[Path], Tensor] = load_shard_sp1024
+    ):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
@@ -128,12 +133,73 @@ class DistributedTokenLoader:
         )
 
 
+class TokenStreamByte260(TokenStream):
+    """TokenStream for byte260 shards — thin wrapper around the generic class."""
+
+    def __init__(self, pattern: str, tok):
+        super().__init__(pattern, load_fn=partial(load_shard_byte260, tok=tok))
+
+
+class DistributedTokenLoaderByte260(DistributedTokenLoader):
+    """Per-rank token loader for byte260 shards.
+
+    Uses skip-take pattern: each rank skips other ranks' tokens and takes
+    its own contiguous span.  Only one +1 overlap token (for the current
+    rank's x/y shift), so fewer total tokens consumed per step.
+    """
+
+    def __init__(
+        self,
+        pattern: str,
+        tok,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+    ):
+        super().__init__(
+            pattern,
+            rank,
+            world_size,
+            device,
+            load_fn=partial(load_shard_byte260, tok=tok),
+        )
+
+    def next_batch(
+        self, global_tokens: int, seq_len: int, grad_accum_steps: int
+    ) -> tuple[Tensor, Tensor]:
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        if local_tokens < seq_len:
+            raise ValueError("TRAIN_BATCH_TOKENS too small for this world_size/seq_len")
+        local_seqs = local_tokens // seq_len
+        n = local_seqs * seq_len + 1
+        # Skip other ranks' tokens.
+        for _ in range(self.rank):
+            self.stream.take(local_seqs * seq_len)
+        local = self.stream.take(n)
+        # Skip remaining ranks' tokens.
+        for _ in range(self.rank + 1, self.world_size):
+            self.stream.take(local_seqs * seq_len)
+        x = (
+            local[:-1]
+            .reshape(local_seqs, seq_len)
+            .to(device=self.device, dtype=torch.int64, non_blocking=True)
+        )
+        y = (
+            local[1:]
+            .reshape(local_seqs, seq_len)
+            .to(device=self.device, dtype=torch.int64, non_blocking=True)
+        )
+        return x, y
+
+
 # ---------------------------------------------------------------------------
 # Validation data loading
 # ---------------------------------------------------------------------------
 
 
-def load_validation_sp1024(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
+def load_validation_tokens_sp1024(
+    pattern: str, seq_len: int, max_tokens: int = 0
+) -> Tensor:
     """Load and concatenate SentencePiece validation shards."""
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -147,7 +213,9 @@ def load_validation_sp1024(pattern: str, seq_len: int, max_tokens: int = 0) -> T
     return tokens[: usable + 1]
 
 
-def load_validation_byte260(pattern: str, seq_len: int, tok, max_tokens: int = 0) -> Tensor:
+def load_validation_tokens_byte260(
+    pattern: str, seq_len: int, tok, max_tokens: int = 0
+) -> Tensor:
     """Load and concatenate byte260 validation shards, remapped via tokenizer."""
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:

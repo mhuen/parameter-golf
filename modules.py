@@ -1,5 +1,7 @@
 """Shared building blocks for multi-stream and related training scripts."""
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -27,17 +29,169 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+def _balanced_factors(n: int) -> tuple[int, int]:
+    """Find two factors of n closest to sqrt(n)."""
+    s = int(math.sqrt(n))
+    while n % s != 0:
+        s -= 1
+    return s, n // s
+
+
+def _nearest_divisor(n: int, target: int) -> int:
+    """Find the divisor of n closest to target."""
+    best, best_dist = 1, abs(1 - target)
+    for d in range(1, int(math.sqrt(n)) + 1):
+        if n % d == 0:
+            for candidate in (d, n // d):
+                dist = abs(candidate - target)
+                if dist < best_dist:
+                    best, best_dist = candidate, dist
+    return best
+
+
+class KroneckerLinear(nn.Module):
+    """W = sum_k A_k ⊗ B_k. Materializes W then uses F.linear for speed.
+
+    Factor params (A, B) are 3D. When muon_optimize_factors is enabled, Muon reshapes
+    them to 2D (stacking the K term slices) for NS orthogonalization in factor space.
+    NOTE: if per-factor NS underperforms, consider NS on the full materialized W
+    gradient instead (requires capturing ∂L/∂W via hooks outside torch.compile and
+    a custom optimizer step to chain-rule the orthogonalized update back to factors).
+    """
+
+    def __init__(self, in_features, out_features, bias=False, num_terms=4):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.p_in, self.q_in = _balanced_factors(in_features)
+        self.p_out, self.q_out = _balanced_factors(out_features)
+        self.num_terms = num_terms
+        self.A = nn.Parameter(torch.randn(num_terms, self.p_out, self.p_in))
+        self.B = nn.Parameter(torch.randn(num_terms, self.q_out, self.q_in))
+        scale = (in_features * out_features) ** -0.5
+        nn.init.normal_(self.A, std=scale)
+        nn.init.normal_(self.B, std=scale)
+        self._W_cache = None
+
+    def materialize(self):
+        """Build W = Σ_k kron(A_k, B_k) and cache. Stays in autograd graph."""
+        A = self.A.to(torch.bfloat16)
+        B = self.B.to(torch.bfloat16)
+        W = torch.einsum("kij,kmn->imjn", A, B)
+        self._W_cache = W.reshape(self.out_features, self.in_features)
+
+    def clear_cache(self):
+        self._W_cache = None
+
+    def forward(self, x):
+        if self._W_cache is not None:
+            return F.linear(x, self._W_cache)
+        A = self.A.to(x.dtype)
+        B = self.B.to(x.dtype)
+        W = torch.einsum("kij,kmn->imjn", A, B).reshape(
+            self.out_features, self.in_features
+        )
+        return F.linear(x, W)
+
+
+class MonarchLinear(nn.Module):
+    """Monarch: two block-diagonal matmuls with a shuffle between them.
+    Materializes W then uses F.linear for speed.
+
+    See KroneckerLinear docstring for notes on muon_optimize_factors and the
+    alternative of NS on the full materialized W gradient.
+    """
+
+    def __init__(self, in_features, out_features, bias=False, nblocks=0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        if nblocks <= 0:
+            nblocks = _nearest_divisor(
+                min(in_features, out_features),
+                int(math.sqrt(min(in_features, out_features))),
+            )
+        self.nblocks = nblocks
+        if in_features % nblocks != 0:
+            raise ValueError(
+                f"in_features ({in_features}) must be divisible by nblocks ({nblocks})"
+            )
+        self.blk_in = in_features // nblocks
+        self.w1 = nn.Parameter(torch.randn(nblocks, self.blk_in, self.blk_in))
+        if out_features % self.blk_in != 0:
+            raise ValueError(
+                f"out_features ({out_features}) must be divisible by blk_in={self.blk_in} "
+                f"(= in_features // nblocks)"
+            )
+        self.blk_out2 = out_features // self.blk_in
+        self.w2 = nn.Parameter(torch.randn(self.blk_in, nblocks, self.blk_out2))
+        scale = (in_features * out_features) ** -0.25
+        nn.init.normal_(self.w1, std=scale)
+        nn.init.normal_(self.w2, std=scale)
+        self._W_cache = None
+
+    def materialize(self):
+        """Build full W from Monarch factors and cache. Stays in autograd graph."""
+        w1 = self.w1.to(torch.bfloat16)
+        w2 = self.w2.to(torch.bfloat16)
+        W = torch.einsum("jno,njk->jonk", w2, w1)
+        self._W_cache = W.reshape(self.out_features, self.in_features)
+
+    def clear_cache(self):
+        self._W_cache = None
+
+    def forward(self, x):
+        if self._W_cache is not None:
+            return F.linear(x, self._W_cache)
+        w1 = self.w1.to(x.dtype)
+        w2 = self.w2.to(x.dtype)
+        W = torch.einsum("jno,njk->jonk", w2, w1).reshape(
+            self.out_features, self.in_features
+        )
+        return F.linear(x, W)
+
+
+def make_linear(in_features, out_features, bias=False, mode="dense", **kwargs):
+    """Factory: create a CastedLinear, KroneckerLinear, or MonarchLinear."""
+    if mode == "dense":
+        return CastedLinear(in_features, out_features, bias=bias)
+    elif mode == "kronecker":
+        return KroneckerLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            num_terms=kwargs.get("kronecker_terms", 4),
+        )
+    elif mode == "monarch":
+        return MonarchLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            nblocks=kwargs.get("monarch_nblocks", 0),
+        )
+    else:
+        raise ValueError(f"Unknown linear_mode: {mode!r}")
+
+
 # ---------------------------------------------------------------------------
 # Positional encoding
 # ---------------------------------------------------------------------------
 
 
 class Rotary(nn.Module):
-    """RoPE positional encoding with cached cos/sin tables."""
+    """RoPE positional encoding with cached cos/sin tables.
 
-    def __init__(self, dim: int, base: float = 10000.0):
+    When rope_dim_fraction < 1.0, only a subset of head dimensions receive
+    positional encoding; the remainder pass through unchanged (partial RoPE).
+    """
+
+    def __init__(self, dim: int, base: float = 10000.0, rope_dim_fraction: float = 1.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        # Only compute frequencies for the rotated subset of dimensions.
+        rope_dims = max(2, 2 * (int(dim * rope_dim_fraction) // 2))  # ensure even
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, rope_dims, 2, dtype=torch.float32) / rope_dims)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -48,7 +202,6 @@ class Rotary(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         if (
             self._cos_cached is None
-            or self._sin_cached is None
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
@@ -61,9 +214,18 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    rope_dims = cos.size(-1) * 2  # cos covers half the rotated dims
+    if rope_dims >= x.size(-1):
+        # Full RoPE: apply to all dimensions.
+        half = x.size(-1) // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    # Partial RoPE: only rotate first rope_dims, pass the rest through.
+    x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+    half = rope_dims // 2
+    x1, x2 = x_rope[..., :half], x_rope[..., half:]
+    x_rotated = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((x_rotated, x_pass), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -91,11 +253,19 @@ def build_doc_mask(input_ids: Tensor, bos_id: int) -> Tensor:
 class MLP(nn.Module):
     """Two-layer MLP with squared activation: leaky_relu(x).square()."""
 
-    def __init__(self, dim: int, mlp_mult: int, leaky_relu_negative_slope: float | None = 0.5):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        leaky_relu_negative_slope: float | None = 0.5,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
+    ):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        _lkw = linear_kwargs or {}
+        self.fc = make_linear(dim, hidden, bias=False, mode=linear_mode, **_lkw)
+        self.proj = make_linear(hidden, dim, bias=False, mode=linear_mode, **_lkw)
         self.proj._zero_init = True
         self.leaky_relu_negative_slope = leaky_relu_negative_slope
 
@@ -147,7 +317,9 @@ class GatedCausalConv(nn.Module):
             value = F.silu(self.conv_value(h))
             return (gate * value).transpose(1, 2)
         else:
-            return F.leaky_relu(self.conv(h), negative_slope=0.5).square().transpose(1, 2)
+            return (
+                F.leaky_relu(self.conv(h), negative_slope=0.5).square().transpose(1, 2)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +328,13 @@ class GatedCausalConv(nn.Module):
 
 # Default control tensor patterns (scalars, gains, etc. that should stay fp32)
 DEFAULT_CONTROL_PATTERNS = (
-    "attn_scale", "mlp_scale", "resid_mix", "q_gain",
-    "skip_weight", "alpha", "beta",
+    "attn_scale",
+    "mlp_scale",
+    "resid_mix",
+    "q_gain",
+    "skip_weight",
+    "alpha",
+    "beta",
 )
 
 
@@ -169,7 +346,6 @@ def restore_low_dim_params_to_fp32(
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (
-                param.ndim < 2
-                or any(pattern in name for pattern in control_patterns)
+                param.ndim < 2 or any(pattern in name for pattern in control_patterns)
             ) and param.dtype != torch.float32:
                 param.data = param.data.float()
