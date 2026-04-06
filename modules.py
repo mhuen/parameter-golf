@@ -228,6 +228,44 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x_rotated, x_pass), dim=-1)
 
 
+class SemanticRotary(nn.Module):
+    """RoPE driven by semantic boundary IDs (word/sentence/paragraph counts)."""
+
+    def __init__(self, configs):
+        """configs: list of (num_pairs, base) for each boundary type."""
+        super().__init__()
+        self.configs = configs
+        inv_freqs = []
+        for num_pairs, base in configs:
+            dims = num_pairs * 2
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, dims, 2, dtype=torch.float32) / dims)
+            )
+            inv_freqs.append(inv_freq)
+        self.register_buffer("inv_freq", torch.cat(inv_freqs), persistent=False)
+        self._offsets = []
+        pos = 0
+        for num_pairs, _ in configs:
+            self._offsets.append((pos, pos + num_pairs))
+            pos += num_pairs
+        self.total_half = pos  # total cos/sin width
+
+    def forward(self, boundary_ids_list, dtype):
+        """boundary_ids_list: list of (B, S) long tensors, one per boundary type.
+        Returns: cos (B, 1, S, total_half), sin (B, 1, S, total_half)"""
+        parts_cos, parts_sin = [], []
+        for ids, (start, end) in zip(boundary_ids_list, self._offsets, strict=True):
+            inv_f = self.inv_freq[start:end]  # (num_pairs,)
+            freqs = ids.unsqueeze(-1).float() * inv_f  # (B, S, num_pairs)
+            parts_cos.append(freqs.cos())
+            parts_sin.append(freqs.sin())
+        cos = (
+            torch.cat(parts_cos, dim=-1).unsqueeze(1).to(dtype=dtype)
+        )  # (B, 1, S, total_half)
+        sin = torch.cat(parts_sin, dim=-1).unsqueeze(1).to(dtype=dtype)
+        return cos, sin
+
+
 # ---------------------------------------------------------------------------
 # Attention utilities
 # ---------------------------------------------------------------------------
