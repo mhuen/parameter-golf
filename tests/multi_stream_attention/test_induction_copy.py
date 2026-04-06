@@ -43,15 +43,40 @@ from multi_stream_attention import CausualMultiStreamAttention
 # ---------------------------------------------------------------------------
 
 
-def make_sample(min_len: int = 4, max_len: int = 20) -> str:
-    """Generate one copy-task sample."""
+CATEGORIES = ["letters", "digits", "random"]
+
+
+def _random_code(category: str, length: int) -> str:
+    """Generate a random code string of the given category."""
+    if category == "letters":
+        return "".join(random.choices(string.ascii_lowercase, k=length))
+    elif category == "digits":
+        return "".join(random.choices(string.digits, k=length))
+    elif category == "random":
+        # printable ASCII excluding space and control chars (33-126)
+        return "".join(chr(random.randint(33, 126)) for _ in range(length))
+    raise ValueError(f"Unknown category: {category}")
+
+
+def make_sample(
+    min_len: int = 4,
+    max_len: int = 20,
+    category: str | None = None,
+) -> tuple[str, str, int, str]:
+    """Generate one copy-task sample.
+
+    Returns: (full_text, code, prefix_len, category)
+    """
+    if category is None:
+        category = random.choice(CATEGORIES)
     code_len = random.randint(min_len, max_len)
-    code = "".join(random.choices(string.ascii_lowercase, k=code_len))
+    code = _random_code(category, code_len)
     prefix_len = 3
     return (
         f"The code is {code}. Please repeat the code: {code[:prefix_len]}",
         code,
         prefix_len,
+        category,
     )
 
 
@@ -60,18 +85,23 @@ def make_batch(
     batch_size: int,
     min_len: int = 4,
     max_len: int = 20,
+    category: str | None = None,
 ) -> tuple[Tensor, Tensor, list[int]]:
     """Generate a padded batch.
+
+    Args:
+        category: if None, each sample picks a random category (mixed training).
+            If set, all samples use that category (per-category evaluation).
 
     Returns:
         input_ids: (B, max_seq_len) — full sequence including prompt + completion
         targets: (B, max_seq_len) — shifted targets (-100 for non-prediction positions)
         code_lengths: list of code string lengths
     """
-    samples = [make_sample(min_len, max_len) for _ in range(batch_size)]
+    samples = [make_sample(min_len, max_len, category) for _ in range(batch_size)]
     texts = []
     code_lengths = []
-    for full_text, code, prefix_len in samples:
+    for full_text, code, prefix_len, _cat in samples:
         target_text = full_text + code[prefix_len:]
         texts.append(target_text)
         code_lengths.append(len(code))
@@ -82,7 +112,9 @@ def make_batch(
     input_ids = torch.full((batch_size, max_len_seq), tok.pad_id, dtype=torch.long)
     targets = torch.full((batch_size, max_len_seq), -100, dtype=torch.long)
 
-    for i, (enc, (full_text, code, prefix_len)) in enumerate(zip(encoded, samples)):
+    for i, (enc, (full_text, code, prefix_len, _cat)) in enumerate(
+        zip(encoded, samples)
+    ):
         seq_len = enc.numel()
         input_ids[i, :seq_len] = enc
 
@@ -114,6 +146,27 @@ def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
                 window=12,
                 num_hashes=2,
                 boundary=HashBoundary.WORD,
+                track_hits=True,
+            ),  # 6d
+            ByteHashComponent(
+                tok,
+                window=12,
+                num_hashes=2,
+                boundary=HashBoundary.DIGIT,
+                track_hits=True,
+            ),  # 6d
+            ByteHashComponent(
+                tok,
+                window=3,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
+            ),  # 6d
+            ByteHashComponent(
+                tok,
+                window=8,
+                num_hashes=2,
+                boundary=None,
                 track_hits=True,
             ),  # 6d
             # BoundaryComponent(
@@ -279,6 +332,7 @@ def evaluate(
     n_samples: int = 200,
     min_len: int = 4,
     max_len: int = 16,
+    category: str | None = None,
     device: str = "cpu",
 ) -> float:
     """Character-level accuracy on the copy task (autoregressive)."""
@@ -287,7 +341,7 @@ def evaluate(
     correct_chars = 0
 
     for _ in range(n_samples):
-        full_text, code, prefix_len = make_sample(min_len, max_len)
+        full_text, code, prefix_len, _cat = make_sample(min_len, max_len, category)
         remaining = code[prefix_len:]
         n_to_predict = len(remaining)
         if n_to_predict == 0:
@@ -313,11 +367,15 @@ def evaluate(
 
 
 def show_examples(
-    model: nn.Module, tok: EfficientByteTokenizer, device: str, n: int = 5
+    model: nn.Module,
+    tok: EfficientByteTokenizer,
+    device: str,
+    n: int = 3,
+    category: str | None = None,
 ):
     model.eval()
     for _ in range(n):
-        full_text, code, prefix_len = make_sample(6, 14)
+        full_text, code, prefix_len, cat = make_sample(6, 14, category)
         remaining = code[prefix_len:]
         ids = torch.from_numpy(tok.encode(full_text)).long().unsqueeze(0).to(device)
 
@@ -332,7 +390,7 @@ def show_examples(
         pred_str = tok.decode_to_str(predicted)
         match = "OK" if pred_str == remaining else "FAIL"
         print(
-            f"    {match:4s} code={code!r:22s}  prefix={code[:prefix_len]!r}  "
+            f"    {match:4s} [{cat:7s}] code={code!r:22s}  prefix={code[:prefix_len]!r}  "
             f"expected={remaining!r:18s}  predicted={pred_str!r}"
         )
 
@@ -367,33 +425,48 @@ if __name__ == "__main__":
         print("=" * 60)
         print(f"{name}")
         print("=" * 60)
-        model = ModelClass(tok, head_dim=8)
+        model = ModelClass(tok, head_dim=32)
         model = train(model, **train_kwargs)
 
-        print("\n  Final evaluation:")
+        print("\n  Final evaluation (per category x length range):")
         accs = {}
-        for lo, hi in eval_ranges:
-            acc = evaluate(
-                model, tok, n_samples=300, min_len=lo, max_len=hi, device=device
+        for cat in CATEGORIES:
+            for lo, hi in eval_ranges:
+                acc = evaluate(
+                    model,
+                    tok,
+                    n_samples=200,
+                    min_len=lo,
+                    max_len=hi,
+                    category=cat,
+                    device=device,
+                )
+                accs[(cat, lo, hi)] = acc
+            print(
+                f"    {cat:8s}  "
+                + "  ".join(
+                    f"{lo}-{hi}: {accs[(cat, lo, hi)]:.0%}" for lo, hi in eval_ranges
+                )
             )
-            accs[(lo, hi)] = acc
-            print(f"    Code length {lo:2d}-{hi:2d}: {acc:.1%}")
         results[name] = accs
 
         print("\n  Examples:")
-        show_examples(model, tok, device)
+        for cat in CATEGORIES:
+            show_examples(model, tok, device, n=2, category=cat)
         print()
 
     # Summary comparison
     print("=" * 60)
     print("Summary")
     print("=" * 60)
-    header = f"  {'Range':>8s}"
-    for name in results:
-        header += f"  {name:>30s}"
-    print(header)
-    for lo, hi in eval_ranges:
-        row = f"  {lo:2d}-{hi:2d}   "
+    for cat in CATEGORIES:
+        print(f"\n  [{cat}]")
+        header = f"    {'Range':>8s}"
         for name in results:
-            row += f"  {results[name][(lo, hi)]:>30.1%}"
-        print(row)
+            header += f"  {name:>28s}"
+        print(header)
+        for lo, hi in eval_ranges:
+            row = f"    {lo:2d}-{hi:2d}   "
+            for name in results:
+                row += f"  {results[name][(cat, lo, hi)]:>28.1%}"
+            print(row)
