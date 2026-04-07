@@ -32,6 +32,7 @@ from byte_modules import ByteHashComponent, BoundaryComponent, HashBoundary
 from modules import RMSNorm, LearnableShift
 from multi_streams import (
     Stream,
+    StreamDef,
     MultiStreamBuilder,
     SinCosPositionComponent,
 )
@@ -138,47 +139,50 @@ def make_batch(
 def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
     """Create the stream builder used by both model variants."""
     return MultiStreamBuilder(
-        writable_dim=tok.vocab_size,
-        structural_components=[
-            # SinCosPositionComponent(num_freqs=4),  # 8d
-            ByteHashComponent(
-                tok,
-                window=12,
-                num_hashes=2,
-                boundary=HashBoundary.WORD,
-                track_hits=True,
-            ),  # 6d
-            ByteHashComponent(
-                tok,
-                window=12,
-                num_hashes=2,
-                boundary=HashBoundary.DIGIT,
-                track_hits=True,
-            ),  # 6d
-            ByteHashComponent(
-                tok,
-                window=3,
-                num_hashes=2,
-                boundary=None,
-                track_hits=True,
-            ),  # 6d
-            ByteHashComponent(
-                tok,
-                window=8,
-                num_hashes=2,
-                boundary=None,
-                track_hits=True,
-            ),  # 6d
-            # BoundaryComponent(
-            #     tok,
-            #     word_pos_freqs=2,
-            #     word_id_freqs=2,
-            #     sent_pos_freqs=0,
-            #     sent_id_freqs=0,
-            #     para_pos_freqs=0,
-            #     para_id_freqs=0,
-            # ),  # 8d
+        stream_defs=[
+            StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
+            StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
+                # SinCosPositionComponent(num_freqs=4),  # 8d
+                ByteHashComponent(
+                    tok,
+                    window=12,
+                    num_hashes=2,
+                    boundary=HashBoundary.WORD,
+                    track_hits=True,
+                ),  # 6d
+                ByteHashComponent(
+                    tok,
+                    window=12,
+                    num_hashes=2,
+                    boundary=HashBoundary.DIGIT,
+                    track_hits=True,
+                ),  # 6d
+                ByteHashComponent(
+                    tok,
+                    window=3,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
+                ),  # 6d
+                ByteHashComponent(
+                    tok,
+                    window=8,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
+                ),  # 6d
+                # BoundaryComponent(
+                #     tok,
+                #     word_pos_freqs=2,
+                #     word_id_freqs=2,
+                #     sent_pos_freqs=0,
+                #     sent_id_freqs=0,
+                #     para_pos_freqs=0,
+                #     para_id_freqs=0,
+                # ),  # 8d
+            ]),
         ],
+        vocab_size=tok.vocab_size,
     )
 
 
@@ -204,7 +208,7 @@ class MultiStreamCopyModel(nn.Module):
 
     def forward(self, input_ids: Tensor) -> Tensor:
         logit_stream = F.one_hot(input_ids, self.vocab_size).float()
-        streams = self.builder(input_ids, logit_stream)
+        streams = self.builder(input_ids, logit=logit_stream)
         out = self.attn(streams)
         return out[Stream.LOGIT]
 
@@ -227,7 +231,10 @@ class StandardAttentionCopyModel(nn.Module):
         self.vocab_size = tok.vocab_size
         self.builder = make_stream_builder(tok)
 
-        input_dim = tok.vocab_size + self.builder.structural.dim
+        structural_dim = next(
+            s.dim for s in self.builder.config.streams if s.name == Stream.STRUCTURAL
+        )
+        input_dim = tok.vocab_size + structural_dim
         self.W_q = nn.Linear(input_dim, head_dim, bias=False)
         self.W_k = nn.Linear(input_dim, head_dim, bias=False)
         self.W_v = nn.Linear(input_dim, head_dim, bias=False)
@@ -243,7 +250,7 @@ class StandardAttentionCopyModel(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         B, S = input_ids.shape
         onehot = F.one_hot(input_ids, self.vocab_size).float()
-        streams = self.builder(input_ids, onehot)
+        streams = self.builder(input_ids, logit=onehot)
         structural = streams[Stream.STRUCTURAL]
         x = torch.cat([onehot, structural], dim=-1)  # (B, S, input_dim)
 

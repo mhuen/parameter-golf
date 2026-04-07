@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from modules import sincos_encode
@@ -38,6 +39,24 @@ class StreamConfig:
 @dataclass
 class MultiStreamConfig:
     streams: list[StreamConfig]
+
+
+@dataclass
+class StreamDef:
+    """Definition for a single stream in MultiStreamBuilder.
+
+    Exactly one of these must determine the dimension:
+    - ``dim``: explicit dimension (for externally-provided or auto-zeros streams)
+    - ``components``: list of nn.Module components (dim auto-computed)
+    - ``auto_onehot``: True to auto-create one-hot from input_ids (requires vocab_size)
+    """
+
+    name: Stream
+    read_only: bool = False
+    dim: int | None = None
+    components: list[nn.Module] | None = None
+    auto_zeros: bool = False
+    auto_onehot: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -120,56 +139,75 @@ class CompositeStream(nn.Module):
 
 
 class MultiStreamBuilder(nn.Module):
-    """Constructs the full stream dict from input_ids.
+    """Constructs the full stream dict from input_ids and optional provided streams.
 
-    Combines a writable stream (provided by the caller, e.g. one-hot or
-    embedding) with read-only structural streams built from composable
-    components.
+    Each stream is defined by a ``StreamDef`` specifying how it is constructed:
+    - External input: caller provides the tensor in ``forward(**provided_streams)``
+    - Components: built automatically from composable ``nn.Module`` components
+    - Auto one-hot: one-hot encoding of ``input_ids``
+    - Auto zeros: zero-initialized tensor
 
     Usage:
-        builder = MultiStreamBuilder(
-            writable_dim=vocab_size,
-            structural_components=[SinCosPositionComponent(), ByteHashComponent(tok), ...],
-        )
-        # builder.config is the MultiStreamConfig for attention layers
-        attn = CausualMultiStreamAttention(..., stream_config=builder.config)
+        builder = MultiStreamBuilder([
+            StreamDef(Stream.LOGIT, dim=vocab_size),              # caller provides
+            StreamDef(Stream.TOKENS, auto_onehot=True, read_only=True),
+            StreamDef(Stream.STRUCTURAL, read_only=True, components=[hash_comp, ...]),
+            StreamDef(Stream.CONTEXT, dim=32, auto_zeros=True),   # writable scratch
+        ], vocab_size=vocab_size)
 
-        # In forward:
-        streams = builder(input_ids, writable_stream=one_hot, dtype=torch.float32)
+        attn = CausualMultiStreamAttention(..., stream_config=builder.config)
+        streams = builder(input_ids, logit=one_hot_tensor)
         out = attn(streams)
     """
 
     def __init__(
         self,
-        writable_dim: int,
-        structural_components: list[nn.Module] | None = None,
-        writable_name: Stream = Stream.LOGIT,
-        structural_name: Stream = Stream.STRUCTURAL,
+        stream_defs: list[StreamDef],
+        vocab_size: int | None = None,
     ):
         super().__init__()
-        self.writable_name = writable_name
-        self.structural_name = structural_name
-        self.writable_dim = writable_dim
+        self.vocab_size = vocab_size
+        self._defs = list(stream_defs)
 
-        if structural_components:
-            self.structural = CompositeStream(structural_components)
-            self._config = MultiStreamConfig(
-                streams=[
-                    StreamConfig(writable_name, dim=writable_dim, read_only=False),
-                    StreamConfig(
-                        structural_name,
-                        dim=self.structural.dim,
-                        read_only=True,
-                    ),
-                ]
+        # Build CompositeStreams for component-based defs
+        composites: dict[str, CompositeStream] = {}
+        stream_configs: list[StreamConfig] = []
+
+        for sd in self._defs:
+            dim = self._resolve_dim(sd)
+            stream_configs.append(
+                StreamConfig(sd.name, dim=dim, read_only=sd.read_only)
             )
-        else:
-            self.structural = None
-            self._config = MultiStreamConfig(
-                streams=[
-                    StreamConfig(writable_name, dim=writable_dim, read_only=False),
-                ]
+            if sd.components is not None:
+                composites[sd.name.value] = CompositeStream(sd.components)
+
+        self.composites = nn.ModuleDict(composites)
+        self._config = MultiStreamConfig(streams=stream_configs)
+
+    def _resolve_dim(self, sd: StreamDef) -> int:
+        """Compute and validate the dimension for a StreamDef."""
+        if sd.auto_onehot:
+            if self.vocab_size is None:
+                raise ValueError(
+                    f"Stream {sd.name} has auto_onehot=True but vocab_size not provided"
+                )
+            if sd.dim is not None and sd.dim != self.vocab_size:
+                raise ValueError(
+                    f"Stream {sd.name}: dim={sd.dim} conflicts with vocab_size={self.vocab_size}"
+                )
+            return self.vocab_size
+        if sd.components is not None:
+            comp_dim = sum(c.dim for c in sd.components)
+            if sd.dim is not None and sd.dim != comp_dim:
+                raise ValueError(
+                    f"Stream {sd.name}: dim={sd.dim} conflicts with components dim={comp_dim}"
+                )
+            return comp_dim
+        if sd.dim is None:
+            raise ValueError(
+                f"Stream {sd.name}: must specify dim, components, or auto_onehot"
             )
+        return sd.dim
 
     @property
     def config(self) -> MultiStreamConfig:
@@ -178,21 +216,41 @@ class MultiStreamBuilder(nn.Module):
     def forward(
         self,
         input_ids: Tensor,
-        writable_stream: Tensor,
         dtype: torch.dtype = torch.float32,
+        **provided_streams: dict[Stream, Tensor],
     ) -> dict[Stream, Tensor]:
         """Build stream dict.
 
         Args:
-            input_ids: (B, S) token IDs, used by structural components.
-            writable_stream: (B, S, writable_dim) pre-computed writable stream
-                (e.g. one-hot, embedding output).
-            dtype: dtype for structural stream computation.
+            input_ids: (B, S) token IDs.
+            dtype: dtype for auto-constructed streams.
+            **provided_streams: tensors keyed by stream name value
+                (e.g. ``logit=tensor``). Required for streams without
+                auto_onehot, auto_zeros, or components.
 
         Returns:
             dict mapping Stream names to tensors.
         """
-        streams: dict[Stream, Tensor] = {self.writable_name: writable_stream}
-        if self.structural is not None:
-            streams[self.structural_name] = self.structural(input_ids, dtype)
+        B, S = input_ids.shape
+        streams: dict[Stream, Tensor] = {}
+
+        for sd in self._defs:
+            key = sd.name.value
+            if sd.components is not None:
+                streams[sd.name] = self.composites[key](input_ids, dtype)
+            elif sd.auto_onehot:
+                streams[sd.name] = F.one_hot(input_ids, self.vocab_size).to(dtype=dtype)
+            elif sd.auto_zeros:
+                dim = self._resolve_dim(sd)
+                streams[sd.name] = torch.zeros(
+                    B, S, dim, dtype=dtype, device=input_ids.device
+                )
+            else:
+                if key not in provided_streams:
+                    raise KeyError(
+                        f"Stream '{key}' must be provided in forward() call "
+                        f"(got keys: {list(provided_streams.keys())})"
+                    )
+                streams[sd.name] = provided_streams[key]
+
         return streams

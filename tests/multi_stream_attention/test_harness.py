@@ -1,0 +1,338 @@
+"""Shared test infrastructure for multi-stream attention head tests.
+
+Provides:
+- TinyGPT: small standard transformer baseline (embedding + RoPE attention + MLP)
+- MultiStreamTestModel: wraps MultiStreamBuilder + attention/block layers
+- Training and evaluation utilities for synthetic copy/recall tasks
+"""
+
+import sys
+import os
+import math
+from typing import Callable
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+from efficient_byte_tokenizer import EfficientByteTokenizer
+from modules import RMSNorm
+from multi_streams import (
+    Stream,
+    StreamDef,
+    MultiStreamBuilder,
+    MultiStreamConfig,
+)
+from multi_stream_attention import (
+    CausualMultiStreamAttention,
+    MultiStreamBlock,
+    StreamMixingConfig,
+)
+
+
+# ---------------------------------------------------------------------------
+# TinyGPT baseline (self-contained, no train_gpt.py dependency)
+# ---------------------------------------------------------------------------
+
+
+class Rotary(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._cache: tuple[int, Tensor, Tensor] | None = None
+
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        if self._cache is None or self._cache[0] != seq_len or self._cache[1].device != device:
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._cache = (seq_len, freqs.cos()[None, None], freqs.sin()[None, None])
+        return self._cache[1].to(dtype), self._cache[2].to(dtype)
+
+
+def _apply_rotary(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    half = x.size(-1) // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+
+
+class TinyAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int, rope_base: float = 10000.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.c_q = nn.Linear(dim, dim, bias=False)
+        self.c_k = nn.Linear(dim, dim, bias=False)
+        self.c_v = nn.Linear(dim, dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, S, D = x.shape
+        q = self.c_q(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(S, x.device, q.dtype)
+        q = _apply_rotary(q, cos, sin)
+        k = _apply_rotary(k, cos, sin)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.proj(y.transpose(1, 2).reshape(B, S, D))
+
+
+class TinyMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int = 2):
+        super().__init__()
+        hidden = dim * mlp_mult
+        self.fc = nn.Linear(dim, hidden, bias=False)
+        self.proj = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
+
+
+class TinyBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_mult: int = 2):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = TinyAttention(dim, num_heads)
+        self.mlp = TinyMLP(dim, mlp_mult)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.attn_norm(x))
+        x = x + self.mlp(self.mlp_norm(x))
+        return x
+
+
+class TinyGPT(nn.Module):
+    """Small GPT baseline: embedding -> blocks -> norm -> linear head.
+
+    Returns logits (B, S, vocab_size), not loss.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        dim: int = 64,
+        num_layers: int = 1,
+        num_heads: int = 2,
+        mlp_mult: int = 2,
+    ):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.blocks = nn.ModuleList(
+            [TinyBlock(dim, num_heads, mlp_mult) for _ in range(num_layers)]
+        )
+        self.norm = RMSNorm()
+        self.head = nn.Linear(dim, vocab_size, bias=False)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.norm(x))
+
+
+# ---------------------------------------------------------------------------
+# Multi-stream test model
+# ---------------------------------------------------------------------------
+
+
+class MultiStreamTestModel(nn.Module):
+    """Wraps MultiStreamBuilder + N attention/block layers.
+
+    Returns logits (B, S, vocab_size) from the logit stream.
+    """
+
+    def __init__(
+        self,
+        stream_defs: list[StreamDef],
+        vocab_size: int,
+        num_heads: int = 1,
+        num_kv_heads: int | None = None,
+        head_dim: int = 32,
+        num_layers: int = 1,
+        use_block: bool = False,
+        mlp_hidden_dim: int | None = None,
+        k_shift: bool = True,
+        mixing_config: StreamMixingConfig | None = None,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+
+        self.builder = MultiStreamBuilder(stream_defs, vocab_size=vocab_size)
+
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+
+        shared_kwargs = dict(
+            multi_head_dim=num_heads * head_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            stream_config=self.builder.config,
+        )
+
+        if use_block:
+            self.layers = nn.ModuleList([
+                MultiStreamBlock(
+                    **shared_kwargs,
+                    mixing_config=mixing_config,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    k_shift=k_shift,
+                )
+                for _ in range(num_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                CausualMultiStreamAttention(
+                    **shared_kwargs,
+                    k_shift=k_shift,
+                )
+                for _ in range(num_layers)
+            ])
+
+    def forward(self, input_ids: Tensor, **provided_streams: Tensor) -> Tensor:
+        logit_onehot = F.one_hot(input_ids, self.vocab_size).float()
+        streams = self.builder(input_ids, logit=logit_onehot, **provided_streams)
+        for layer in self.layers:
+            streams = layer(streams)
+        return streams[Stream.LOGIT]
+
+
+# ---------------------------------------------------------------------------
+# Training and evaluation utilities
+# ---------------------------------------------------------------------------
+
+
+def count_params(model: nn.Module, label: str = "") -> int:
+    n = sum(p.numel() for p in model.parameters())
+    if label:
+        print(f"  {label}: {n:,} params")
+    else:
+        print(f"  params: {n:,}")
+    return n
+
+
+MakeBatchFn = Callable[
+    [EfficientByteTokenizer, int],  # (tok, batch_size) ->
+    tuple[Tensor, Tensor],          # (input_ids, targets)
+]
+
+
+def train_model(
+    model: nn.Module,
+    make_batch_fn: MakeBatchFn,
+    tok: EfficientByteTokenizer,
+    steps: int = 2000,
+    batch_size: int = 64,
+    lr: float = 3e-2,
+    eval_fn: Callable | None = None,
+    eval_every: int = 400,
+    device: str = "cpu",
+) -> nn.Module:
+    """Generic training loop for synthetic tasks."""
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
+
+    for step in range(1, steps + 1):
+        model.train()
+        input_ids, targets = make_batch_fn(tok, batch_size)
+        input_ids = input_ids.to(device)
+        targets = targets.to(device)
+
+        logits = model(input_ids)
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-100,
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        if step % eval_every == 0 or step == 1:
+            acc = eval_fn(model, device) if eval_fn else 0.0
+            print(f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}")
+
+    return model
+
+
+MakeSampleFn = Callable[
+    [],  # () ->
+    tuple[str, str],  # (prompt_text, expected_completion)
+]
+
+
+@torch.no_grad()
+def evaluate_autoregressive(
+    model: nn.Module,
+    make_sample_fn: MakeSampleFn,
+    tok: EfficientByteTokenizer,
+    n_samples: int = 200,
+    device: str = "cpu",
+) -> float:
+    """Character-level accuracy via autoregressive generation."""
+    model.eval()
+    total = 0
+    correct = 0
+
+    for _ in range(n_samples):
+        prompt, expected = make_sample_fn()
+        n_predict = len(tok.encode(expected))
+        if n_predict == 0:
+            continue
+
+        ids = torch.from_numpy(tok.encode(prompt)).long().unsqueeze(0).to(device)
+
+        predicted = []
+        for _ in range(n_predict):
+            logits = model(ids)
+            next_id = logits[0, -1].argmax().item()
+            predicted.append(next_id)
+            ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
+
+        expected_ids = tok.encode(expected)
+        for j in range(min(len(predicted), len(expected_ids))):
+            total += 1
+            if predicted[j] == expected_ids[j]:
+                correct += 1
+        total += max(0, len(expected_ids) - len(predicted))
+
+    return correct / max(total, 1)
+
+
+@torch.no_grad()
+def show_examples(
+    model: nn.Module,
+    make_sample_fn: MakeSampleFn,
+    tok: EfficientByteTokenizer,
+    device: str = "cpu",
+    n: int = 5,
+):
+    """Print example predictions."""
+    model.eval()
+    for _ in range(n):
+        prompt, expected = make_sample_fn()
+        n_predict = len(tok.encode(expected))
+        ids = torch.from_numpy(tok.encode(prompt)).long().unsqueeze(0).to(device)
+
+        predicted = []
+        for _ in range(n_predict):
+            logits = model(ids)
+            next_id = logits[0, -1].argmax().item()
+            predicted.append(next_id)
+            ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
+
+        pred_str = tok.decode_to_str(predicted)
+        match = "OK" if pred_str == expected else "FAIL"
+        print(f"    {match:4s}  expected={expected!r:20s}  predicted={pred_str!r}")
