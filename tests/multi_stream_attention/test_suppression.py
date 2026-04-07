@@ -1,20 +1,24 @@
-"""Test: suppression / no-repeat task -- can models find the first missing letter?
+"""Test: suppression / no-repeat — find the missing item from a set.
 
-Synthetic task:
-    "Seen: c,a,e. Next unused: " -> "b"
+Synthetic task variations:
+    1. "Alphabet: a-p. Seen: h,c,m,a,f,p,b,k,d,j. First missing: " → "e"
+    2. "Alphabet: a-p. Seen: h,c,m,a,f,p,b,k,d,j. Last missing: "  → "o"
+    3. "Sequence: 5,2,8,1,6,3. Missing from 1-9: "                  → "4"
 
-A random subset of N letters (N=2..4) is drawn from ALPHABET="abcdef" (6 options),
-shuffled, and displayed. The model must predict the first alphabetically missing
-letter from the full alphabet.
+The model must:
+1. Track which symbols have been "seen" (set membership / suppression)
+2. Identify gaps relative to a reference set
+3. Handle variable-length seen lists with distractors
 
-This tests the model's ability to:
-1. Track which symbols have been "seen" (suppression / set membership)
-2. Identify the first gap in an ordered set
+Key anti-reward-hacking measures:
+- Large alphabet (16 letters or 1-digit numbers) → too many combos to memorize
+- Variable N (seen count) → no fixed positional pattern
+- Distractors mixed in → must distinguish signal from noise
+- Multiple question types (first/last missing) → can't hardcode one strategy
+- Shuffled seen order → no positional shortcut
+- Uniform answer distribution via target-first sampling
 
-Compares:
-1. Multi-stream attention with context stream (writable scratch for accumulating
-   seen-state) + structural hash features.
-2. TinyGPT baseline sized to approximately match parameter count.
+Compares multi-stream attention (with context stream) vs TinyGPT baseline.
 """
 
 import sys, os
@@ -37,6 +41,7 @@ from test_harness import (
     train_model,
     evaluate_autoregressive,
     show_examples,
+    verify_causality,
 )
 
 
@@ -44,72 +49,90 @@ from test_harness import (
 # Data generation
 # ---------------------------------------------------------------------------
 
-ALPHABET = "abcdef"  # 6 letters, simple version
+ALPHABET = "abcdefghijklmnop"  # 16 letters
+MIN_N, MAX_N = 6, 13  # seen count range (leaves 3-10 missing)
+QUERY_TYPES = ("first", "last")
+
+# Distractor pools — items that look like alphabet items but aren't
+_DISTRACTORS_ALPHA = list("qrstuvwxyz")  # letters outside our alphabet
+_DISTRACTORS_NUM = [str(i) for i in range(10)]  # digits
 
 
-MIN_N, MAX_N = 2, len(ALPHABET) - 1  # N seen letters (2 to 5 for 6-letter alphabet)
-
-
-def make_sample(fixed_n: int | None = None) -> tuple[str, str]:
+def make_sample(
+    fixed_n: int | None = None,
+    fixed_query: str | None = None,
+) -> tuple[str, str]:
     """Generate one suppression-task sample with uniform answer distribution.
 
-    To avoid reward-hacking we pick the target letter first (uniform), then
-    construct the seen set so the target is guaranteed to be the first missing:
-    - All letters before the target are always in the seen set (required prefix)
-    - Random additional letters from after the target fill the rest
-    - N is chosen to be feasible for the selected target
+    Picks target first (uniform over ALPHABET), then constructs seen set so
+    target is the first (or last) missing letter.
 
     Args:
-        fixed_n: if set, use exactly this many seen letters (for per-N eval).
-            Otherwise, pick N uniformly from the feasible range.
+        fixed_n: fix number of seen letters (for per-N eval).
+        fixed_query: fix query type ("first" or "last") for per-type eval.
 
     Returns: (prompt, answer)
-        prompt: e.g. "Seen: c,a,e. Next unused: "
-        answer: e.g. "b"
     """
-    # Pick target uniformly from the full alphabet
+    query = fixed_query or random.choice(QUERY_TYPES)
+
+    # Pick target uniformly
     target_idx = random.randint(0, len(ALPHABET) - 1)
     answer = ALPHABET[target_idx]
 
-    # Required prefix: all letters before the target must be in seen set
-    required = list(ALPHABET[:target_idx])
-    available_after = list(ALPHABET[target_idx + 1 :])
+    if query == "first":
+        # All letters before target must be seen (so target is first missing)
+        required = set(ALPHABET[:target_idx])
+        forbidden = set()  # target itself is excluded
+    else:  # "last"
+        # All letters after target must be seen (so target is last missing)
+        required = set(ALPHABET[target_idx + 1 :])
+        forbidden = set()
 
-    # Determine N (total seen letters)
-    min_n = max(MIN_N, len(required))  # at least enough to hold required prefix
-    max_n = min(MAX_N, len(required) + len(available_after))  # can't exceed available
+    # Available to optionally include (everything except target and required)
+    optional = set(ALPHABET) - required - {answer}
+
+    # Determine N
+    min_n = max(MIN_N, len(required))
+    max_n = min(MAX_N, len(required) + len(optional))
     if min_n > max_n:
-        # Target requires more prefix than MAX_N allows — retry with different target
-        return make_sample(fixed_n=fixed_n)
+        return make_sample(fixed_n=fixed_n, fixed_query=fixed_query)
 
     if fixed_n is not None:
         if fixed_n < min_n or fixed_n > max_n:
-            # This target isn't feasible for fixed_n — retry
-            return make_sample(fixed_n=fixed_n)
+            return make_sample(fixed_n=fixed_n, fixed_query=fixed_query)
         n = fixed_n
     else:
         n = random.randint(min_n, max_n)
 
-    # Fill: required prefix + random extras from after target
+    # Build seen set
     n_extra = n - len(required)
-    extra = random.sample(available_after, n_extra) if n_extra > 0 else []
-    seen = required + extra
-
-    # Shuffle to make order unpredictable
+    extra = random.sample(sorted(optional), min(n_extra, len(optional)))
+    seen = list(required) + extra
     random.shuffle(seen)
 
-    prompt = f"Seen: {','.join(seen)}. Next unused: "
+    # Add 0-3 distractors mixed into the seen list
+    n_distractors = random.randint(0, 3)
+    if n_distractors > 0:
+        pool = _DISTRACTORS_ALPHA + _DISTRACTORS_NUM
+        distractors = random.sample(pool, min(n_distractors, len(pool)))
+        # Insert distractors at random positions
+        for d in distractors:
+            pos = random.randint(0, len(seen))
+            seen.insert(pos, d)
+
+    seen_str = ",".join(seen)
+    alpha_range = f"{ALPHABET[0]}-{ALPHABET[-1]}"
+
+    if query == "first":
+        prompt = f"Alphabet: {alpha_range}. Seen: {seen_str}. First missing: "
+    else:
+        prompt = f"Alphabet: {alpha_range}. Seen: {seen_str}. Last missing: "
+
     return prompt, answer
 
 
-def make_batch(
-    tok: EfficientByteTokenizer, batch_size: int
-) -> tuple[Tensor, Tensor]:
-    """Build a padded batch with supervision only on the answer character.
-
-    Returns: (input_ids, targets) both of shape (B, max_len)
-        targets is -100 everywhere except the answer position.
-    """
+def make_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Tensor]:
+    """Build a padded batch with supervision only on the answer character."""
     all_ids = []
     all_targets = []
 
@@ -121,13 +144,11 @@ def make_batch(
         full_ids = prompt_ids + answer_ids
 
         # Shifted targets: logits[i] predicts token at i+1
-        # So targets[prompt_len-1] = answer_ids[0], etc.
         targets = [-100] * (len(prompt_ids) - 1) + answer_ids + [-100]
 
         all_ids.append(full_ids)
         all_targets.append(targets)
 
-    # Pad to max length in batch
     max_len = max(len(ids) for ids in all_ids)
     pad_id = tok.pad_id
 
@@ -138,31 +159,40 @@ def make_batch(
         padded_ids.append(ids + [pad_id] * pad_len)
         padded_targets.append(tgts + [-100] * pad_len)
 
-    input_ids = torch.tensor(padded_ids, dtype=torch.long)
-    targets = torch.tensor(padded_targets, dtype=torch.long)
-
-    return input_ids, targets
+    return (
+        torch.tensor(padded_ids, dtype=torch.long),
+        torch.tensor(padded_targets, dtype=torch.long),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Stream definitions
 # ---------------------------------------------------------------------------
 
+
 def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     """Stream defs including a writable context stream for accumulating state."""
     return [
         StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
-        StreamDef(name=Stream.CONTEXT, dim=48, auto_zeros=True),  # writable scratch
+        StreamDef(name=Stream.CONTEXT, dim=48, auto_zeros=True),
         StreamDef(name=Stream.TOKENS, read_only=True, auto_onehot=True),
         StreamDef(
             name=Stream.STRUCTURAL,
             read_only=True,
             components=[
                 ByteHashComponent(
-                    tok, window=3, num_hashes=2, boundary=HashBoundary.WORD, track_hits=True
+                    tok,
+                    window=3,
+                    num_hashes=2,
+                    boundary=HashBoundary.WORD,
+                    track_hits=True,
                 ),
                 ByteHashComponent(
-                    tok, window=6, num_hashes=2, boundary=None, track_hits=True
+                    tok,
+                    window=6,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
                 ),
             ],
         ),
@@ -170,8 +200,9 @@ def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
 
 
 # ---------------------------------------------------------------------------
-# Per-N evaluation helper
+# Per-N / per-query evaluation helpers
 # ---------------------------------------------------------------------------
+
 
 def evaluate_per_n(
     model: torch.nn.Module,
@@ -193,6 +224,26 @@ def evaluate_per_n(
     return results
 
 
+def evaluate_per_query(
+    model: torch.nn.Module,
+    tok: EfficientByteTokenizer,
+    device: str,
+    n_samples_per: int = 200,
+) -> dict[str, float]:
+    """Evaluate accuracy broken down by query type."""
+    results = {}
+    for q in QUERY_TYPES:
+
+        def make_sample_fixed(q=q):
+            return make_sample(fixed_query=q)
+
+        acc = evaluate_autoregressive(
+            model, make_sample_fixed, tok, n_samples=n_samples_per, device=device
+        )
+        results[q] = acc
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -202,7 +253,9 @@ if __name__ == "__main__":
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}")
     print(f"Alphabet: {ALPHABET!r} ({len(ALPHABET)} letters)")
-    print(f"N (seen letters): {MIN_N}-{MAX_N}\n")
+    print(f"N (seen letters): {MIN_N}-{MAX_N}")
+    print(f"Query types: {QUERY_TYPES}")
+    print(f"Distractors: 0-3 per sample\n")
 
     # --- Stream definitions ---
     stream_defs = make_stream_defs(tok)
@@ -212,10 +265,10 @@ if __name__ == "__main__":
         stream_defs=stream_defs,
         vocab_size=tok.vocab_size,
         num_heads=2,
-        head_dim=32,
+        head_dim=16,
         num_layers=2,
-        use_block=True,
-        mlp_hidden_dim=128,
+        # use_block=True,
+        # mlp_hidden_dim=32,
     )
 
     gpt_model = TinyGPT(
@@ -229,16 +282,16 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Model sizes")
     print("=" * 60)
-    ms_params = count_params(ms_model, "Multi-Stream (2 heads, head_dim=32, 2 layers, context)")
-    gpt_params = count_params(gpt_model, "TinyGPT (dim=128, 2 layers, 4 heads, mlp_mult=2)")
+    ms_params = count_params(ms_model, "Multi-Stream")
+    gpt_params = count_params(gpt_model, "TinyGPT")
     print(f"  Ratio: {gpt_params / ms_params:.2f}x\n")
 
     train_kwargs = dict(
-        tok=tok, steps=2000, batch_size=64, lr=3e-2, eval_every=400, device=device
+        tok=tok, steps=2000, batch_size=64, lr=3e-2, eval_every=500, device=device
     )
 
     models = [
-        ("Multi-Stream Attention (2 heads, 2 layers, context stream)", ms_model),
+        ("Multi-Stream (2 heads, 2 blocks, context)", ms_model),
         ("TinyGPT (dim=128, 2 layers, 4 heads)", gpt_model),
     ]
 
@@ -259,139 +312,40 @@ if __name__ == "__main__":
         )
         print(f"\n  Overall accuracy: {overall_acc:.1%}")
 
-        # Per-N accuracy
-        per_n = evaluate_per_n(model, tok, device, n_samples_per=200)
+        # Per-query accuracy
+        per_q = evaluate_per_query(model, tok, device, n_samples_per=200)
+        print("  Per-query accuracy:")
+        for q, acc in per_q.items():
+            print(f"    {q}: {acc:.1%}")
+
+        # Per-N accuracy (sample a few)
+        per_n = evaluate_per_n(model, tok, device, n_samples_per=150)
         print("  Per-N accuracy:")
         for n_seen, acc in sorted(per_n.items()):
-            print(f"    N={n_seen} (seen letters): {acc:.1%}")
+            print(f"    N={n_seen}: {acc:.1%}")
 
-        results[name] = {"overall": overall_acc, "per_n": per_n}
+        results[name] = {"overall": overall_acc, "per_q": per_q, "per_n": per_n}
 
-        # Show examples
         print("\n  Examples:")
-        show_examples(model, make_sample, tok, device, n=5)
+        show_examples(model, make_sample, tok, device, n=6)
+
+        verify_causality(model, tok, device, make_sample_fn=make_sample, label=name)
         print()
 
-    # --- Summary comparison ---
+    # --- Summary ---
     print("=" * 60)
     print("Summary")
     print("=" * 60)
-    header = f"  {'N':>4s}"
-    for name in results:
-        short = name[:35]
-        header += f"  {short:>35s}"
-    print(header)
-
-    for n_seen in range(MIN_N, MAX_N + 1):
-        row = f"  {n_seen:>4d}"
+    for metric in ["overall"] + list(QUERY_TYPES):
+        row = f"  {metric:>10s}"
         for name in results:
-            acc = results[name]["per_n"][n_seen]
-            row += f"  {acc:>35.1%}"
+            if metric == "overall":
+                val = results[name]["overall"]
+            else:
+                val = results[name]["per_q"][metric]
+            row += f"  {val:>30.1%}"
         print(row)
 
-    row = f"  {'all':>4s}"
-    for name in results:
-        acc = results[name]["overall"]
-        row += f"  {acc:>35.1%}"
-    print(row)
-
-    # -----------------------------------------------------------------------
-    # Harder variant: 10-letter alphabet, N from 3 to 7
-    # Uncomment to run.
-    # -----------------------------------------------------------------------
-    #
-    # ALPHABET_HARD = "abcdefghij"  # 10 letters
-    #
-    # def make_sample_hard(fixed_n: int | None = None) -> tuple[str, str]:
-    #     n = fixed_n if fixed_n is not None else random.randint(3, 7)
-    #     seen = random.sample(list(ALPHABET_HARD), n)
-    #     random.shuffle(seen)
-    #     seen_set = set(seen)
-    #     answer = ""
-    #     for ch in ALPHABET_HARD:
-    #         if ch not in seen_set:
-    #             answer = ch
-    #             break
-    #     prompt = f"Seen: {','.join(seen)}. Next unused: "
-    #     return prompt, answer
-    #
-    # def make_batch_hard(
-    #     tok: EfficientByteTokenizer, batch_size: int
-    # ) -> tuple[Tensor, Tensor]:
-    #     all_ids = []
-    #     all_targets = []
-    #     for _ in range(batch_size):
-    #         prompt, answer = make_sample_hard()
-    #         prompt_ids = tok.encode(prompt)
-    #         answer_ids = tok.encode(answer)
-    #         full_ids = list(prompt_ids) + list(answer_ids)
-    #         targets = [-100] * len(prompt_ids) + list(answer_ids)
-    #         all_ids.append(full_ids)
-    #         all_targets.append(targets)
-    #     max_len = max(len(ids) for ids in all_ids)
-    #     pad_id = tok.pad_id
-    #     padded_ids = []
-    #     padded_targets = []
-    #     for ids, tgts in zip(all_ids, all_targets):
-    #         pad_len = max_len - len(ids)
-    #         padded_ids.append(ids + [pad_id] * pad_len)
-    #         padded_targets.append(tgts + [-100] * pad_len)
-    #     input_ids = torch.tensor(padded_ids, dtype=torch.long)
-    #     targets = torch.tensor(padded_targets, dtype=torch.long)
-    #     return input_ids, targets
-    #
-    # print("\n" + "=" * 60)
-    # print("HARDER VARIANT: alphabet='abcdefghij' (10 letters), N=3..7")
-    # print("=" * 60)
-    #
-    # stream_defs_hard = make_stream_defs(tok)
-    #
-    # ms_model_hard = MultiStreamTestModel(
-    #     stream_defs=stream_defs_hard,
-    #     vocab_size=tok.vocab_size,
-    #     num_heads=2,
-    #     head_dim=32,
-    #     num_layers=2,
-    #     use_block=True,
-    #     mlp_hidden_dim=128,
-    # )
-    #
-    # gpt_model_hard = TinyGPT(
-    #     vocab_size=tok.vocab_size,
-    #     dim=128,
-    #     num_layers=2,
-    #     num_heads=4,
-    #     mlp_mult=2,
-    # )
-    #
-    # for name, model in [
-    #     ("Multi-Stream (hard)", ms_model_hard),
-    #     ("TinyGPT (hard)", gpt_model_hard),
-    # ]:
-    #     print(f"\n--- {name} ---")
-    #     count_params(model, name)
-    #
-    #     def eval_fn_hard(m, d):
-    #         return evaluate_autoregressive(
-    #             m, make_sample_hard, tok, n_samples=200, device=d
-    #         )
-    #
-    #     train_model(
-    #         model, make_batch_hard, tok=tok, steps=3000, batch_size=64,
-    #         lr=3e-2, eval_every=500, device=device, eval_fn=eval_fn_hard,
-    #     )
-    #
-    #     overall = evaluate_autoregressive(
-    #         model, make_sample_hard, tok, n_samples=500, device=device
-    #     )
-    #     print(f"  Overall accuracy: {overall:.1%}")
-    #
-    #     print("  Per-N accuracy:")
-    #     for n_seen in range(3, 8):
-    #         def _fn(n=n_seen):
-    #             return make_sample_hard(fixed_n=n)
-    #         acc = evaluate_autoregressive(model, _fn, tok, n_samples=200, device=device)
-    #         print(f"    N={n_seen}: {acc:.1%}")
-    #
-    #     print("  Examples:")
-    #     show_examples(model, make_sample_hard, tok, device, n=5)
+    print(f"\n  Random baseline: {1 / len(ALPHABET):.1%}")
+    print(f"  Multi-stream params: {ms_params:,}")
+    print(f"  TinyGPT params:      {gpt_params:,}")

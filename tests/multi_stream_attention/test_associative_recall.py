@@ -33,6 +33,7 @@ from test_harness import (
     train_model,
     evaluate_autoregressive,
     show_examples,
+    verify_causality,
 )
 
 
@@ -62,9 +63,7 @@ def make_sample() -> tuple[str, str]:
     return prompt, answer
 
 
-def make_batch(
-    tok: EfficientByteTokenizer, batch_size: int
-) -> tuple[Tensor, Tensor]:
+def make_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Tensor]:
     """Build a padded batch with supervision only on answer tokens.
 
     Returns: (input_ids, targets) both of shape (B, max_len)
@@ -121,7 +120,11 @@ if __name__ == "__main__":
             read_only=True,
             components=[
                 ByteHashComponent(
-                    tok, window=6, num_hashes=2, boundary=HashBoundary.WORD, track_hits=True
+                    tok,
+                    window=6,
+                    num_hashes=2,
+                    boundary=HashBoundary.WORD,
+                    track_hits=True,
                 ),
                 ByteHashComponent(
                     tok, window=3, num_hashes=2, boundary=None, track_hits=True
@@ -170,4 +173,6 @@ if __name__ == "__main__":
 
         print("\n  Examples:")
         show_examples(model, make_sample, tok, device, n=5)
+
+        verify_causality(model, tok, device, make_sample_fn=make_sample, label=name)
         print()

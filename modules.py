@@ -312,16 +312,28 @@ class LearnableShift(nn.Module):
         num_channels: independent shift parameters (e.g., num_kv_heads).
             Broadcasts along the dim immediately before seq_dim.
         seq_dim: sequence dimension index (default -2, matching (B, H, S, D)).
-        init: pre-sigmoid init. -5.0 → d ≈ 0.007 (near identity).
+        init: pre-sigmoid init value. None → random uniform in [-2, 2].
+            Fixed float examples: -5.0 → d ≈ 0.007 (near identity),
+            -1.0 → d ≈ 0.27 (moderate shift).
     """
 
-    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -1.0):
+    def __init__(
+        self,
+        num_channels: int = 1,
+        seq_dim: int = -2,
+        init: float | None = None,
+    ):
         super().__init__()
         self.num_channels = num_channels
         self.seq_dim = seq_dim
-        self.shift_logit = nn.Parameter(
-            torch.full((num_channels,), init, dtype=torch.float32)
-        )
+        self.shift_logit = nn.Parameter(torch.empty(num_channels, dtype=torch.float32))
+        if init is not None:
+            nn.init.constant_(self.shift_logit, init)
+        else:
+            self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.uniform_(self.shift_logit, -2.0, 2.0)
 
     def forward(self, x: Tensor) -> Tensor:
         d = torch.sigmoid(self.shift_logit)  # (C,) in [0, 1]

@@ -276,7 +276,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
     def forward(
         self,
         input_streams: dict[Stream, Tensor],
-        skip_residual: bool = False,
+        skip_residual: bool = True,
     ) -> dict[Stream, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
@@ -485,7 +485,7 @@ class CausualMultiStreamAttention(nn.Module):
     def forward(
         self,
         input_streams: dict[Stream, Tensor],
-        skip_residual: bool = False,
+        skip_residual: bool = True,
     ) -> dict[Stream, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 

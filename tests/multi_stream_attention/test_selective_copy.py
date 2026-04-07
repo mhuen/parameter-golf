@@ -32,6 +32,7 @@ from test_harness import (
     train_model,
     evaluate_autoregressive,
     show_examples,
+    verify_causality,
 )
 
 
@@ -166,9 +167,9 @@ if __name__ == "__main__":
         vocab_size=tok.vocab_size,
         num_heads=2,
         head_dim=32,
-        num_layers=1,
-        use_block=True,
-        mlp_hidden_dim=128,
+        num_layers=2,
+        # use_block=True,
+        # mlp_hidden_dim=16,
     )
     ms_params = count_params(ms_model, "Multi-stream")
 
@@ -199,10 +200,14 @@ if __name__ == "__main__":
     )
 
     def ms_eval_fn(model, dev):
-        return evaluate_autoregressive(model, make_sample, tok, n_samples=200, device=dev)
+        return evaluate_autoregressive(
+            model, make_sample, tok, n_samples=200, device=dev
+        )
 
     def gpt_eval_fn(model, dev):
-        return evaluate_autoregressive(model, make_sample, tok, n_samples=200, device=dev)
+        return evaluate_autoregressive(
+            model, make_sample, tok, n_samples=200, device=dev
+        )
 
     print("=" * 60)
     print("Training Multi-stream")
@@ -251,6 +256,18 @@ if __name__ == "__main__":
         show_examples(model, _make_sample_letters, tok, device=device, n=5)
         print("  [digits]")
         show_examples(model, _make_sample_digits, tok, device=device, n=5)
+
+    # --- Causality verification ---
+    print()
+    print("=" * 60)
+    print("Causality verification")
+    print("=" * 60)
+    verify_causality(
+        ms_model, tok, device, make_sample_fn=make_sample, label="Multi-stream"
+    )
+    verify_causality(
+        gpt_model, tok, device, make_sample_fn=make_sample, label="TinyGPT"
+    )
 
     # --- Summary comparison ---
     print()

@@ -37,6 +37,7 @@ from multi_streams import (
     SinCosPositionComponent,
 )
 from multi_stream_attention import CausualMultiStreamAttention
+from test_harness import verify_causality
 
 
 # ---------------------------------------------------------------------------
@@ -141,46 +142,57 @@ def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
     return MultiStreamBuilder(
         stream_defs=[
             StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
-            StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
-                # SinCosPositionComponent(num_freqs=4),  # 8d
-                ByteHashComponent(
-                    tok,
-                    window=12,
-                    num_hashes=2,
-                    boundary=HashBoundary.WORD,
-                    track_hits=True,
-                ),  # 6d
-                ByteHashComponent(
-                    tok,
-                    window=12,
-                    num_hashes=2,
-                    boundary=HashBoundary.DIGIT,
-                    track_hits=True,
-                ),  # 6d
-                ByteHashComponent(
-                    tok,
-                    window=3,
-                    num_hashes=2,
-                    boundary=None,
-                    track_hits=True,
-                ),  # 6d
-                ByteHashComponent(
-                    tok,
-                    window=8,
-                    num_hashes=2,
-                    boundary=None,
-                    track_hits=True,
-                ),  # 6d
-                # BoundaryComponent(
-                #     tok,
-                #     word_pos_freqs=2,
-                #     word_id_freqs=2,
-                #     sent_pos_freqs=0,
-                #     sent_id_freqs=0,
-                #     para_pos_freqs=0,
-                #     para_id_freqs=0,
-                # ),  # 8d
-            ]),
+            StreamDef(
+                name=Stream.STRUCTURAL,
+                read_only=True,
+                components=[
+                    # SinCosPositionComponent(num_freqs=4),  # 8d
+                    ByteHashComponent(
+                        tok,
+                        window=12,
+                        num_hashes=2,
+                        boundary=HashBoundary.WORD,
+                        track_hits=True,
+                    ),  # 6d
+                    ByteHashComponent(
+                        tok,
+                        window=12,
+                        num_hashes=2,
+                        boundary=HashBoundary.DIGIT,
+                        track_hits=True,
+                    ),  # 6d
+                    ByteHashComponent(
+                        tok,
+                        window=2,
+                        num_hashes=2,
+                        boundary=None,
+                        track_hits=True,
+                    ),  # 6d
+                    ByteHashComponent(
+                        tok,
+                        window=3,
+                        num_hashes=2,
+                        boundary=None,
+                        track_hits=True,
+                    ),  # 6d
+                    ByteHashComponent(
+                        tok,
+                        window=5,
+                        num_hashes=2,
+                        boundary=None,
+                        track_hits=True,
+                    ),  # 6d
+                    # BoundaryComponent(
+                    #     tok,
+                    #     word_pos_freqs=2,
+                    #     word_id_freqs=2,
+                    #     sent_pos_freqs=0,
+                    #     sent_id_freqs=0,
+                    #     para_pos_freqs=0,
+                    #     para_id_freqs=0,
+                    # ),  # 8d
+                ],
+            ),
         ],
         vocab_size=tok.vocab_size,
     )
@@ -432,7 +444,7 @@ if __name__ == "__main__":
         print("=" * 60)
         print(f"{name}")
         print("=" * 60)
-        model = ModelClass(tok, head_dim=32)
+        model = ModelClass(tok, head_dim=16)
         model = train(model, **train_kwargs)
 
         print("\n  Final evaluation (per category x length range):")
@@ -460,6 +472,14 @@ if __name__ == "__main__":
         print("\n  Examples:")
         for cat in CATEGORIES:
             show_examples(model, tok, device, n=2, category=cat)
+
+        def _make_sample_2tuple():
+            full_text, code, prefix_len, _cat = make_sample()
+            return full_text, code[prefix_len:]
+
+        verify_causality(
+            model, tok, device, make_sample_fn=_make_sample_2tuple, label=name
+        )
         print()
 
     # Summary comparison

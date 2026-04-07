@@ -24,7 +24,7 @@ from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import ByteHashComponent, HashBoundary
-from multi_streams import Stream, StreamDef
+from multi_streams import Stream, StreamDef, SinCosPositionComponent
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
@@ -32,6 +32,7 @@ from test_harness import (
     train_model,
     evaluate_autoregressive,
     show_examples,
+    verify_causality,
 )
 
 
@@ -62,7 +63,11 @@ def make_sample(
         (prompt_text, answer_str) where answer_str completes the current partial
         period plus one full additional period.
     """
-    period = fixed_period if fixed_period is not None else random.randint(min_period, max_period)
+    period = (
+        fixed_period
+        if fixed_period is not None
+        else random.randint(min_period, max_period)
+    )
     repeats = random.randint(min_repeats, max_repeats)
     base = _random_pattern(period)
     # Build enough repeats to have room for the prompt + answer
@@ -98,7 +103,11 @@ def make_batch(
     """
     samples = []
     for _ in range(batch_size):
-        period = fixed_period if fixed_period is not None else random.randint(min_period, max_period)
+        period = (
+            fixed_period
+            if fixed_period is not None
+            else random.randint(min_period, max_period)
+        )
         repeats = random.randint(min_repeats, max_repeats)
         base = _random_pattern(period)
         full_seq = base * repeats
@@ -128,15 +137,19 @@ def make_batch(
 # ---------------------------------------------------------------------------
 
 
-def make_train_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Tensor]:
+def make_train_batch(
+    tok: EfficientByteTokenizer, batch_size: int
+) -> tuple[Tensor, Tensor]:
     """Training batch generator compatible with train_model's MakeBatchFn."""
     return make_batch(tok, batch_size)
 
 
 def make_eval_sample(fixed_period: int | None = None):
     """Return a callable () -> (prompt, answer) for evaluate_autoregressive."""
+
     def _fn() -> tuple[str, str]:
         return make_sample(fixed_period=fixed_period)
+
     return _fn
 
 
@@ -154,11 +167,32 @@ def build_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     return [
         StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
         StreamDef(name=Stream.TOKENS, read_only=True, auto_onehot=True),
-        StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
-            ByteHashComponent(tok, window=3, num_hashes=2, boundary=None, track_hits=True),
-            ByteHashComponent(tok, window=5, num_hashes=2, boundary=None, track_hits=True),
-            ByteHashComponent(tok, window=8, num_hashes=2, boundary=None, track_hits=True),
-        ]),
+        StreamDef(
+            name=Stream.STRUCTURAL,
+            read_only=True,
+            components=[
+                SinCosPositionComponent(num_freqs=32),  # 12d
+                ByteHashComponent(
+                    tok,
+                    window=20,
+                    num_hashes=2,
+                    boundary=HashBoundary.WORD,
+                    track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok, window=2, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=3, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=5, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=8, num_hashes=2, boundary=None, track_hits=True
+                ),
+            ],
+        ),
     ]
 
 
@@ -178,9 +212,11 @@ if __name__ == "__main__":
         stream_defs=stream_defs,
         vocab_size=tok.vocab_size,
         num_heads=1,
-        head_dim=32,
+        head_dim=16,
         num_layers=1,
         k_shift=True,
+        # use_block=True,
+        # mlp_hidden_dim=16,
     )
     gpt_model = TinyGPT(
         vocab_size=tok.vocab_size,
@@ -211,9 +247,15 @@ if __name__ == "__main__":
         print(f"Training: {name}")
         print("=" * 60)
 
-        eval_fn = lambda m, d: evaluate_autoregressive(
-            m, make_eval_sample(), tok, n_samples=200, device=d,
-        )
+        def eval_fn(m, d):
+            return evaluate_autoregressive(
+                m,
+                make_eval_sample(),
+                tok,
+                n_samples=200,
+                device=d,
+            )
+
         model = train_model(
             model,
             make_batch_fn=make_train_batch,
@@ -223,7 +265,11 @@ if __name__ == "__main__":
 
         # --- Overall evaluation ---
         overall_acc = evaluate_autoregressive(
-            model, make_eval_sample(), tok, n_samples=500, device=device,
+            model,
+            make_eval_sample(),
+            tok,
+            n_samples=500,
+            device=device,
         )
         print(f"\n  Overall accuracy: {overall_acc:.1%}")
 
@@ -232,8 +278,11 @@ if __name__ == "__main__":
         period_accs = {}
         for p in range(2, 7):
             acc = evaluate_autoregressive(
-                model, make_eval_sample(fixed_period=p), tok,
-                n_samples=200, device=device,
+                model,
+                make_eval_sample(fixed_period=p),
+                tok,
+                n_samples=200,
+                device=device,
             )
             period_accs[p] = acc
             print(f"    period={p}: {acc:.1%}")
@@ -242,6 +291,8 @@ if __name__ == "__main__":
         # --- Show examples ---
         print("\n  Examples:")
         show_examples(model, make_eval_sample(), tok, device=device, n=5)
+
+        verify_causality(model, tok, device, make_sample_fn=make_eval_sample(), label=name)
         print()
 
     # --- Summary comparison ---

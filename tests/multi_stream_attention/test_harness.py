@@ -46,7 +46,11 @@ class Rotary(nn.Module):
         self._cache: tuple[int, Tensor, Tensor] | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype):
-        if self._cache is None or self._cache[0] != seq_len or self._cache[1].device != device:
+        if (
+            self._cache is None
+            or self._cache[0] != seq_len
+            or self._cache[1].device != device
+        ):
             t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.outer(t, self.inv_freq.to(device))
             self._cache = (seq_len, freqs.cos()[None, None], freqs.sin()[None, None])
@@ -179,23 +183,27 @@ class MultiStreamTestModel(nn.Module):
         )
 
         if use_block:
-            self.layers = nn.ModuleList([
-                MultiStreamBlock(
-                    **shared_kwargs,
-                    mixing_config=mixing_config,
-                    mlp_hidden_dim=mlp_hidden_dim,
-                    k_shift=k_shift,
-                )
-                for _ in range(num_layers)
-            ])
+            self.layers = nn.ModuleList(
+                [
+                    MultiStreamBlock(
+                        **shared_kwargs,
+                        mixing_config=mixing_config,
+                        mlp_hidden_dim=mlp_hidden_dim,
+                        k_shift=k_shift,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
         else:
-            self.layers = nn.ModuleList([
-                CausualMultiStreamAttention(
-                    **shared_kwargs,
-                    k_shift=k_shift,
-                )
-                for _ in range(num_layers)
-            ])
+            self.layers = nn.ModuleList(
+                [
+                    CausualMultiStreamAttention(
+                        **shared_kwargs,
+                        k_shift=k_shift,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
 
     def forward(self, input_ids: Tensor, **provided_streams: Tensor) -> Tensor:
         logit_onehot = F.one_hot(input_ids, self.vocab_size).float()
@@ -221,8 +229,98 @@ def count_params(model: nn.Module, label: str = "") -> int:
 
 MakeBatchFn = Callable[
     [EfficientByteTokenizer, int],  # (tok, batch_size) ->
-    tuple[Tensor, Tensor],          # (input_ids, targets)
+    tuple[Tensor, Tensor],  # (input_ids, targets)
 ]
+
+
+def _collect_k_shift_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
+    """Find all LearnableShift modules used as k_shift in the model."""
+    results = []
+    # Direct k_shift_mod on the model (e.g. StandardAttentionCopyModel)
+    ks = getattr(model, "k_shift_mod", None)
+    if ks is not None:
+        results.append(("", ks))
+        return results
+    # Direct attn.k_shift_mod (e.g. MultiStreamCopyModel)
+    attn = getattr(model, "attn", None)
+    if attn is not None:
+        ks = getattr(attn, "k_shift_mod", None)
+        if ks is not None:
+            results.append(("", ks))
+            return results
+    # Walk model.layers (MultiStreamTestModel with CausualMultiStreamAttention or MultiStreamBlock)
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        for i, layer in enumerate(layers):
+            ks = getattr(layer, "k_shift_mod", None)
+            if ks is None:
+                ks = getattr(getattr(layer, "attn", None), "k_shift_mod", None)
+            if ks is not None:
+                label = f"L{i}" if len(layers) > 1 else ""
+                results.append((label, ks))
+    return results
+
+
+def _format_k_shifts(model: nn.Module) -> str:
+    """Format k_shift values for all layers into a compact string."""
+    mods = _collect_k_shift_modules(model)
+    if not mods:
+        return ""
+    parts = []
+    for label, ks in mods:
+        vals = torch.sigmoid(ks.shift_logit)
+        if vals.numel() == 1:
+            s = f"{vals.item():.3f}"
+        else:
+            s = "[" + ",".join(f"{v:.3f}" for v in vals.tolist()) + "]"
+        if label:
+            parts.append(f"{label}={s}")
+        else:
+            parts.append(s)
+    return "  k_shift=" + " ".join(parts)
+
+
+def _format_alpha_summary(param: Tensor) -> str:
+    """Summarize a per-dimension alpha/beta parameter as mean(min..max) after sigmoid."""
+    vals = torch.sigmoid(param)
+    return f"{vals.mean().item():.3f}({vals.min().item():.3f}..{vals.max().item():.3f})"
+
+
+def _format_alphas(model: nn.Module) -> str:
+    """Format gating alpha summaries for multi-stream layers.
+
+    For MultiStreamBlock layers: reports attn_alpha and mlp_alpha per writable stream.
+    For bare CausualMultiStreamAttention: reports alpha_pre_sigmoid per writable stream.
+    """
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return ""
+
+    parts = []
+    for i, layer in enumerate(layers):
+        prefix = f"L{i}" if len(layers) > 1 else ""
+        # MultiStreamBlock has attn_alpha / mlp_alpha
+        attn_alpha = getattr(layer, "attn_alpha", None)
+        if attn_alpha is not None:
+            for name, param in attn_alpha.items():
+                lbl = f"{prefix}attn_α.{name}" if prefix else f"attn_α.{name}"
+                parts.append(f"{lbl}={_format_alpha_summary(param)}")
+            mlp_alpha = getattr(layer, "mlp_alpha", None)
+            if mlp_alpha is not None:
+                for name, param in mlp_alpha.items():
+                    lbl = f"{prefix}mlp_α.{name}" if prefix else f"mlp_α.{name}"
+                    parts.append(f"{lbl}={_format_alpha_summary(param)}")
+            continue
+        # Bare CausualMultiStreamAttention has alpha_pre_sigmoid
+        alpha_ps = getattr(layer, "alpha_pre_sigmoid", None)
+        if alpha_ps is not None:
+            for name, param in alpha_ps.items():
+                lbl = f"{prefix}α.{name}" if prefix else f"α.{name}"
+                parts.append(f"{lbl}={_format_alpha_summary(param)}")
+
+    if not parts:
+        return ""
+    return "  " + " ".join(parts)
 
 
 def train_model(
@@ -262,7 +360,10 @@ def train_model(
 
         if step % eval_every == 0 or step == 1:
             acc = eval_fn(model, device) if eval_fn else 0.0
-            print(f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}")
+
+            ks_str = _format_k_shifts(model)
+            alpha_str = _format_alphas(model)
+            print(f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}{ks_str}{alpha_str}")
 
     return model
 
@@ -309,6 +410,87 @@ def evaluate_autoregressive(
         total += max(0, len(expected_ids) - len(predicted))
 
     return correct / max(total, 1)
+
+
+@torch.no_grad()
+def verify_causality(
+    model: nn.Module,
+    tok: EfficientByteTokenizer,
+    device: str = "cpu",
+    n_samples: int = 5,
+    make_sample_fn: MakeSampleFn | None = None,
+    seq_len: int | None = None,
+    atol: float = 1e-3,
+    label: str = "",
+):
+    """Verify that the model is strictly causal by comparing single-pass vs sequential logits.
+
+    For each sample, runs the model once on the full sequence to get logits at every
+    position, then runs the model T separate times on tokens[:1], tokens[:2], ...,
+    tokens[:T]. The logits at position t must be identical in both cases — any
+    difference means information is leaking from future tokens.
+
+    Args:
+        model: the model to test (must accept input_ids and return logits).
+        tok: tokenizer.
+        device: device string.
+        n_samples: number of random sequences to test.
+        make_sample_fn: if provided, generates (prompt, answer) pairs for input.
+        seq_len: if make_sample_fn is None, use random token sequences of this length.
+        atol: absolute tolerance for logit comparison.
+        label: optional label for print output.
+
+    Raises:
+        AssertionError if any logit mismatch is found.
+    """
+    model.eval()
+    prefix = f"  [{label}] " if label else "  "
+
+    if seq_len is None and make_sample_fn is None:
+        seq_len = 30
+
+    overall_max = 0.0
+    for i in range(n_samples):
+        # Build input sequence
+        if make_sample_fn is not None:
+            prompt, answer = make_sample_fn()
+            full_text = prompt + answer
+            ids = torch.from_numpy(tok.encode(full_text)).long().unsqueeze(0).to(device)
+        else:
+            ids = torch.randint(0, tok.vocab_size, (1, seq_len), device=device)
+
+        T = ids.size(1)
+        if T < 2:
+            continue
+
+        # Single-pass: full sequence
+        full_logits = model(ids)  # (1, T, V)
+
+        # Sequential: run on tokens[:t] for t = 1..T, collect logit at last position
+        max_diff = 0.0
+        worst_pos = -1
+        for t in range(1, T + 1):
+            partial_logits = model(ids[:, :t])  # (1, t, V)
+            seq_logit = partial_logits[0, t - 1]  # logit at position t-1
+            full_logit = full_logits[0, t - 1]
+
+            diff = (seq_logit - full_logit).abs().max().item()
+            if diff > max_diff:
+                max_diff = diff
+                worst_pos = t - 1
+
+        if max_diff > atol:
+            raise AssertionError(
+                f"{prefix}CAUSALITY VIOLATION in sample {i}: "
+                f"max logit diff = {max_diff:.2e} at position {worst_pos} "
+                f"(tolerance = {atol:.0e}, seq_len = {T})"
+            )
+        overall_max = max(overall_max, max_diff)
+
+    print(
+        f"{prefix}Causality check PASSED ({n_samples} samples, "
+        f"max_diff={overall_max:.2e}, atol={atol:.0e})"
+    )
 
 
 @torch.no_grad()
