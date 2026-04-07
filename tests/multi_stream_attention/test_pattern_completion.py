@@ -54,16 +54,27 @@ def make_sample(
 ) -> tuple[str, str]:
     """Generate one pattern-completion sample.
 
+    The prompt is cut at a random offset within the last period, so the model
+    cannot just copy the last N characters — it must genuinely detect the period
+    and figure out where it is in the cycle.
+
     Returns:
-        (prompt_text, answer_str) where answer_str is the last full period
-        to predict, and prompt_text is everything before it.
+        (prompt_text, answer_str) where answer_str completes the current partial
+        period plus one full additional period.
     """
     period = fixed_period if fixed_period is not None else random.randint(min_period, max_period)
     repeats = random.randint(min_repeats, max_repeats)
     base = _random_pattern(period)
-    full_seq = base * repeats
-    prompt = full_seq[:-period]
-    answer = full_seq[-period:]
+    # Build enough repeats to have room for the prompt + answer
+    full_seq = base * (repeats + 2)
+    # Cut at a random offset within the last shown period (1 to period-1 chars into it)
+    # This means the prompt does NOT end at a period boundary
+    offset = random.randint(1, period - 1) if period > 1 else 0
+    prompt_len = period * repeats + offset
+    # Answer: rest of current partial period + one full period
+    answer_len = (period - offset) + period
+    prompt = full_seq[:prompt_len]
+    answer = full_seq[prompt_len : prompt_len + answer_len]
     return prompt, answer
 
 

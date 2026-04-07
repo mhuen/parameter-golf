@@ -47,29 +47,56 @@ from test_harness import (
 ALPHABET = "abcdef"  # 6 letters, simple version
 
 
+MIN_N, MAX_N = 2, len(ALPHABET) - 1  # N seen letters (2 to 5 for 6-letter alphabet)
+
+
 def make_sample(fixed_n: int | None = None) -> tuple[str, str]:
-    """Generate one suppression-task sample.
+    """Generate one suppression-task sample with uniform answer distribution.
+
+    To avoid reward-hacking we pick the target letter first (uniform), then
+    construct the seen set so the target is guaranteed to be the first missing:
+    - All letters before the target are always in the seen set (required prefix)
+    - Random additional letters from after the target fill the rest
+    - N is chosen to be feasible for the selected target
 
     Args:
         fixed_n: if set, use exactly this many seen letters (for per-N eval).
-            Otherwise, pick N uniformly from [2, 4].
+            Otherwise, pick N uniformly from the feasible range.
 
     Returns: (prompt, answer)
         prompt: e.g. "Seen: c,a,e. Next unused: "
         answer: e.g. "b"
     """
-    n = fixed_n if fixed_n is not None else random.randint(2, 4)
-    seen = random.sample(list(ALPHABET), n)
-    # Shuffle to make order unpredictable (harder than sorted)
-    random.shuffle(seen)
+    # Pick target uniformly from the full alphabet
+    target_idx = random.randint(0, len(ALPHABET) - 1)
+    answer = ALPHABET[target_idx]
 
-    # First alphabetically missing letter
-    seen_set = set(seen)
-    answer = ""
-    for ch in ALPHABET:
-        if ch not in seen_set:
-            answer = ch
-            break
+    # Required prefix: all letters before the target must be in seen set
+    required = list(ALPHABET[:target_idx])
+    available_after = list(ALPHABET[target_idx + 1 :])
+
+    # Determine N (total seen letters)
+    min_n = max(MIN_N, len(required))  # at least enough to hold required prefix
+    max_n = min(MAX_N, len(required) + len(available_after))  # can't exceed available
+    if min_n > max_n:
+        # Target requires more prefix than MAX_N allows — retry with different target
+        return make_sample(fixed_n=fixed_n)
+
+    if fixed_n is not None:
+        if fixed_n < min_n or fixed_n > max_n:
+            # This target isn't feasible for fixed_n — retry
+            return make_sample(fixed_n=fixed_n)
+        n = fixed_n
+    else:
+        n = random.randint(min_n, max_n)
+
+    # Fill: required prefix + random extras from after target
+    n_extra = n - len(required)
+    extra = random.sample(available_after, n_extra) if n_extra > 0 else []
+    seen = required + extra
+
+    # Shuffle to make order unpredictable
+    random.shuffle(seen)
 
     prompt = f"Seen: {','.join(seen)}. Next unused: "
     return prompt, answer
@@ -154,7 +181,7 @@ def evaluate_per_n(
 ) -> dict[int, float]:
     """Evaluate accuracy broken down by number of seen letters."""
     results = {}
-    for n in range(2, 5):  # N = 2, 3, 4
+    for n in range(MIN_N, MAX_N + 1):
 
         def make_sample_fixed(n=n):
             return make_sample(fixed_n=n)
@@ -175,7 +202,7 @@ if __name__ == "__main__":
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}")
     print(f"Alphabet: {ALPHABET!r} ({len(ALPHABET)} letters)")
-    print(f"N (seen letters): 2-4\n")
+    print(f"N (seen letters): {MIN_N}-{MAX_N}\n")
 
     # --- Stream definitions ---
     stream_defs = make_stream_defs(tok)
@@ -255,7 +282,7 @@ if __name__ == "__main__":
         header += f"  {short:>35s}"
     print(header)
 
-    for n_seen in range(2, 5):
+    for n_seen in range(MIN_N, MAX_N + 1):
         row = f"  {n_seen:>4d}"
         for name in results:
             acc = results[name]["per_n"][n_seen]
