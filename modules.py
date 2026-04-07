@@ -315,7 +315,7 @@ class LearnableShift(nn.Module):
         init: pre-sigmoid init. -5.0 → d ≈ 0.007 (near identity).
     """
 
-    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -2.0):
+    def __init__(self, num_channels: int = 1, seq_dim: int = -2, init: float = -1.0):
         super().__init__()
         self.num_channels = num_channels
         self.seq_dim = seq_dim
