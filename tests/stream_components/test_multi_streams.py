@@ -10,7 +10,8 @@ import torch
 from torch import Tensor
 
 from multi_streams import (
-    Stream,
+    StreamType,
+    StreamID,
     StreamDef,
     StreamConfig,
     MultiStreamConfig,
@@ -156,8 +157,8 @@ class TestMultiStreamBuilder:
     def test_config_with_structural(self):
         builder = MultiStreamBuilder(
             stream_defs=[
-                StreamDef(name=Stream.LOGIT, dim=256),
-                StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
+                StreamDef(name=StreamID(StreamType.LOGIT), dim=256),
+                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
                     SinCosPositionComponent(num_freqs=8),
                     DocBoundaryComponent(bos_id=1, num_freqs=1),
                 ]),
@@ -165,27 +166,27 @@ class TestMultiStreamBuilder:
         )
         cfg = builder.config
         assert len(cfg.streams) == 2
-        assert cfg.streams[0].name == Stream.LOGIT
+        assert cfg.streams[0].name == StreamID(StreamType.LOGIT)
         assert cfg.streams[0].read_only is False
-        assert cfg.streams[1].name == Stream.STRUCTURAL
+        assert cfg.streams[1].name == StreamID(StreamType.STRUCTURAL)
         assert cfg.streams[1].read_only is True
         assert cfg.streams[1].dim == 18  # 8*2 + 1*2
 
     @torch.no_grad()
     def test_config_without_structural(self):
         builder = MultiStreamBuilder(
-            stream_defs=[StreamDef(name=Stream.LOGIT, dim=256)],
+            stream_defs=[StreamDef(name=StreamID(StreamType.LOGIT), dim=256)],
         )
         cfg = builder.config
         assert len(cfg.streams) == 1
-        assert cfg.streams[0].name == Stream.LOGIT
+        assert cfg.streams[0].name == StreamID(StreamType.LOGIT)
 
     @torch.no_grad()
     def test_forward_returns_streams(self):
         builder = MultiStreamBuilder(
             stream_defs=[
-                StreamDef(name=Stream.LOGIT, dim=32),
-                StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
+                StreamDef(name=StreamID(StreamType.LOGIT), dim=32),
+                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
                     SinCosPositionComponent(num_freqs=4),
                 ]),
             ],
@@ -194,16 +195,16 @@ class TestMultiStreamBuilder:
         ids = torch.zeros(B, S, dtype=torch.long)
         writable = torch.randn(B, S, 32)
         streams = builder(ids, dtype=torch.float32, logit=writable)
-        assert set(streams.keys()) == {Stream.LOGIT, Stream.STRUCTURAL}
-        assert streams[Stream.LOGIT].shape == (B, S, 32)
-        assert streams[Stream.STRUCTURAL].shape == (B, S, 8)
+        assert set(streams.keys()) == {StreamID(StreamType.LOGIT), StreamID(StreamType.STRUCTURAL)}
+        assert streams[StreamID(StreamType.LOGIT)].shape == (B, S, 32)
+        assert streams[StreamID(StreamType.STRUCTURAL)].shape == (B, S, 8)
 
     @torch.no_grad()
     def test_writable_passthrough(self):
         builder = MultiStreamBuilder(
             stream_defs=[
-                StreamDef(name=Stream.LOGIT, dim=16),
-                StreamDef(name=Stream.STRUCTURAL, read_only=True, components=[
+                StreamDef(name=StreamID(StreamType.LOGIT), dim=16),
+                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
                     SinCosPositionComponent(),
                 ]),
             ],
@@ -211,4 +212,4 @@ class TestMultiStreamBuilder:
         ids = torch.zeros(1, 5, dtype=torch.long)
         writable = torch.randn(1, 5, 16)
         streams = builder(ids, logit=writable)
-        assert torch.equal(streams[Stream.LOGIT], writable)
+        assert torch.equal(streams[StreamID(StreamType.LOGIT)], writable)

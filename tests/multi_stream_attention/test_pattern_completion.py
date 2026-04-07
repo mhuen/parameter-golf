@@ -24,7 +24,7 @@ from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import ByteHashComponent, HashBoundary
-from multi_streams import Stream, StreamDef, SinCosPositionComponent
+from multi_streams import StreamType, StreamID, StreamDef, SinCosPositionComponent
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
@@ -165,10 +165,10 @@ def build_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     Multiple window sizes (3, 5, 8) to cover different period lengths.
     """
     return [
-        StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
-        StreamDef(name=Stream.TOKENS, read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
         StreamDef(
-            name=Stream.STRUCTURAL,
+            name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
             components=[
                 SinCosPositionComponent(num_freqs=32),  # 12d

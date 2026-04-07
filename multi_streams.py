@@ -22,18 +22,45 @@ from modules import sincos_encode
 # ---------------------------------------------------------------------------
 
 
-class Stream(StrEnum):
+class StreamType(StrEnum):
     LOGIT = "logit"
     CONTEXT = "context"
     TOKENS = "tokens"
     STRUCTURAL = "structural"
+    REGISTER = "register"
+    COMPUTE_RESULT = "compute_result"
+
+
+@dataclass(frozen=True)
+class StreamID:
+    """Hashable stream identifier supporting multiple streams of the same type.
+
+    For backward compatibility, ``str(StreamID(Stream.LOGIT))`` returns ``"logit"``,
+    matching existing ``nn.ModuleDict`` / ``nn.ParameterDict`` keys.
+    """
+
+    type: StreamType
+    name: str = ""
+
+    def __str__(self) -> str:
+        return f"{self.type.value}:{self.name}" if self.name else self.type.value
+
+    def __repr__(self) -> str:
+        if self.name:
+            return f"StreamID({self.type!r}, {self.name!r})"
+        return f"StreamID({self.type!r})"
 
 
 @dataclass
 class StreamConfig:
-    name: Stream
+    name: StreamID
     dim: int
     read_only: bool = False
+
+    @property
+    def key(self) -> str:
+        """String key for use in nn.ModuleDict/ParameterDict."""
+        return str(self.name)
 
 
 @dataclass
@@ -51,7 +78,7 @@ class StreamDef:
     - ``auto_onehot``: True to auto-create one-hot from input_ids (requires vocab_size)
     """
 
-    name: Stream
+    name: StreamID
     read_only: bool = False
     dim: int | None = None
     components: list[nn.Module] | None = None
@@ -179,7 +206,7 @@ class MultiStreamBuilder(nn.Module):
                 StreamConfig(sd.name, dim=dim, read_only=sd.read_only)
             )
             if sd.components is not None:
-                composites[sd.name.value] = CompositeStream(sd.components)
+                composites[str(sd.name)] = CompositeStream(sd.components)
 
         self.composites = nn.ModuleDict(composites)
         self._config = MultiStreamConfig(streams=stream_configs)
@@ -217,25 +244,25 @@ class MultiStreamBuilder(nn.Module):
         self,
         input_ids: Tensor,
         dtype: torch.dtype = torch.float32,
-        **provided_streams: dict[Stream, Tensor],
-    ) -> dict[Stream, Tensor]:
+        **provided_streams: dict[StreamID, Tensor],
+    ) -> dict[StreamID, Tensor]:
         """Build stream dict.
 
         Args:
             input_ids: (B, S) token IDs.
             dtype: dtype for auto-constructed streams.
-            **provided_streams: tensors keyed by stream name value
+            **provided_streams: tensors keyed by stream name string
                 (e.g. ``logit=tensor``). Required for streams without
                 auto_onehot, auto_zeros, or components.
 
         Returns:
-            dict mapping Stream names to tensors.
+            dict mapping StreamID to tensors.
         """
         B, S = input_ids.shape
-        streams: dict[Stream, Tensor] = {}
+        streams: dict[StreamID, Tensor] = {}
 
         for sd in self._defs:
-            key = sd.name.value
+            key = str(sd.name)
             if sd.components is not None:
                 streams[sd.name] = self.composites[key](input_ids, dtype)
             elif sd.auto_onehot:
@@ -246,11 +273,16 @@ class MultiStreamBuilder(nn.Module):
                     B, S, dim, dtype=dtype, device=input_ids.device
                 )
             else:
-                if key not in provided_streams:
+                # Try exact key first, then fall back to type value
+                # (kwargs are Python identifiers, so "logit" not "logit:NAME")
+                if key in provided_streams:
+                    streams[sd.name] = provided_streams[key]
+                elif sd.name.type.value in provided_streams:
+                    streams[sd.name] = provided_streams[sd.name.type.value]
+                else:
                     raise KeyError(
                         f"Stream '{key}' must be provided in forward() call "
                         f"(got keys: {list(provided_streams.keys())})"
                     )
-                streams[sd.name] = provided_streams[key]
 
         return streams

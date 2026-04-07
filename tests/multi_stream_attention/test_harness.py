@@ -21,7 +21,8 @@ from torch import Tensor
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from modules import RMSNorm
 from multi_streams import (
-    Stream,
+    StreamType,
+    StreamID,
     StreamDef,
     MultiStreamBuilder,
     MultiStreamConfig,
@@ -210,7 +211,7 @@ class MultiStreamTestModel(nn.Module):
         streams = self.builder(input_ids, logit=logit_onehot, **provided_streams)
         for layer in self.layers:
             streams = layer(streams)
-        return streams[Stream.LOGIT]
+        return streams[StreamID(StreamType.LOGIT)]
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +364,9 @@ def train_model(
 
             ks_str = _format_k_shifts(model)
             alpha_str = _format_alphas(model)
-            print(f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}{ks_str}{alpha_str}")
+            print(
+                f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}{ks_str}{alpha_str}"
+            )
 
     return model
 

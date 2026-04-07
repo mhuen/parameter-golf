@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from torch import Tensor, nn
 
+from multi_streams import StreamType, StreamID
 from multi_stream_attention import (
     CastedLinear,
     CausualMultiStreamAttentionViaMixing,
@@ -13,10 +14,14 @@ from multi_stream_attention import (
     MixingSource,
     MultiStreamConfig,
     RMSNorm,
-    Stream,
     StreamConfig,
     StreamMixingConfig,
 )
+
+LOGIT = StreamID(StreamType.LOGIT)
+CONTEXT = StreamID(StreamType.CONTEXT)
+TOKENS = StreamID(StreamType.TOKENS)
+STRUCTURAL = StreamID(StreamType.STRUCTURAL)
 
 
 class VanillaAttention(nn.Module):
@@ -54,7 +59,7 @@ class VanillaAttention(nn.Module):
         # Precompute split sizes for output
         self._split_sizes = [s.dim for s in stream_config.streams]
 
-    def forward(self, input_streams: dict[Stream, Tensor]) -> dict[Stream, Tensor]:
+    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
         x = torch.cat(
@@ -94,7 +99,7 @@ class VanillaAttention(nn.Module):
 
 def generate_structural_gated_copy(
     bsz: int, seqlen: int, stream_config: MultiStreamConfig, device: str = "cpu"
-) -> tuple[dict[Stream, torch.Tensor], torch.Tensor]:
+) -> tuple[dict[StreamID, torch.Tensor], torch.Tensor]:
     """Task 1: Structural-gated token retrieval.
 
     Target: for each position i, the logit output should be a projection of
@@ -104,15 +109,15 @@ def generate_structural_gated_copy(
     Requires: Q from structural, K from structural, V from tokens → logit.
     """
     dims = {s.name: s.dim for s in stream_config.streams}
-    struct_dim = dims[Stream.STRUCTURAL]
-    token_dim = dims[Stream.TOKENS]
-    logit_dim = dims[Stream.LOGIT]
+    struct_dim = dims[STRUCTURAL]
+    token_dim = dims[TOKENS]
+    logit_dim = dims[LOGIT]
 
     structural = F.normalize(
         torch.randn(bsz, seqlen, struct_dim, device=device), dim=-1
     )
     tokens = torch.randn(bsz, seqlen, token_dim, device=device)
-    context = torch.randn(bsz, seqlen, dims[Stream.CONTEXT], device=device) * 0.1
+    context = torch.randn(bsz, seqlen, dims[CONTEXT], device=device) * 0.1
     logit_in = torch.randn(bsz, seqlen, logit_dim, device=device) * 0.1
 
     scores = torch.bmm(structural, structural.transpose(1, 2))
@@ -124,17 +129,17 @@ def generate_structural_gated_copy(
     target = retrieved[..., :logit_dim]
 
     inputs = {
-        Stream.LOGIT: logit_in,
-        Stream.CONTEXT: context,
-        Stream.TOKENS: tokens,
-        Stream.STRUCTURAL: structural,
+        LOGIT: logit_in,
+        CONTEXT: context,
+        TOKENS: tokens,
+        STRUCTURAL: structural,
     }
     return inputs, target
 
 
 def generate_cross_stream_retrieval(
     bsz: int, seqlen: int, stream_config: MultiStreamConfig, device: str = "cpu"
-) -> tuple[dict[Stream, torch.Tensor], torch.Tensor]:
+) -> tuple[dict[StreamID, torch.Tensor], torch.Tensor]:
     """Task 2: Cross-stream content-addressed retrieval.
 
     The context stream contains "query keys". Target: for each position i,
@@ -144,13 +149,13 @@ def generate_cross_stream_retrieval(
     Requires: Q from context, K from context, V from tokens → logit.
     """
     dims = {s.name: s.dim for s in stream_config.streams}
-    ctx_dim = dims[Stream.CONTEXT]
-    token_dim = dims[Stream.TOKENS]
-    logit_dim = dims[Stream.LOGIT]
+    ctx_dim = dims[CONTEXT]
+    token_dim = dims[TOKENS]
+    logit_dim = dims[LOGIT]
 
     context = F.normalize(torch.randn(bsz, seqlen, ctx_dim, device=device), dim=-1)
     tokens = torch.randn(bsz, seqlen, token_dim, device=device)
-    structural = torch.randn(bsz, seqlen, dims[Stream.STRUCTURAL], device=device) * 0.1
+    structural = torch.randn(bsz, seqlen, dims[STRUCTURAL], device=device) * 0.1
     logit_in = torch.randn(bsz, seqlen, logit_dim, device=device) * 0.1
 
     scores = torch.bmm(context, context.transpose(1, 2))
@@ -162,10 +167,10 @@ def generate_cross_stream_retrieval(
     target = retrieved[..., :logit_dim]
 
     inputs = {
-        Stream.LOGIT: logit_in,
-        Stream.CONTEXT: context,
-        Stream.TOKENS: tokens,
-        Stream.STRUCTURAL: structural,
+        LOGIT: logit_in,
+        CONTEXT: context,
+        TOKENS: tokens,
+        STRUCTURAL: structural,
     }
     return inputs, target
 
@@ -189,7 +194,7 @@ def train_and_eval(
     for step in range(num_steps):
         inputs, target = task_fn(bsz, seqlen, stream_config, device)
         output = model(inputs)
-        loss = F.mse_loss(output[Stream.LOGIT], target)
+        loss = F.mse_loss(output[LOGIT], target)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -206,10 +211,10 @@ if __name__ == "__main__":
     stream_dim_structural = 24
     stream_config = MultiStreamConfig(
         streams=[
-            StreamConfig(Stream.LOGIT, stream_dim_logit),
-            StreamConfig(Stream.CONTEXT, stream_dim_context),
-            StreamConfig(Stream.TOKENS, stream_dim_tokens, read_only=True),
-            StreamConfig(Stream.STRUCTURAL, stream_dim_structural, read_only=True),
+            StreamConfig(LOGIT, stream_dim_logit),
+            StreamConfig(CONTEXT, stream_dim_context),
+            StreamConfig(TOKENS, stream_dim_tokens, read_only=True),
+            StreamConfig(STRUCTURAL, stream_dim_structural, read_only=True),
         ]
     )
 

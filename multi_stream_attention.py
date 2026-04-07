@@ -5,7 +5,7 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from modules import RMSNorm, CastedLinear, LearnableShift, make_linear
-from multi_streams import Stream, StreamConfig, MultiStreamConfig
+from multi_streams import StreamType, StreamID, StreamConfig, MultiStreamConfig
 
 
 class MixingMode(StrEnum):
@@ -72,7 +72,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         self.stream_config = stream_config
         self.mixing_config = mixing_config
         self.num_streams = len(stream_config.streams)
-        self._stream_lookup: dict[Stream, StreamConfig] = {
+        self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
         }
         _lkw = linear_kwargs or {}
@@ -80,7 +80,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         # --- Per-stream Q/K/V projections ---
         self.W_q = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     stream.dim,
                     self.num_heads * self.head_dim,
                     bias=False,
@@ -92,7 +92,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         )
         self.W_k = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     stream.dim,
                     self.num_kv_heads * self.head_dim,
                     bias=False,
@@ -104,7 +104,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         )
         self.W_v = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     stream.dim,
                     self.num_kv_heads * self.head_dim,
                     bias=False,
@@ -165,14 +165,14 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         # --- Output projection (gated write-back per writable stream) ---
         self.alpha_pre_sigmoid = nn.ParameterDict(
             {
-                stream.name: nn.Parameter(torch.full((stream.dim,), -2.0))
+                stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
                 for stream in self.stream_config.streams
                 if not stream.read_only
             }
         )
         self.W_o_value = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     self.num_heads * self.head_dim,
                     stream.dim,
                     bias=False,
@@ -185,7 +185,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         )
         self.W_o_gate = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     self.num_heads * self.head_dim,
                     stream.dim,
                     bias=False,
@@ -197,7 +197,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
             }
         )
 
-    def _compute_mix_logits(self, input_streams: dict[Stream, Tensor]) -> Tensor:
+    def _compute_mix_logits(self, input_streams: dict[StreamID, Tensor]) -> Tensor:
         """Compute raw mixing logits. Returns shape depends on source:
         - Static: [total_mix_logits]
         - Dynamic: [bsz, seqlen, total_mix_logits]
@@ -275,9 +275,9 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
 
     def forward(
         self,
-        input_streams: dict[Stream, Tensor],
+        input_streams: dict[StreamID, Tensor],
         skip_residual: bool = True,
-    ) -> dict[Stream, Tensor]:
+    ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
         # Validate input streams
@@ -297,9 +297,9 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         for stream in self.stream_config.streams:
             x = input_streams[stream.name]
 
-            q = self.W_q[stream.name](x)  # [bsz, seqlen, H * head_dim]
-            k = self.W_k[stream.name](x)  # [bsz, seqlen, H_kv * head_dim]
-            v = self.W_v[stream.name](x)  # [bsz, seqlen, H_kv * head_dim]
+            q = self.W_q[stream.key](x)  # [bsz, seqlen, H * head_dim]
+            k = self.W_k[stream.key](x)  # [bsz, seqlen, H_kv * head_dim]
+            v = self.W_v[stream.key](x)  # [bsz, seqlen, H_kv * head_dim]
 
             q_list.append(
                 q.view(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
@@ -359,20 +359,20 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
             bsz, seqlen, self.num_heads * self.head_dim
         )  # [bsz, seqlen, H * head_dim]
 
-        output_streams: dict[Stream, Tensor] = {}
+        output_streams: dict[StreamID, Tensor] = {}
         for stream in self.stream_config.streams:
             if stream.read_only:
                 output_streams[stream.name] = input_streams[stream.name]
                 continue
 
-            value = self.W_o_value[stream.name](attn_flat)
-            gate = torch.sigmoid(self.W_o_gate[stream.name](attn_flat))
+            value = self.W_o_value[stream.key](attn_flat)
+            gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
             if skip_residual:
                 output_streams[stream.name] = update
             else:
-                alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.name])
+                alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.key])
                 output_streams[stream.name] = (1 - alpha) * input_streams[
                     stream.name
                 ] + alpha * update
@@ -410,7 +410,7 @@ class CausualMultiStreamAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.stream_config = stream_config
-        self._stream_lookup: dict[Stream, StreamConfig] = {
+        self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
         }
         _lkw = linear_kwargs or {}
@@ -450,14 +450,14 @@ class CausualMultiStreamAttention(nn.Module):
 
         self.alpha_pre_sigmoid = nn.ParameterDict(
             {
-                stream.name: nn.Parameter(torch.full((stream.dim,), -2.0))
+                stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
                 for stream in stream_config.streams
                 if not stream.read_only
             }
         )
         self.W_o_value = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     num_heads * self.head_dim,
                     stream.dim,
                     bias=False,
@@ -470,7 +470,7 @@ class CausualMultiStreamAttention(nn.Module):
         )
         self.W_o_gate = nn.ModuleDict(
             {
-                stream.name: make_linear(
+                stream.key: make_linear(
                     num_heads * self.head_dim,
                     stream.dim,
                     bias=False,
@@ -484,9 +484,9 @@ class CausualMultiStreamAttention(nn.Module):
 
     def forward(
         self,
-        input_streams: dict[Stream, Tensor],
+        input_streams: dict[StreamID, Tensor],
         skip_residual: bool = True,
-    ) -> dict[Stream, Tensor]:
+    ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
         # Validate input streams
@@ -540,20 +540,20 @@ class CausualMultiStreamAttention(nn.Module):
         )
 
         # Gated write-back per writable stream
-        output_streams: dict[Stream, Tensor] = {}
+        output_streams: dict[StreamID, Tensor] = {}
         for stream in self.stream_config.streams:
             if stream.read_only:
                 output_streams[stream.name] = input_streams[stream.name]
                 continue
 
-            value = self.W_o_value[stream.name](attn_flat)
-            gate = torch.sigmoid(self.W_o_gate[stream.name](attn_flat))
+            value = self.W_o_value[stream.key](attn_flat)
+            gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
             if skip_residual:
                 output_streams[stream.name] = update
             else:
-                alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.name])
+                alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.key])
                 output_streams[stream.name] = (1 - alpha) * input_streams[
                     stream.name
                 ] + alpha * update
@@ -596,7 +596,7 @@ class MultiStreamMLP(nn.Module):
 
         self.proj_value = nn.ModuleDict(
             {
-                s.name: make_linear(
+                s.key: make_linear(
                     hidden_dim,
                     s.dim,
                     bias=False,
@@ -610,7 +610,7 @@ class MultiStreamMLP(nn.Module):
         if gated_output:
             self.proj_gate = nn.ModuleDict(
                 {
-                    s.name: make_linear(
+                    s.key: make_linear(
                         hidden_dim,
                         s.dim,
                         bias=False,
@@ -622,7 +622,7 @@ class MultiStreamMLP(nn.Module):
                 }
             )
 
-    def forward(self, input_streams: dict[Stream, Tensor]) -> dict[Stream, Tensor]:
+    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
         x = torch.cat(
             [input_streams[s.name] for s in self.stream_config.streams], dim=-1
@@ -630,16 +630,16 @@ class MultiStreamMLP(nn.Module):
         h = F.leaky_relu(self.fc_up(x), negative_slope=self.leaky_relu_slope)
         h = h.square()
 
-        output: dict[Stream, Tensor] = {}
+        output: dict[StreamID, Tensor] = {}
         for s in self.stream_config.streams:
             if s.read_only:
                 continue
             if self.gated_output:
-                value = self.proj_value[s.name](h)
-                gate = torch.sigmoid(self.proj_gate[s.name](h))
+                value = self.proj_value[s.key](h)
+                gate = torch.sigmoid(self.proj_gate[s.key](h))
                 output[s.name] = value * gate
             else:
-                output[s.name] = self.proj_value[s.name](h)
+                output[s.name] = self.proj_value[s.key](h)
         return output
 
 
@@ -673,10 +673,10 @@ class MultiStreamBlock(nn.Module):
 
         # Per-stream norms (weight-free RMSNorm)
         self.attn_norms = nn.ModuleDict(
-            {s.name: RMSNorm() for s in stream_config.streams}
+            {s.key: RMSNorm() for s in stream_config.streams}
         )
         self.mlp_norms = nn.ModuleDict(
-            {s.name: RMSNorm() for s in stream_config.streams}
+            {s.key: RMSNorm() for s in stream_config.streams}
         )
 
         # Attention
@@ -715,64 +715,63 @@ class MultiStreamBlock(nn.Module):
         # Init: α=-2 (σ≈0.12, small update), β=2 (σ≈0.88, mostly keep)
         self.attn_alpha = nn.ParameterDict(
             {
-                s.name: nn.Parameter(torch.full((s.dim,), -2.0))
+                s.key: nn.Parameter(torch.full((s.dim,), -2.0))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
         self.attn_beta = nn.ParameterDict(
             {
-                s.name: nn.Parameter(torch.full((s.dim,), 2.0))
+                s.key: nn.Parameter(torch.full((s.dim,), 2.0))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
         self.mlp_alpha = nn.ParameterDict(
             {
-                s.name: nn.Parameter(torch.full((s.dim,), -2.0))
+                s.key: nn.Parameter(torch.full((s.dim,), -2.0))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
         self.mlp_beta = nn.ParameterDict(
             {
-                s.name: nn.Parameter(torch.full((s.dim,), 2.0))
+                s.key: nn.Parameter(torch.full((s.dim,), 2.0))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
 
-    def forward(self, input_streams: dict[Stream, Tensor]) -> dict[Stream, Tensor]:
+    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         # --- Attention sub-layer ---
         normed = {
-            s.name: self.attn_norms[s.name](input_streams[s.name])
+            s.name: self.attn_norms[s.key](input_streams[s.name])
             for s in self.stream_config.streams
         }
         attn_out = self.attn(normed, skip_residual=True)
 
-        x: dict[Stream, Tensor] = {}
+        x: dict[StreamID, Tensor] = {}
         for s in self.stream_config.streams:
             if s.read_only:
                 x[s.name] = input_streams[s.name]
             else:
-                alpha = torch.sigmoid(self.attn_alpha[s.name])
-                beta = torch.sigmoid(self.attn_beta[s.name])
+                alpha = torch.sigmoid(self.attn_alpha[s.key])
+                beta = torch.sigmoid(self.attn_beta[s.key])
                 x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
 
         # --- MLP sub-layer ---
         normed = {
-            s.name: self.mlp_norms[s.name](x[s.name])
-            for s in self.stream_config.streams
+            s.name: self.mlp_norms[s.key](x[s.name]) for s in self.stream_config.streams
         }
         mlp_out = self.mlp(normed)
 
-        output: dict[Stream, Tensor] = {}
+        output: dict[StreamID, Tensor] = {}
         for s in self.stream_config.streams:
             if s.read_only:
                 output[s.name] = x[s.name]
             else:
-                alpha = torch.sigmoid(self.mlp_alpha[s.name])
-                beta = torch.sigmoid(self.mlp_beta[s.name])
+                alpha = torch.sigmoid(self.mlp_alpha[s.key])
+                beta = torch.sigmoid(self.mlp_beta[s.key])
                 output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
 
         return output
@@ -782,10 +781,10 @@ if __name__ == "__main__":
     # Quick shape & backward sanity check
     stream_config = MultiStreamConfig(
         streams=[
-            StreamConfig(Stream.LOGIT, 32),
-            StreamConfig(Stream.CONTEXT, 48),
-            StreamConfig(Stream.TOKENS, 48, read_only=True),
-            StreamConfig(Stream.STRUCTURAL, 24, read_only=True),
+            StreamConfig(StreamID(StreamType.LOGIT), 32),
+            StreamConfig(StreamID(StreamType.CONTEXT), 48),
+            StreamConfig(StreamID(StreamType.TOKENS), 48, read_only=True),
+            StreamConfig(StreamID(StreamType.STRUCTURAL), 24, read_only=True),
         ]
     )
     bsz, seqlen = 2, 16

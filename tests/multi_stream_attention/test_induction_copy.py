@@ -31,7 +31,8 @@ from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import ByteHashComponent, BoundaryComponent, HashBoundary
 from modules import RMSNorm, LearnableShift
 from multi_streams import (
-    Stream,
+    StreamType,
+    StreamID,
     StreamDef,
     MultiStreamBuilder,
     SinCosPositionComponent,
@@ -141,9 +142,9 @@ def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
     """Create the stream builder used by both model variants."""
     return MultiStreamBuilder(
         stream_defs=[
-            StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
+            StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
             StreamDef(
-                name=Stream.STRUCTURAL,
+                name=StreamID(StreamType.STRUCTURAL),
                 read_only=True,
                 components=[
                     # SinCosPositionComponent(num_freqs=4),  # 8d
@@ -222,7 +223,7 @@ class MultiStreamCopyModel(nn.Module):
         logit_stream = F.one_hot(input_ids, self.vocab_size).float()
         streams = self.builder(input_ids, logit=logit_stream)
         out = self.attn(streams)
-        return out[Stream.LOGIT]
+        return out[StreamID(StreamType.LOGIT)]
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +245,7 @@ class StandardAttentionCopyModel(nn.Module):
         self.builder = make_stream_builder(tok)
 
         structural_dim = next(
-            s.dim for s in self.builder.config.streams if s.name == Stream.STRUCTURAL
+            s.dim for s in self.builder.config.streams if s.name == StreamID(StreamType.STRUCTURAL)
         )
         input_dim = tok.vocab_size + structural_dim
         self.W_q = nn.Linear(input_dim, head_dim, bias=False)
@@ -263,7 +264,7 @@ class StandardAttentionCopyModel(nn.Module):
         B, S = input_ids.shape
         onehot = F.one_hot(input_ids, self.vocab_size).float()
         streams = self.builder(input_ids, logit=onehot)
-        structural = streams[Stream.STRUCTURAL]
+        structural = streams[StreamID(StreamType.STRUCTURAL)]
         x = torch.cat([onehot, structural], dim=-1)  # (B, S, input_dim)
 
         q = self.q_norm(self.W_q(x)).unsqueeze(1)  # (B, 1, S, D)

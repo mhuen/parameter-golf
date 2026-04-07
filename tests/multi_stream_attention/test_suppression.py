@@ -33,7 +33,7 @@ from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import ByteHashComponent, HashBoundary
-from multi_streams import Stream, StreamDef
+from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
@@ -173,11 +173,11 @@ def make_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Te
 def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     """Stream defs including a writable context stream for accumulating state."""
     return [
-        StreamDef(name=Stream.LOGIT, dim=tok.vocab_size),
-        StreamDef(name=Stream.CONTEXT, dim=48, auto_zeros=True),
-        StreamDef(name=Stream.TOKENS, read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
+        StreamDef(name=StreamID(StreamType.CONTEXT), dim=48, auto_zeros=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
         StreamDef(
-            name=Stream.STRUCTURAL,
+            name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
             components=[
                 ByteHashComponent(
