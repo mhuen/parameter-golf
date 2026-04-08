@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from enum import StrEnum
 from dataclasses import dataclass
 
-from modules import RMSNorm, CastedLinear, LearnableShift, make_linear
+from modules import RMSNorm, CastedLinear, GatedCausalConv, LearnableShift, make_linear
 from multi_streams import (
     StreamType,
     StreamID,
@@ -652,6 +652,188 @@ class MultiStreamMLP(nn.Module):
         return output
 
 
+class MultiStreamCausalConv(nn.Module):
+    """Causal conv that reads all streams but only writes to writable streams.
+
+    Shared convolution on concatenated streams, then per-stream gated output
+    projections.  Follows the same interface as ``MultiStreamMLP``.
+    """
+
+    def __init__(
+        self,
+        stream_config: MultiStreamConfig,
+        kernel_size: int = 4,
+        conv_groups: int = 0,
+        gated_conv: bool = True,
+        gated_output: bool = True,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
+    ):
+        super().__init__()
+        self.stream_config = stream_config
+        self.gated_output = gated_output
+        _lkw = linear_kwargs or {}
+
+        sum_stream_dims = sum(s.dim for s in stream_config.streams)
+        self.conv = GatedCausalConv(
+            dim=sum_stream_dims,
+            kernel_size=kernel_size,
+            groups=conv_groups,
+            gated=gated_conv,
+        )
+
+        self.proj_value = nn.ModuleDict(
+            {
+                s.key: make_linear(
+                    sum_stream_dims,
+                    s.dim,
+                    bias=False,
+                    mode=linear_mode,
+                    **_lkw,
+                )
+                for s in stream_config.streams
+                if not s.read_only
+            }
+        )
+        if gated_output:
+            self.proj_gate = nn.ModuleDict(
+                {
+                    s.key: make_linear(
+                        sum_stream_dims,
+                        s.dim,
+                        bias=False,
+                        mode=linear_mode,
+                        **_lkw,
+                    )
+                    for s in stream_config.streams
+                    if not s.read_only
+                }
+            )
+
+        # Zero-init output projections for clean residual at start
+        for s in stream_config.streams:
+            if not s.read_only:
+                self.proj_value[s.key]._zero_init = True
+
+    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
+        """Returns update deltas for writable streams only."""
+        x = torch.cat(
+            [input_streams[s.name] for s in self.stream_config.streams], dim=-1
+        )
+        h = self.conv(x)
+
+        output: dict[StreamID, Tensor] = {}
+        for s in self.stream_config.streams:
+            if s.read_only:
+                continue
+            if self.gated_output:
+                value = self.proj_value[s.key](h)
+                gate = torch.sigmoid(self.proj_gate[s.key](h))
+                output[s.name] = value * gate
+            else:
+                output[s.name] = self.proj_value[s.key](h)
+        return output
+
+
+class MultiStreamCausalConvLayers(nn.Module):
+    """Stack of ``MultiStreamCausalConv`` layers with per-stream norms and residuals.
+
+    Each layer: pre-norm all streams → conv → σ(β)*x + σ(α)*update for writable
+    streams.  Read-only streams pass through unchanged.
+
+    Intended as a pre-processing stage to fill initial information into writable
+    streams before the attention blocks.
+    """
+
+    def __init__(
+        self,
+        stream_config: MultiStreamConfig,
+        num_layers: int,
+        kernel_size: int | list[int] = 4,
+        conv_groups: int = 0,
+        gated_conv: bool = True,
+        gated_output: bool = True,
+        linear_mode: str = "dense",
+        linear_kwargs: dict | None = None,
+    ):
+        super().__init__()
+        self.stream_config = stream_config
+        self.num_layers = num_layers
+
+        if isinstance(kernel_size, int):
+            kernel_sizes = [kernel_size] * num_layers
+        else:
+            if len(kernel_size) != num_layers:
+                raise ValueError(
+                    f"kernel_size list length ({len(kernel_size)}) must match "
+                    f"num_layers ({num_layers})"
+                )
+            kernel_sizes = kernel_size
+
+        self.norms = nn.ModuleList(
+            [
+                nn.ModuleDict({s.key: RMSNorm() for s in stream_config.streams})
+                for _ in range(num_layers)
+            ]
+        )
+        self.convs = nn.ModuleList(
+            [
+                MultiStreamCausalConv(
+                    stream_config=stream_config,
+                    kernel_size=ks,
+                    conv_groups=conv_groups,
+                    gated_conv=gated_conv,
+                    gated_output=gated_output,
+                    linear_mode=linear_mode,
+                    linear_kwargs=linear_kwargs,
+                )
+                for ks in kernel_sizes
+            ]
+        )
+        self.alphas = nn.ModuleList(
+            [
+                nn.ParameterDict(
+                    {
+                        s.key: nn.Parameter(torch.full((s.dim,), -2.0))
+                        for s in stream_config.streams
+                        if not s.read_only
+                    }
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.betas = nn.ModuleList(
+            [
+                nn.ParameterDict(
+                    {
+                        s.key: nn.Parameter(torch.full((s.dim,), 2.0))
+                        for s in stream_config.streams
+                        if not s.read_only
+                    }
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self, input_streams: dict[StreamID, Tensor]
+    ) -> dict[StreamID, Tensor]:
+        x = dict(input_streams)
+        for layer_idx in range(self.num_layers):
+            norms = self.norms[layer_idx]
+            normed = {
+                s.name: norms[s.key](x[s.name]) for s in self.stream_config.streams
+            }
+            conv_out = self.convs[layer_idx](normed)
+            for s in self.stream_config.streams:
+                if s.read_only:
+                    continue
+                alpha = torch.sigmoid(self.alphas[layer_idx][s.key])
+                beta = torch.sigmoid(self.betas[layer_idx][s.key])
+                x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
+        return x
+
+
 class CausalArithmeticMultiStreamAttention(nn.Module):
     """Attention-based arithmetic module operating on compressed number streams.
 
@@ -993,6 +1175,9 @@ class MultiStreamBlock(nn.Module):
     (β≈1), interpolating (α+β≈1), or full-replacement (α≈1, β≈0) behavior per
     dimension per stream.
 
+    Optional ``conv``: if set, a MultiStreamCausalConv is applied between
+    attention and MLP (before arith_attn if present).
+
     Optional ``arith_attn``: if set, a CausalArithmeticMultiStreamAttention
     module is applied between attention and MLP using compressed number streams.
     """
@@ -1011,6 +1196,7 @@ class MultiStreamBlock(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         k_shift: bool = True,
+        conv: MultiStreamCausalConv | None = None,
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
     ):
         super().__init__()
@@ -1087,6 +1273,27 @@ class MultiStreamBlock(nn.Module):
             }
         )
 
+        # Optional causal conv (between attention and MLP, before arith_attn)
+        self.conv = conv
+        if conv is not None:
+            self.conv_norms = nn.ModuleDict(
+                {s.key: RMSNorm() for s in stream_config.streams}
+            )
+            self.conv_alpha = nn.ParameterDict(
+                {
+                    s.key: nn.Parameter(torch.full((s.dim,), -2.0))
+                    for s in stream_config.streams
+                    if not s.read_only
+                }
+            )
+            self.conv_beta = nn.ParameterDict(
+                {
+                    s.key: nn.Parameter(torch.full((s.dim,), 2.0))
+                    for s in stream_config.streams
+                    if not s.read_only
+                }
+            )
+
         # Optional arithmetic attention (between attention and MLP)
         self.arith_attn = arith_attn
         if arith_attn is not None:
@@ -1126,6 +1333,19 @@ class MultiStreamBlock(nn.Module):
                 alpha = torch.sigmoid(self.attn_alpha[s.key])
                 beta = torch.sigmoid(self.attn_beta[s.key])
                 x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
+
+        # --- Optional causal conv (between attention and MLP) ---
+        if self.conv is not None:
+            normed = {
+                s.name: self.conv_norms[s.key](x[s.name])
+                for s in self.stream_config.streams
+            }
+            conv_out = self.conv(normed)
+            for s in self.stream_config.streams:
+                if not s.read_only:
+                    alpha = torch.sigmoid(self.conv_alpha[s.key])
+                    beta = torch.sigmoid(self.conv_beta[s.key])
+                    x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
 
         # --- Optional arithmetic attention (between attention and MLP) ---
         if self.arith_attn is not None and compressed is not None and views is not None:
@@ -1210,6 +1430,59 @@ if __name__ == "__main__":
         n = sum(p.numel() for p in mlp.parameters())
         print(f"  gated={str(gated):5s}: OK  ({n:,} params)")
 
+    # --- Conv tests ---
+    print(f"\n{'=' * 70}")
+    print("MultiStreamCausalConv tests")
+    print("=" * 70)
+
+    for gated_conv in [True, False]:
+        for gated_out in [True, False]:
+            conv = MultiStreamCausalConv(
+                stream_config=stream_config,
+                kernel_size=4,
+                gated_conv=gated_conv,
+                gated_output=gated_out,
+            )
+            inp = {
+                s.name: torch.randn(bsz, seqlen, s.dim)
+                for s in stream_config.streams
+            }
+            out = conv(inp)
+            assert set(out.keys()) == {
+                s.name for s in stream_config.streams if not s.read_only
+            }
+            loss = sum(v.sum() for v in out.values())
+            loss.backward()
+            n = sum(p.numel() for p in conv.parameters())
+            tag = f"gated_conv={gated_conv}/gated_out={gated_out}"
+            print(f"  {tag:40s}: OK  ({n:,} params)")
+
+    # --- ConvLayers tests ---
+    print(f"\n{'=' * 70}")
+    print("MultiStreamCausalConvLayers tests")
+    print("=" * 70)
+
+    for num_layers, ks in [(1, 4), (3, 4), (3, [2, 4, 8])]:
+        layers = MultiStreamCausalConvLayers(
+            stream_config=stream_config,
+            num_layers=num_layers,
+            kernel_size=ks,
+        )
+        inp = {
+            s.name: torch.randn(bsz, seqlen, s.dim)
+            for s in stream_config.streams
+        }
+        out = layers(inp)
+        assert set(out.keys()) == {s.name for s in stream_config.streams}
+        for s in stream_config.streams:
+            if s.read_only:
+                assert torch.equal(out[s.name], inp[s.name])
+        loss = sum(v.sum() for v in out.values() if v.requires_grad)
+        loss.backward()
+        n = sum(p.numel() for p in layers.parameters())
+        tag = f"layers={num_layers}/ks={ks}"
+        print(f"  {tag:40s}: OK  ({n:,} params)")
+
     # --- Block tests ---
     print(f"\n{'=' * 70}")
     print("MultiStreamBlock tests")
@@ -1248,6 +1521,24 @@ if __name__ == "__main__":
             n = sum(p.numel() for p in block.parameters())
             tag = f"{label}/gated_mlp={gated_mlp}"
             print(f"  {tag:40s}: OK  ({n:,} params)")
+
+    # Test block with conv
+    conv_mod = MultiStreamCausalConv(stream_config=stream_config, kernel_size=4)
+    block = MultiStreamBlock(
+        **kwargs,
+        mlp_hidden_dim=320,
+        conv=conv_mod,
+    )
+    inp = {s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams}
+    out = block(inp)
+    assert set(out.keys()) == {s.name for s in stream_config.streams}
+    for s in stream_config.streams:
+        if s.read_only:
+            assert torch.equal(out[s.name], inp[s.name])
+    loss = sum(v.sum() for v in out.values() if v.requires_grad)
+    loss.backward()
+    n = sum(p.numel() for p in block.parameters())
+    print(f"  {'standard/conv=True':40s}: OK  ({n:,} params)")
 
     # Test k_shift integration
     for label, mix_cfg in [
