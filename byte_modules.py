@@ -393,17 +393,23 @@ class UTF8Prior(nn.Module):
         return cat_mask, token_mask
 
 
-class StructuredOutputHead(nn.Module):
-    """Hierarchical softmax output head based on ByteCategory tree.
+class ByteLogitHierarchy(nn.Module):
+    """Zero-parameter module defining the byte-category tree structure.
 
-    Decomposes token log-probability as a sum of log-normalized levels:
-      log p(token) = log p(category) + sum(log fraction_sub_i) + log fraction_leaf
+    Holds level_indices, level_masks, margin matrices, and provides
+    :meth:`assemble` to convert per-level logits into flat ``(B, S, V)``
+    log-probs.
+
+    The hierarchy decomposes token log-probability as a sum of
+    log-normalized levels::
+
+        log p(token) = log p(category) + sum(log fraction_sub_i) + log fraction_leaf
 
     Each level is independently log-softmax normalized.  Softcap is applied
     only to leaf-level logits.
     """
 
-    def __init__(self, model_dim, vocab_size, tok, logit_softcap):
+    def __init__(self, vocab_size: int, tok, logit_softcap: float):
         super().__init__()
         self.logit_softcap = logit_softcap
         self.vocab_size = vocab_size
@@ -435,10 +441,10 @@ class StructuredOutputHead(nn.Module):
         mb_lead3_ids = _ids(ByteCategory.MB_LEAD_3)
         mb_lead4_ids = _ids(ByteCategory.MB_LEAD_4)
 
-        # ---- Build levels (heads + index/mask buffers) ----
-        heads = []
-        all_indices = []
-        all_masks = []
+        # ---- Build levels (index/mask buffers) ----
+        all_indices: list[Tensor] = []
+        all_masks: list[Tensor] = []
+        level_sizes: list[int] = []
         self._is_leaf: list[bool] = []
 
         def _add_level(head_size, token_to_idx, active_tids, leaf):
@@ -448,9 +454,7 @@ class StructuredOutputHead(nn.Module):
                 idx[tid] = j
             for tid in active_tids:
                 mask[tid] = 1.0
-            head = CastedLinear(model_dim, head_size, bias=False)
-            head._zero_init = True
-            heads.append(head)
+            level_sizes.append(head_size)
             all_indices.append(idx)
             all_masks.append(mask)
             self._is_leaf.append(leaf)
@@ -547,7 +551,7 @@ class StructuredOutputHead(nn.Module):
         duplicates = {tid: cnt for tid, cnt in leaf_counts.items() if cnt > 1}
         if duplicates:
             raise ValueError(
-                f"StructuredOutputHead: tokens appear in multiple leaves: {duplicates}"
+                f"ByteLogitHierarchy: tokens appear in multiple leaves: {duplicates}"
             )
         leaf_set = set(leaf_token_ids)
         expected = set(range(vocab_size))
@@ -555,13 +559,13 @@ class StructuredOutputHead(nn.Module):
         extra = leaf_set - expected
         if missing or extra:
             raise ValueError(
-                f"StructuredOutputHead leaf coverage error: "
+                f"ByteLogitHierarchy leaf coverage error: "
                 f"missing token IDs {sorted(missing)}, "
                 f"extra token IDs {sorted(extra)}"
             )
 
         # ---- Store as module attributes ----
-        self.heads = nn.ModuleList(heads)
+        self._level_sizes = level_sizes
         self.register_buffer(
             "level_indices", torch.stack(all_indices)
         )  # (num_levels, V)
@@ -570,34 +574,51 @@ class StructuredOutputHead(nn.Module):
         # ---- Precompute n-gram marginalization matrices (static) ----
         # margin_i: (V, H_i) maps token probs → level-output probs via matmul.
         # margin_i[t, j] = 1.0 iff token t is active at level i and maps to output j.
-        for i, head in enumerate(heads):
-            H = head.out_features
-            margin = torch.zeros(vocab_size, H)
+        for i, hs in enumerate(level_sizes):
+            margin = torch.zeros(vocab_size, hs)
             margin.scatter_(1, all_indices[i].unsqueeze(1), all_masks[i].unsqueeze(1))
             self.register_buffer(f"margin_{i}", margin)
 
-    def forward(self, x, cat_prior=None, token_prior=None, ngram_logp=None):
-        """Return (B, S, V) log-probabilities assembled from the hierarchy.
+    @property
+    def num_levels(self) -> int:
+        return len(self._level_sizes)
+
+    @property
+    def level_sizes(self) -> list[int]:
+        return list(self._level_sizes)
+
+    @property
+    def total_slots(self) -> int:
+        return sum(self._level_sizes)
+
+    def assemble(
+        self,
+        per_level_logits: list[Tensor],
+        cat_prior: Tensor | None = None,
+        token_prior: Tensor | None = None,
+        ngram_logp: Tensor | None = None,
+    ) -> Tensor:
+        """Convert per-level logits into flat ``(B, S, V)`` log-probs.
 
         Args:
-            x: (B, S, D) hidden states.
-            cat_prior: (B, S, num_categories) additive mask for level-0 logits.
-            token_prior: (B, S, V) additive mask for final log-probs (e.g. UTF-8).
-            ngram_logp: (B, S, V) token-level n-gram log-probs.  Marginalized into
-                per-level conditional priors and added to each head's logits before
-                log_softmax.
+            per_level_logits: list of ``(B, S, H_i)`` tensors, one per level.
+            cat_prior: ``(B, S, num_categories)`` additive bias for level-0 logits.
+            token_prior: ``(B, S, V)`` additive mask for final log-probs (e.g. UTF-8).
+            ngram_logp: ``(B, S, V)`` token-level n-gram log-probs.  Marginalized
+                into per-level conditional priors and added to each level's logits
+                before log_softmax.
         """
-        B, S, _ = x.shape
-        log_p = torch.zeros(B, S, self.vocab_size, device=x.device, dtype=x.dtype)
-        # Precompute n-gram probs once for all levels (float32 for log/exp precision)
+        first = per_level_logits[0]
+        B, S = first.shape[0], first.shape[1]
+        log_p = torch.zeros(
+            B, S, self.vocab_size, device=first.device, dtype=first.dtype
+        )
         ngram_probs = ngram_logp.float().exp() if ngram_logp is not None else None
-        for i, head in enumerate(self.heads):
-            logits = head(x)
+        for i, logits in enumerate(per_level_logits):
             if i == 0 and cat_prior is not None:
                 logits = logits + cat_prior
             if self._is_leaf[i]:
                 logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
-            # Per-level n-gram prior: marginalize token probs → level conditional
             if ngram_probs is not None:
                 margin = getattr(self, f"margin_{i}")  # (V, H_i)
                 level_probs = ngram_probs @ margin  # (B, S, H_i)
@@ -608,9 +629,73 @@ class StructuredOutputHead(nn.Module):
             log_p = log_p + lp[..., self.level_indices[i]] * self.level_masks[i]
         if token_prior is not None:
             log_p = log_p + token_prior
-            # Renormalize: nll_loss expects valid log-probs summing to 1
             log_p = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
         return log_p
+
+
+class StructuredLogitsAdapter(nn.Module):
+    """Converts flat structured logits ``(B, S, total_slots)`` into flat
+    token log-probs ``(B, S, V)`` by splitting into per-level chunks and
+    assembling via :class:`ByteLogitHierarchy`.
+
+    Use this to wrap any module that predicts in hierarchical space so its
+    output can be written to the flat logit stream.
+    """
+
+    def __init__(self, hierarchy: ByteLogitHierarchy):
+        super().__init__()
+        self.hierarchy = hierarchy
+
+    def forward(
+        self,
+        flat_logits: Tensor,
+        cat_prior: Tensor | None = None,
+        token_prior: Tensor | None = None,
+        ngram_logp: Tensor | None = None,
+    ) -> Tensor:
+        chunks = flat_logits.split(self.hierarchy.level_sizes, dim=-1)
+        return self.hierarchy.assemble(
+            list(chunks),
+            cat_prior=cat_prior,
+            token_prior=token_prior,
+            ngram_logp=ngram_logp,
+        )
+
+
+class StructuredOutputHead(nn.Module):
+    """Hierarchical softmax output head based on ByteCategory tree.
+
+    Projects hidden states through per-level linear heads, then assembles
+    via :class:`StructuredLogitsAdapter` into flat ``(B, S, V)`` log-probs.
+
+    Decomposes token log-probability as a sum of log-normalized levels::
+
+        log p(token) = log p(category) + sum(log fraction_sub_i) + log fraction_leaf
+    """
+
+    def __init__(self, model_dim, vocab_size, tok, logit_softcap):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hierarchy = ByteLogitHierarchy(vocab_size, tok, logit_softcap)
+        self.adapter = StructuredLogitsAdapter(self.hierarchy)
+        heads = []
+        for size in self.hierarchy.level_sizes:
+            head = CastedLinear(model_dim, size, bias=False)
+            head._zero_init = True
+            heads.append(head)
+        self.heads = nn.ModuleList(heads)
+
+    def forward(self, x, cat_prior=None, token_prior=None, ngram_logp=None):
+        """Return ``(B, S, V)`` log-probabilities assembled from the hierarchy.
+
+        Args:
+            x: ``(B, S, D)`` hidden states.
+            cat_prior: ``(B, S, num_categories)`` additive mask for level-0 logits.
+            token_prior: ``(B, S, V)`` additive mask for final log-probs (e.g. UTF-8).
+            ngram_logp: ``(B, S, V)`` token-level n-gram log-probs.
+        """
+        flat = torch.cat([head(x) for head in self.heads], dim=-1)
+        return self.adapter(flat, cat_prior=cat_prior, token_prior=token_prior, ngram_logp=ngram_logp)
 
 
 # ------------------

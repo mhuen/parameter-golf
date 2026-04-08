@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import StructuredOutputHead
+from byte_modules import ByteLogitHierarchy, StructuredLogitsAdapter, StructuredOutputHead
 
 tok = EfficientByteTokenizer()
 V = tok.vocab_size
@@ -140,10 +140,11 @@ def test_leaf_masks_partition_vocab():
     the leaf mask sum.  All other tokens should appear in exactly one leaf.
     """
     head = _make_head()
+    hier = head.hierarchy
     leaf_mask_sum = torch.zeros(V)
-    for i, is_leaf in enumerate(head._is_leaf):
+    for i, is_leaf in enumerate(hier._is_leaf):
         if is_leaf:
-            leaf_mask_sum += head.level_masks[i]
+            leaf_mask_sum += hier.level_masks[i]
     # Each entry should be 0 (singleton) or 1 (covered by exactly one leaf)
     assert ((leaf_mask_sum == 0) | (leaf_mask_sum == 1)).all()
     # Non-singleton tokens should cover the vast majority of the vocab
@@ -153,22 +154,24 @@ def test_leaf_masks_partition_vocab():
 @torch.no_grad()
 def test_leaf_masks_disjoint():
     head = _make_head()
-    leaf_indices = [i for i, lf in enumerate(head._is_leaf) if lf]
+    hier = head.hierarchy
+    leaf_indices = [i for i, lf in enumerate(hier._is_leaf) if lf]
     for a_idx in range(len(leaf_indices)):
         for b_idx in range(a_idx + 1, len(leaf_indices)):
             i = leaf_indices[a_idx]
             j = leaf_indices[b_idx]
-            overlap = (head.level_masks[i] * head.level_masks[j]).sum()
+            overlap = (hier.level_masks[i] * hier.level_masks[j]).sum()
             assert overlap == 0, f"Leaf levels {i} and {j} overlap"
 
 
 @torch.no_grad()
 def test_level_indices_within_head_size():
     head = _make_head()
+    hier = head.hierarchy
     for i, h in enumerate(head.heads):
-        mask = head.level_masks[i]
+        mask = hier.level_masks[i]
         active = mask > 0
-        indices = head.level_indices[i][active]
+        indices = hier.level_indices[i][active]
         assert indices.min() >= 0, f"Level {i}: negative index"
         assert indices.max() < h.out_features, (
             f"Level {i}: index {indices.max()} >= head size {h.out_features}"
@@ -183,10 +186,11 @@ def test_level_indices_within_head_size():
 @torch.no_grad()
 def test_margin_rows_sum_to_mask():
     head = _make_head()
+    hier = head.hierarchy
     for i in range(len(head.heads)):
-        margin = getattr(head, f"margin_{i}")
+        margin = getattr(hier, f"margin_{i}")
         row_sums = margin.sum(dim=1)
-        assert torch.allclose(row_sums, head.level_masks[i]), (
+        assert torch.allclose(row_sums, hier.level_masks[i]), (
             f"Level {i}: margin row sums != level mask"
         )
 
@@ -194,8 +198,9 @@ def test_margin_rows_sum_to_mask():
 @torch.no_grad()
 def test_margin_is_binary():
     head = _make_head()
+    hier = head.hierarchy
     for i in range(len(head.heads)):
-        margin = getattr(head, f"margin_{i}")
+        margin = getattr(hier, f"margin_{i}")
         assert ((margin == 0.0) | (margin == 1.0)).all(), (
             f"Level {i}: margin contains non-binary values"
         )
@@ -204,13 +209,14 @@ def test_margin_is_binary():
 @torch.no_grad()
 def test_ngram_marginalization_preserves_total():
     head = _make_head()
+    hier = head.hierarchy
     # Uniform ngram probs: 1/V for every token
     ngram_probs = torch.full((1, 1, V), 1.0 / V)
     for i in range(len(head.heads)):
-        margin = getattr(head, f"margin_{i}")
+        margin = getattr(hier, f"margin_{i}")
         level_probs = ngram_probs @ margin  # (1, 1, H_i)
         total = level_probs.sum(dim=-1)
-        expected = head.level_masks[i].sum() / V
+        expected = hier.level_masks[i].sum() / V
         assert torch.allclose(total, expected.unsqueeze(0).unsqueeze(0), atol=1e-6), (
             f"Level {i}: marginalized total {total.item():.6f} != expected {expected:.6f}"
         )
@@ -273,3 +279,79 @@ def test_output_shape():
     x = torch.randn(B, S, MODEL_DIM)
     log_p = head(x)
     assert log_p.shape == (B, S, V), f"Expected ({B}, {S}, {V}), got {log_p.shape}"
+
+
+# --------------------------------------------------------------------------
+# ByteLogitHierarchy tests
+# --------------------------------------------------------------------------
+
+
+def _make_hierarchy():
+    return ByteLogitHierarchy(vocab_size=V, tok=tok, logit_softcap=LOGIT_SOFTCAP)
+
+
+@torch.no_grad()
+def test_hierarchy_level_sizes():
+    hier = _make_hierarchy()
+    assert hier.num_levels > 0
+    assert len(hier.level_sizes) == hier.num_levels
+    assert hier.total_slots == sum(hier.level_sizes)
+
+
+@torch.no_grad()
+def test_hierarchy_assemble_sums_to_one():
+    hier = _make_hierarchy()
+    B, S = 2, 5
+    per_level = [torch.randn(B, S, size) for size in hier.level_sizes]
+    log_p = hier.assemble(per_level)
+    assert log_p.shape == (B, S, V)
+    sums = log_p.exp().sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+@torch.no_grad()
+def test_hierarchy_assemble_with_priors():
+    hier = _make_hierarchy()
+    B, S = 2, 5
+    per_level = [torch.randn(B, S, size) for size in hier.level_sizes]
+    cat_prior = torch.randn(B, S, hier.level_sizes[0])
+    token_prior = torch.zeros(B, S, V)
+    token_prior[..., :50] = float("-inf")
+    ngram_logp = F.log_softmax(torch.randn(B, S, V), dim=-1)
+    log_p = hier.assemble(per_level, cat_prior=cat_prior, token_prior=token_prior, ngram_logp=ngram_logp)
+    sums = log_p.exp().sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# StructuredLogitsAdapter tests
+# --------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_adapter_shape_and_normalization():
+    hier = _make_hierarchy()
+    adapter = StructuredLogitsAdapter(hier)
+    B, S = 2, 5
+    flat = torch.randn(B, S, hier.total_slots)
+    log_p = adapter(flat)
+    assert log_p.shape == (B, S, V)
+    sums = log_p.exp().sum(dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+
+@torch.no_grad()
+def test_adapter_matches_head():
+    """StructuredOutputHead and StructuredLogitsAdapter produce identical output
+    when given the same per-level logits."""
+    head = _make_head()
+    hier = head.hierarchy
+    adapter = head.adapter
+    B, S = 2, 5
+    x = torch.randn(B, S, MODEL_DIM)
+    # Get the flat logits that the head would produce
+    flat = torch.cat([h(x) for h in head.heads], dim=-1)
+    # Compare adapter output to head output
+    log_p_adapter = adapter(flat)
+    log_p_head = head(x)
+    assert torch.allclose(log_p_adapter, log_p_head, atol=1e-6)
