@@ -244,7 +244,9 @@ class MultiStreamBuilder(nn.Module):
         for sd in self._defs:
             dim = self._resolve_dim(sd)
             stream_configs.append(
-                StreamConfig(sd.name, dim=dim, read_only=sd.read_only, normalize=sd.normalize)
+                StreamConfig(
+                    sd.name, dim=dim, read_only=sd.read_only, normalize=sd.normalize
+                )
             )
             if sd.components is not None:
                 composites[str(sd.name)] = CompositeStream(sd.components)

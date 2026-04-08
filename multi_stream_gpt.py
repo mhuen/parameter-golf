@@ -152,10 +152,23 @@ def build_multi_stream_components(
     structural_id = StreamID(StreamType.STRUCTURAL)
 
     stream_defs = [
-        StreamDef(logit_id, read_only=False, normalize=False, dim=vocab_size, auto_zeros=True),
+        StreamDef(
+            logit_id, read_only=False, normalize=False, dim=vocab_size, auto_zeros=True
+        ),
         StreamDef(tokens_id, read_only=True, normalize=False, auto_onehot=True),
-        StreamDef(context_id, read_only=False, normalize=True, dim=context_dim, auto_zeros=True),
-        StreamDef(structural_id, read_only=True, normalize=False, components=structural_components),
+        StreamDef(
+            context_id,
+            read_only=False,
+            normalize=True,
+            dim=context_dim,
+            auto_zeros=True,
+        ),
+        StreamDef(
+            structural_id,
+            read_only=True,
+            normalize=False,
+            components=structural_components,
+        ),
     ]
 
     # -- Compression (numbers) --
