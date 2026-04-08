@@ -18,26 +18,38 @@ Levels 2-3 require compositional reasoning (two binary ops). These are
 expected to challenge single-layer models and may need multiple layers.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import random
 import string
 import torch
-from torch import Tensor
+from torch import Stream, Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import (
     ByteHashComponent,
+    BoundaryComponent,
     HashBoundary,
     DigitSequenceComponent,
     NumberExtractor,
+    ByteCategoryComponent,
+    MultiByteStateComponent,
+    CaseComponent,
+    VowelConsonantComponent,
+    ColumnPositionComponent,
+    RepeatedByteComponent,
+    PunctuationDepthComponent,
+    ByteCategoryStatsComponent,
+    DigitComputeComponent,
 )
 from multi_streams import (
     StreamType,
     StreamID,
     StreamDef,
+    DocBoundaryComponent,
     SinCosPositionComponent,
     MultiStreamBuilder,
     CompressionType,
@@ -197,26 +209,57 @@ def make_batch_mixed(tok, bs):
 # Stream definitions
 # ---------------------------------------------------------------------------
 
-STRUCTURAL_ID = StreamID(StreamType.STRUCTURAL)
-TOKENS_ID = StreamID(StreamType.TOKENS)
 
-
-def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
+def make_stream_defs(
+    tok: EfficientByteTokenizer, context_dim: int = 32
+) -> list[StreamDef]:
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
         StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.CONTEXT), dim=context_dim, auto_zeros=True),
         StreamDef(
-            name=STRUCTURAL_ID,
+            name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
             components=[
-                SinCosPositionComponent(num_freqs=32),
+                DocBoundaryComponent(bos_id=tok.bos_id),
+                SinCosPositionComponent(num_freqs=10),
+                ByteCategoryComponent(tok=tok),
+                MultiByteStateComponent(tok=tok, id_freqs=3),
+                CaseComponent(tok=tok),
+                VowelConsonantComponent(tok=tok),
+                ColumnPositionComponent(tok=tok),
+                RepeatedByteComponent(),
+                PunctuationDepthComponent(tok=tok),
+                ByteCategoryStatsComponent(tok=tok),
                 DigitSequenceComponent(tok=tok, id_freqs=5),
+                DigitComputeComponent(tok=tok),
                 ByteHashComponent(
                     tok,
-                    window=6,
+                    window=20,
                     num_hashes=2,
                     boundary=HashBoundary.WORD,
                     track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok, window=2, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=3, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=5, num_hashes=2, boundary=None, track_hits=True
+                ),
+                ByteHashComponent(
+                    tok, window=8, num_hashes=2, boundary=None, track_hits=True
+                ),
+                BoundaryComponent(
+                    tok,
+                    word_pos_freqs=2,
+                    word_id_freqs=2,
+                    sent_pos_freqs=2,
+                    sent_id_freqs=2,
+                    para_pos_freqs=2,
+                    para_id_freqs=2,
                 ),
             ],
         ),
@@ -228,13 +271,13 @@ def build_arith_model(
     num_layers: int = 1,
     num_heads: int = 2,
     head_dim: int = 16,
-    mlp_hidden_dim: int = 32,
+    mlp_hidden_dim: int = 16,
     n_max: int = 16,
     d_head: int = 16,
 ) -> MultiStreamTestModel:
     """Build a MultiStreamTestModel with CausalArithmeticMultiStreamAttention."""
     stream_defs = make_stream_defs(tok)
-    compress_ids = [STRUCTURAL_ID, TOKENS_ID]
+    compress_ids = [stream.name for stream in stream_defs]
     extractor = NumberExtractor(tok, n_max=n_max)
     _cfg = MultiStreamBuilder(stream_defs, vocab_size=tok.vocab_size).config
     arith_attn = CausalArithmeticMultiStreamAttention(
@@ -267,9 +310,9 @@ if __name__ == "__main__":
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}")
     print(f"Task: variable-based arithmetic (vals 1..{MAX_VAL})")
-    print(f"  L1: single op, 3-6 vars    e.g. 'a=42 b=7 c=15 ; a + c = '")
-    print(f"  L2: two chained ops         e.g. 'a=12 b=7 c=3 ; a + b - c = '")
-    print(f"  L3: nested ops              e.g. 'a=5 b=3 c=2 ; c * (a + b) = '")
+    print("  L1: single op, 3-6 vars    e.g. 'a=42 b=7 c=15 ; a + c = '")
+    print("  L2: two chained ops         e.g. 'a=12 b=7 c=3 ; a + b - c = '")
+    print("  L3: nested ops              e.g. 'a=5 b=3 c=2 ; c * (a + b) = '")
     print()
 
     # Show a few samples
@@ -317,10 +360,10 @@ if __name__ == "__main__":
     # models.append(("MS + ArithAttn (1L)", build_arith_model(tok, num_layers=1)))
 
     # # 4. MS + ArithAttn (2 layers)
-    # models.append(("MS + ArithAttn (2L)", build_arith_model(tok, num_layers=2)))
+    models.append(("MS + ArithAttn (2L)", build_arith_model(tok, num_layers=2)))
 
     # 5. MS + ArithAttn (3 layers) — for compositional tasks
-    models.append(("MS + ArithAttn (3L)", build_arith_model(tok, num_layers=3)))
+    # models.append(("MS + ArithAttn (3L)", build_arith_model(tok, num_layers=3)))
 
     # --- Print param counts ---
     print("=" * 70)

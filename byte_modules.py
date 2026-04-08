@@ -613,6 +613,198 @@ class StructuredOutputHead(nn.Module):
         return log_p
 
 
+# ------------------
+# Stream Compressors
+# ------------------
+
+
+class NumberExtractor(nn.Module):
+    """Extracts detected numbers from the token stream into a CompressedView.
+
+    Zero learnable parameters. Detects numbers as:
+    1. Digit runs: contiguous ASCII digits (0-9), optionally with a single
+       decimal point, assembled into floats.
+    2. Number words: lowercased letter runs matched against a dictionary
+       (zero..twenty by default).
+
+    Returns a ``CompressedView`` with:
+    - ``positions``: (B, N_max) position of the last token of each number
+    - ``mask``: (B, N_max) valid entries
+    - ``metadata["values"]``: (B, N_max) scalar value of each number
+    - ``metadata["lengths"]``: (B, N_max) token count per number
+    - ``metadata["active_len"]``: (B, S) current digit run length at each position
+    """
+
+    _MAX_INPUT_DIGITS = 15  # float64 significant digits
+
+    def __init__(
+        self,
+        tok: EfficientByteTokenizer,
+        n_max: int = 32,
+        number_words: dict[str, int] | None = None,
+    ):
+        super().__init__()
+        self.n_max = n_max
+        self._number_words = number_words if number_words is not None else _NUMBER_WORDS
+
+        V = tok.vocab_size
+        digit_value = torch.full((V,), -1, dtype=torch.long)
+        lowercase_byte = torch.zeros(V, dtype=torch.long)
+        is_decimal = torch.zeros(V, dtype=torch.bool)
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info is None:
+                continue
+            if info.has(ByteCategory.DIGIT):
+                digit_value[tid] = info.byte_value - 0x30
+            if info.has(ByteCategory.LETTER):
+                lb = info.lowercase_byte
+                lowercase_byte[tid] = lb if lb is not None else info.byte_value
+            if info.byte_value == 0x2E:
+                is_decimal[tid] = True
+        self.register_buffer("digit_value", digit_value)
+        self.register_buffer("lowercase_byte", lowercase_byte)
+        self.register_buffer("is_decimal", is_decimal)
+
+    def _try_word_number(self, word_bytes: list[int]) -> int | None:
+        word = bytes(word_bytes).decode("ascii", errors="replace")
+        return self._number_words.get(word)
+
+    def forward(self, input_ids: Tensor) -> CompressedView:
+        B, S = input_ids.shape
+        device = input_ids.device
+        n_max = self.n_max
+        max_input_digits = self._MAX_INPUT_DIGITS
+
+        dv = self.digit_value[input_ids]  # (B, S)
+        lb = self.lowercase_byte[input_ids]  # (B, S)
+        is_dec = self.is_decimal[input_ids]  # (B, S)
+
+        # Output tensors
+        positions = torch.zeros(B, n_max, dtype=torch.long, device=device)
+        mask = torch.zeros(B, n_max, dtype=torch.bool, device=device)
+        values = torch.zeros(B, n_max, dtype=torch.float32, device=device)
+        lengths = torch.zeros(B, n_max, dtype=torch.long, device=device)
+        active_len_out = torch.zeros(B, S, dtype=torch.long, device=device)
+
+        for b in range(B):
+            num_idx = 0  # next slot in output
+            # Digit run state
+            digit_num = 0.0
+            digit_len = 0
+            digit_has_dot = False
+            digit_frac_mul = 0.0
+            in_digit_run = False
+            digit_start = 0
+            # Word run state
+            word_bytes: list[int] = []
+            in_word_run = False
+            word_start = 0
+            # Active number run (for next-digit encoding)
+            active_len = 0
+            active_has_dot = False
+
+            def _push_number(val: float, start: int, end: int) -> None:
+                nonlocal num_idx
+                if num_idx >= n_max:
+                    return
+                values[b, num_idx] = val
+                positions[b, num_idx] = end
+                lengths[b, num_idx] = end - start + 1
+                mask[b, num_idx] = True
+                num_idx += 1
+
+            for t in range(S):
+                d = dv[b, t].item()
+                l = lb[b, t].item()
+                is_dot = is_dec[b, t].item()
+
+                dot_continues_run = is_dot and in_digit_run and not digit_has_dot
+
+                # --- Finish any run that ended ---
+                # Numbers are positioned at t (the boundary token), not t-1
+                # (the last digit). This ensures strict causality: the number
+                # only appears in the compressed view when the boundary is
+                # visible, matching what happens in truncated sequences.
+                if d >= 0:
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            _push_number(float(val), word_start, t)
+                        in_word_run = False
+                        word_bytes = []
+                elif dot_continues_run:
+                    pass
+                elif l > 0:
+                    if in_digit_run:
+                        _push_number(digit_num, digit_start, t)
+                        in_digit_run = False
+                else:
+                    if in_digit_run:
+                        _push_number(digit_num, digit_start, t)
+                        in_digit_run = False
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            _push_number(float(val), word_start, t)
+                        in_word_run = False
+                        word_bytes = []
+
+                # --- Extend or start current run ---
+                if d >= 0:
+                    if not in_digit_run:
+                        digit_num = 0.0
+                        digit_len = 0
+                        digit_has_dot = False
+                        digit_frac_mul = 0.0
+                        in_digit_run = True
+                        digit_start = t
+                    if digit_len < max_input_digits:
+                        if digit_has_dot:
+                            digit_num += d * digit_frac_mul
+                            digit_frac_mul *= 0.1
+                        else:
+                            digit_num = digit_num * 10 + d
+                    digit_len += 1
+                elif dot_continues_run:
+                    digit_has_dot = True
+                    digit_frac_mul = 0.1
+                    digit_len += 1
+                elif l > 0:
+                    if not in_word_run:
+                        word_bytes = []
+                        in_word_run = True
+                        word_start = t
+                    word_bytes.append(l)
+
+                # --- Track active digit/decimal run ---
+                if d >= 0:
+                    active_len += 1
+                elif is_dot and not active_has_dot:
+                    active_len += 1
+                    active_has_dot = True
+                else:
+                    active_len = 0
+                    active_has_dot = False
+                active_len_out[b, t] = active_len
+
+            # NOTE: we intentionally do NOT flush in-progress digit/word runs
+            # at end-of-sequence. Only numbers terminated by a boundary token
+            # (non-digit after digits, non-letter after letters) are emitted.
+            # This ensures strict causality: the compressed view at position t
+            # is identical regardless of what tokens follow after t.
+
+        return CompressedView(
+            positions=positions,
+            mask=mask,
+            metadata={
+                "values": values,
+                "lengths": lengths,
+                "active_len": active_len_out,
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Stream components (byte-tokenizer-specific, composable with CompositeStream)
 # ---------------------------------------------------------------------------
@@ -1440,193 +1632,6 @@ _PAIRWISE_ARITH_OPS = frozenset(
     }
 )
 _PAIRWISE_CMP_OPS = frozenset({PairwiseOp.GT, PairwiseOp.EQ, PairwiseOp.LT})
-
-
-class NumberExtractor(nn.Module):
-    """Extracts detected numbers from the token stream into a CompressedView.
-
-    Zero learnable parameters. Detects numbers as:
-    1. Digit runs: contiguous ASCII digits (0-9), optionally with a single
-       decimal point, assembled into floats.
-    2. Number words: lowercased letter runs matched against a dictionary
-       (zero..twenty by default).
-
-    Returns a ``CompressedView`` with:
-    - ``positions``: (B, N_max) position of the last token of each number
-    - ``mask``: (B, N_max) valid entries
-    - ``metadata["values"]``: (B, N_max) scalar value of each number
-    - ``metadata["lengths"]``: (B, N_max) token count per number
-    - ``metadata["active_len"]``: (B, S) current digit run length at each position
-    """
-
-    _MAX_INPUT_DIGITS = 15  # float64 significant digits
-
-    def __init__(
-        self,
-        tok: EfficientByteTokenizer,
-        n_max: int = 32,
-        number_words: dict[str, int] | None = None,
-    ):
-        super().__init__()
-        self.n_max = n_max
-        self._number_words = number_words if number_words is not None else _NUMBER_WORDS
-
-        V = tok.vocab_size
-        digit_value = torch.full((V,), -1, dtype=torch.long)
-        lowercase_byte = torch.zeros(V, dtype=torch.long)
-        is_decimal = torch.zeros(V, dtype=torch.bool)
-        for tid in range(V):
-            info = tok.token_info(tid)
-            if info is None:
-                continue
-            if info.has(ByteCategory.DIGIT):
-                digit_value[tid] = info.byte_value - 0x30
-            if info.has(ByteCategory.LETTER):
-                lb = info.lowercase_byte
-                lowercase_byte[tid] = lb if lb is not None else info.byte_value
-            if info.byte_value == 0x2E:
-                is_decimal[tid] = True
-        self.register_buffer("digit_value", digit_value)
-        self.register_buffer("lowercase_byte", lowercase_byte)
-        self.register_buffer("is_decimal", is_decimal)
-
-    def _try_word_number(self, word_bytes: list[int]) -> int | None:
-        word = bytes(word_bytes).decode("ascii", errors="replace")
-        return self._number_words.get(word)
-
-    def forward(self, input_ids: Tensor) -> CompressedView:
-        B, S = input_ids.shape
-        device = input_ids.device
-        n_max = self.n_max
-        max_input_digits = self._MAX_INPUT_DIGITS
-
-        dv = self.digit_value[input_ids]  # (B, S)
-        lb = self.lowercase_byte[input_ids]  # (B, S)
-        is_dec = self.is_decimal[input_ids]  # (B, S)
-
-        # Output tensors
-        positions = torch.zeros(B, n_max, dtype=torch.long, device=device)
-        mask = torch.zeros(B, n_max, dtype=torch.bool, device=device)
-        values = torch.zeros(B, n_max, dtype=torch.float32, device=device)
-        lengths = torch.zeros(B, n_max, dtype=torch.long, device=device)
-        active_len_out = torch.zeros(B, S, dtype=torch.long, device=device)
-
-        for b in range(B):
-            num_idx = 0  # next slot in output
-            # Digit run state
-            digit_num = 0.0
-            digit_len = 0
-            digit_has_dot = False
-            digit_frac_mul = 0.0
-            in_digit_run = False
-            digit_start = 0
-            # Word run state
-            word_bytes: list[int] = []
-            in_word_run = False
-            word_start = 0
-            # Active number run (for next-digit encoding)
-            active_len = 0
-            active_has_dot = False
-
-            def _push_number(val: float, start: int, end: int) -> None:
-                nonlocal num_idx
-                if num_idx >= n_max:
-                    return
-                values[b, num_idx] = val
-                positions[b, num_idx] = end
-                lengths[b, num_idx] = end - start + 1
-                mask[b, num_idx] = True
-                num_idx += 1
-
-            for t in range(S):
-                d = dv[b, t].item()
-                l = lb[b, t].item()
-                is_dot = is_dec[b, t].item()
-
-                dot_continues_run = is_dot and in_digit_run and not digit_has_dot
-
-                # --- Finish any run that ended ---
-                # Numbers are positioned at t (the boundary token), not t-1
-                # (the last digit). This ensures strict causality: the number
-                # only appears in the compressed view when the boundary is
-                # visible, matching what happens in truncated sequences.
-                if d >= 0:
-                    if in_word_run:
-                        val = self._try_word_number(word_bytes)
-                        if val is not None:
-                            _push_number(float(val), word_start, t)
-                        in_word_run = False
-                        word_bytes = []
-                elif dot_continues_run:
-                    pass
-                elif l > 0:
-                    if in_digit_run:
-                        _push_number(digit_num, digit_start, t)
-                        in_digit_run = False
-                else:
-                    if in_digit_run:
-                        _push_number(digit_num, digit_start, t)
-                        in_digit_run = False
-                    if in_word_run:
-                        val = self._try_word_number(word_bytes)
-                        if val is not None:
-                            _push_number(float(val), word_start, t)
-                        in_word_run = False
-                        word_bytes = []
-
-                # --- Extend or start current run ---
-                if d >= 0:
-                    if not in_digit_run:
-                        digit_num = 0.0
-                        digit_len = 0
-                        digit_has_dot = False
-                        digit_frac_mul = 0.0
-                        in_digit_run = True
-                        digit_start = t
-                    if digit_len < max_input_digits:
-                        if digit_has_dot:
-                            digit_num += d * digit_frac_mul
-                            digit_frac_mul *= 0.1
-                        else:
-                            digit_num = digit_num * 10 + d
-                    digit_len += 1
-                elif dot_continues_run:
-                    digit_has_dot = True
-                    digit_frac_mul = 0.1
-                    digit_len += 1
-                elif l > 0:
-                    if not in_word_run:
-                        word_bytes = []
-                        in_word_run = True
-                        word_start = t
-                    word_bytes.append(l)
-
-                # --- Track active digit/decimal run ---
-                if d >= 0:
-                    active_len += 1
-                elif is_dot and not active_has_dot:
-                    active_len += 1
-                    active_has_dot = True
-                else:
-                    active_len = 0
-                    active_has_dot = False
-                active_len_out[b, t] = active_len
-
-            # NOTE: we intentionally do NOT flush in-progress digit/word runs
-            # at end-of-sequence. Only numbers terminated by a boundary token
-            # (non-digit after digits, non-letter after letters) are emitted.
-            # This ensures strict causality: the compressed view at position t
-            # is identical regardless of what tokens follow after t.
-
-        return CompressedView(
-            positions=positions,
-            mask=mask,
-            metadata={
-                "values": values,
-                "lengths": lengths,
-                "active_len": active_len_out,
-            },
-        )
 
 
 class DigitComputeComponent(nn.Module):

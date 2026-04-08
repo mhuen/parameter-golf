@@ -183,6 +183,9 @@ class MultiStreamTestModel(nn.Module):
             compressions=compressions,
             compress_streams=compress_streams,
         )
+        print("Stream definitions:")
+        for stream in self.builder.config.streams:
+            print(f"  {stream.name}: dim={stream.dim}")
 
         if num_kv_heads is None:
             num_kv_heads = num_heads

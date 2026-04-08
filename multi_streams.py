@@ -351,8 +351,8 @@ class MultiStreamBuilder(nn.Module):
                 idx = view.positions.clamp(0, S - 1).unsqueeze(-1)  # (B, N, 1)
                 idx = idx.expand(-1, -1, full.shape[-1])  # (B, N, d)
                 gathered = full.gather(1, idx)  # (B, N, d)
-                compressed[comp_type][stream_id] = (
-                    gathered * view.mask.unsqueeze(-1).to(dtype=gathered.dtype)
-                )
+                compressed[comp_type][stream_id] = gathered * view.mask.unsqueeze(
+                    -1
+                ).to(dtype=gathered.dtype)
 
         return streams, compressed, views
