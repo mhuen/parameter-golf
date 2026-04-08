@@ -16,6 +16,7 @@ from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import (
     ByteLogitHierarchy,
     StructuredLogitsAdapter,
+    StructuredLogitsScatter,
     StructuredOutputHead,
 )
 
@@ -363,3 +364,96 @@ def test_adapter_matches_head():
     log_p_adapter = adapter(flat)
     log_p_head = head(x)
     assert torch.allclose(log_p_adapter, log_p_head, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# assemble_logits tests
+# --------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_assemble_logits_shape():
+    hier = _make_hierarchy()
+    B, S = 2, 5
+    per_level = [torch.randn(B, S, hs) for hs in hier.level_sizes]
+    flat = hier.assemble_logits(per_level)
+    assert flat.shape == (B, S, V)
+
+
+@torch.no_grad()
+def test_assemble_logits_scatter_correctness():
+    """Each token's flat logit should equal the sum of its per-level slot logits."""
+    hier = _make_hierarchy()
+    B, S = 1, 1
+    per_level = [torch.randn(B, S, hs) for hs in hier.level_sizes]
+    flat = hier.assemble_logits(per_level)
+
+    # Manually compute expected value for each token
+    for t in range(V):
+        expected = 0.0
+        for i, logits in enumerate(per_level):
+            mask_val = hier.level_masks[i, t].item()
+            if mask_val > 0:
+                idx = hier.level_indices[i, t].item()
+                level_logit = logits[0, 0, idx].item()
+                if hier._is_leaf[i]:
+                    level_logit = LOGIT_SOFTCAP * math.tanh(level_logit / LOGIT_SOFTCAP)
+                expected += level_logit
+        assert abs(flat[0, 0, t].item() - expected) < 1e-5, (
+            f"Token {t}: got {flat[0, 0, t].item()}, expected {expected}"
+        )
+
+
+@torch.no_grad()
+def test_assemble_logits_zero_input():
+    """All-zero per-level logits should produce all-zero flat logits."""
+    hier = _make_hierarchy()
+    B, S = 2, 5
+    per_level = [torch.zeros(B, S, hs) for hs in hier.level_sizes]
+    flat = hier.assemble_logits(per_level)
+    assert torch.allclose(flat, torch.zeros_like(flat))
+
+
+@torch.no_grad()
+def test_assemble_logits_with_cat_prior():
+    hier = _make_hierarchy()
+    B, S = 2, 5
+    per_level = [torch.randn(B, S, hs) for hs in hier.level_sizes]
+    cat_prior = torch.randn(B, S, hier.level_sizes[0])
+    flat_no_prior = hier.assemble_logits(per_level)
+    flat_with_prior = hier.assemble_logits(per_level, cat_prior=cat_prior)
+    # The difference should only be in the category contribution
+    assert not torch.allclose(flat_no_prior, flat_with_prior)
+    assert flat_with_prior.shape == (B, S, V)
+
+
+def test_assemble_logits_gradient_flow():
+    """Gradients should flow through assemble_logits."""
+    hier = _make_hierarchy()
+    B, S = 1, 3
+    per_level = [torch.randn(B, S, hs, requires_grad=True) for hs in hier.level_sizes]
+    flat = hier.assemble_logits(per_level)
+    loss = flat.sum()
+    loss.backward()
+    for i, logits in enumerate(per_level):
+        assert logits.grad is not None, f"No gradient for level {i}"
+        assert logits.grad.abs().sum() > 0, f"Zero gradient for level {i}"
+
+
+# --------------------------------------------------------------------------
+# StructuredLogitsScatter tests
+# --------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_scatter_shape_and_matches_assemble_logits():
+    hier = _make_hierarchy()
+    scatter = StructuredLogitsScatter(hier)
+    B, S = 2, 5
+    flat_slots = torch.randn(B, S, hier.total_slots)
+    result = scatter(flat_slots)
+    assert result.shape == (B, S, V)
+    # Should match calling assemble_logits directly
+    chunks = flat_slots.split(hier.level_sizes, dim=-1)
+    expected = hier.assemble_logits(list(chunks))
+    assert torch.allclose(result, expected)

@@ -29,6 +29,7 @@ from multi_streams import (
     CompressionType,
     CompressedView,
 )
+from byte_modules import ByteLogitHierarchy
 from multi_stream_attention import (
     CausalMultiStreamAttention,
     CausalArithmeticMultiStreamAttention,
@@ -173,6 +174,7 @@ class MultiStreamTestModel(nn.Module):
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
         compressions: dict | None = None,
         compress_streams: list[StreamID] | None = None,
+        logit_hierarchy: ByteLogitHierarchy | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -206,6 +208,7 @@ class MultiStreamTestModel(nn.Module):
                         mlp_hidden_dim=mlp_hidden_dim,
                         k_shift=k_shift,
                         arith_attn=arith_attn,
+                        logit_hierarchy=logit_hierarchy,
                     )
                     for _ in range(num_layers)
                 ]

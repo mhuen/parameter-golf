@@ -22,7 +22,7 @@ import torch
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import NumberExtractor
+from byte_modules import NumberExtractor, ByteLogitHierarchy
 from byte_stream_components import (
     ByteHashComponent,
     HashBoundary,
@@ -333,7 +333,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--pack", action="store_true",
+        "--pack",
+        action="store_true",
         help="Pack 2 documents per sequence (each prefixed with BOS)",
     )
     args = parser.parse_args()
@@ -345,6 +346,10 @@ if __name__ == "__main__":
 
     # --- Build models ---
     models: list[tuple[str, torch.nn.Module]] = []
+    logit_hierarchy = ByteLogitHierarchy(
+        vocab_size=tok.vocab_size, tok=tok, logit_softcap=30.0
+    )
+    # logit_hierarchy = None  # comment in to disable logit hierarchy and use flat logits instead
 
     # 1. TinyGPT baseline
     gpt_model = TinyGPT(
@@ -365,6 +370,7 @@ if __name__ == "__main__":
         num_layers=1,
         use_block=True,
         mlp_hidden_dim=16,
+        logit_hierarchy=logit_hierarchy,  # comment in to use logit hierarchy
     )
     models.append(("MS basic (no digit)", ms_basic))
 
@@ -377,6 +383,7 @@ if __name__ == "__main__":
         num_layers=1,
         use_block=True,
         mlp_hidden_dim=16,
+        logit_hierarchy=logit_hierarchy,  # comment in to use logit hierarchy
     )
     models.append(("MS + DigitCompute", ms_digit))
 
@@ -408,6 +415,7 @@ if __name__ == "__main__":
         arith_attn=arith_attn,
         compressions={CompressionType.NUMBER: extractor},
         compress_streams=compress_ids,
+        logit_hierarchy=logit_hierarchy,  # comment in to use logit hierarchy
     )
     models.append(("MS + ArithAttn", ms_arith))
 
@@ -428,7 +436,12 @@ if __name__ == "__main__":
 
     # --- Training ---
     train_kwargs = dict(
-        tok=tok, steps=2000, batch_size=64, lr=3e-2, eval_every=500, device=device,
+        tok=tok,
+        steps=2000,
+        batch_size=64,
+        lr=3e-2,
+        eval_every=500,
+        device=device,
         pack_documents=args.pack,
     )
 
@@ -442,11 +455,15 @@ if __name__ == "__main__":
         print("=" * 60)
 
         if args.pack:
+
             def eval_fn(m, d):
                 return evaluate_packed(m, make_batch, tok, n_samples=200, device=d)
         else:
+
             def eval_fn(m, d):
-                return evaluate_autoregressive(m, make_sample, tok, n_samples=200, device=d)
+                return evaluate_autoregressive(
+                    m, make_sample, tok, n_samples=200, device=d
+                )
 
         if "Oracle" in name:
             train_kwargs_copy = train_kwargs.copy()
@@ -461,7 +478,11 @@ if __name__ == "__main__":
         print(f"\n  Single-doc accuracy: {overall_acc:.1%}")
         if args.pack:
             packed_acc = evaluate_packed(
-                model, make_batch, tok, n_samples=500, device=device,
+                model,
+                make_batch,
+                tok,
+                n_samples=500,
+                device=device,
             )
             print(f"  Packed accuracy:     {packed_acc:.1%}")
         results[name] = overall_acc

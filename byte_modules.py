@@ -621,6 +621,51 @@ class ByteLogitHierarchy(nn.Module):
             log_p = log_p - torch.logsumexp(log_p, dim=-1, keepdim=True)
         return log_p
 
+    def assemble_logits(
+        self,
+        per_level_logits: list[Tensor],
+        cat_prior: Tensor | None = None,
+    ) -> Tensor:
+        """Scatter per-level logits to flat token logits (unnormalized).
+
+        Like :meth:`assemble` but without per-level ``log_softmax``.  Returns
+        raw logits suitable for residual accumulation; normalization is left to
+        the caller (e.g. ``cross_entropy`` at loss time).
+
+        Supports ``cat_prior`` and ``logit_softcap`` (which operate on raw
+        logits) but not ``ngram_logp`` / ``token_prior`` (which require
+        normalized log-probs).
+        """
+        first = per_level_logits[0]
+        B, S = first.shape[0], first.shape[1]
+        flat = torch.zeros(
+            B, S, self.vocab_size, device=first.device, dtype=first.dtype
+        )
+        for i, logits in enumerate(per_level_logits):
+            if i == 0 and cat_prior is not None:
+                logits = logits + cat_prior
+            if self._is_leaf[i]:
+                logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+            flat = flat + logits[..., self.level_indices[i]] * self.level_masks[i]
+        return flat
+
+
+class StructuredLogitsScatter(nn.Module):
+    """Converts flat structured logits ``(B, S, total_slots)`` into flat
+    token logits ``(B, S, V)`` via unnormalized scatter-add.
+
+    Unlike :class:`StructuredLogitsAdapter`, no ``log_softmax`` is applied —
+    output is raw logits, not log-probabilities.
+    """
+
+    def __init__(self, hierarchy: ByteLogitHierarchy):
+        super().__init__()
+        self.hierarchy = hierarchy
+
+    def forward(self, flat_logits: Tensor) -> Tensor:
+        chunks = flat_logits.split(self.hierarchy.level_sizes, dim=-1)
+        return self.hierarchy.assemble_logits(list(chunks))
+
 
 class StructuredLogitsAdapter(nn.Module):
     """Converts flat structured logits ``(B, S, total_slots)`` into flat

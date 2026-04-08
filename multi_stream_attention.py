@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from enum import StrEnum
 from dataclasses import dataclass
 
+from byte_modules import ByteLogitHierarchy
 from modules import RMSNorm, CastedLinear, GatedCausalConv, LearnableShift, make_linear
 from multi_streams import (
     StreamType,
@@ -66,6 +67,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         k_shift: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        skip_residual: bool = True,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -77,6 +79,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         self.head_dim = multi_head_dim // num_heads
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.skip_residual = skip_residual
 
         self.stream_config = stream_config
         self.mixing_config = mixing_config
@@ -172,13 +175,14 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         )
 
         # --- Output projection (gated write-back per writable stream) ---
-        self.alpha_pre_sigmoid = nn.ParameterDict(
-            {
-                stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
-                for stream in self.stream_config.streams
-                if not stream.read_only
-            }
-        )
+        if not skip_residual:
+            self.alpha_pre_sigmoid = nn.ParameterDict(
+                {
+                    stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
+                    for stream in self.stream_config.streams
+                    if not stream.read_only
+                }
+            )
         self.W_o_value = nn.ModuleDict(
             {
                 stream.key: make_linear(
@@ -285,7 +289,6 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
     def forward(
         self,
         input_streams: dict[StreamID, Tensor],
-        skip_residual: bool = True,
     ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
@@ -378,7 +381,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
-            if skip_residual:
+            if self.skip_residual:
                 output_streams[stream.name] = update
             else:
                 alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.key])
@@ -407,6 +410,7 @@ class CausalMultiStreamAttention(nn.Module):
         k_shift: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        skip_residual: bool = True,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -418,6 +422,7 @@ class CausalMultiStreamAttention(nn.Module):
         self.head_dim = multi_head_dim // num_heads
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.skip_residual = skip_residual
         self.stream_config = stream_config
         self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
@@ -457,13 +462,14 @@ class CausalMultiStreamAttention(nn.Module):
             LearnableShift(num_channels=num_kv_heads) if k_shift else None
         )
 
-        self.alpha_pre_sigmoid = nn.ParameterDict(
-            {
-                stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
-                for stream in stream_config.streams
-                if not stream.read_only
-            }
-        )
+        if not skip_residual:
+            self.alpha_pre_sigmoid = nn.ParameterDict(
+                {
+                    stream.key: nn.Parameter(torch.full((stream.dim,), -2.0))
+                    for stream in stream_config.streams
+                    if not stream.read_only
+                }
+            )
         self.W_o_value = nn.ModuleDict(
             {
                 stream.key: make_linear(
@@ -494,7 +500,6 @@ class CausalMultiStreamAttention(nn.Module):
     def forward(
         self,
         input_streams: dict[StreamID, Tensor],
-        skip_residual: bool = True,
     ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
@@ -559,7 +564,7 @@ class CausalMultiStreamAttention(nn.Module):
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
-            if skip_residual:
+            if self.skip_residual:
                 output_streams[stream.name] = update
             else:
                 alpha = torch.sigmoid(self.alpha_pre_sigmoid[stream.key])
@@ -587,12 +592,22 @@ class MultiStreamMLP(nn.Module):
         leaky_relu_slope: float = 0.5,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        logit_hierarchy: ByteLogitHierarchy | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
         self.leaky_relu_slope = leaky_relu_slope
+        self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
+
+        # Identify the logit stream ID (if hierarchy is active)
+        self._logit_sid: StreamID | None = None
+        if logit_hierarchy is not None:
+            for s in stream_config.streams:
+                if s.name.type == StreamType.LOGIT and not s.read_only:
+                    self._logit_sid = s.name
+                    break
 
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
         self.fc_up = make_linear(
@@ -607,7 +622,7 @@ class MultiStreamMLP(nn.Module):
             {
                 s.key: make_linear(
                     hidden_dim,
-                    s.dim,
+                    self._proj_dim(s),
                     bias=False,
                     mode=linear_mode,
                     **_lkw,
@@ -621,7 +636,7 @@ class MultiStreamMLP(nn.Module):
                 {
                     s.key: make_linear(
                         hidden_dim,
-                        s.dim,
+                        self._proj_dim(s),
                         bias=False,
                         mode=linear_mode,
                         **_lkw,
@@ -630,6 +645,12 @@ class MultiStreamMLP(nn.Module):
                     if not s.read_only
                 }
             )
+
+    def _proj_dim(self, s: StreamConfig) -> int:
+        """Output projection dim: total_slots for the logit stream when hierarchy is active."""
+        if self._logit_hierarchy is not None and s.name == self._logit_sid:
+            return self._logit_hierarchy.total_slots
+        return s.dim
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
@@ -646,9 +667,13 @@ class MultiStreamMLP(nn.Module):
             if self.gated_output:
                 value = self.proj_value[s.key](h)
                 gate = torch.sigmoid(self.proj_gate[s.key](h))
-                output[s.name] = value * gate
+                value = value * gate
             else:
-                output[s.name] = self.proj_value[s.key](h)
+                value = self.proj_value[s.key](h)
+            if self._logit_hierarchy is not None and s.name == self._logit_sid:
+                chunks = value.split(self._logit_hierarchy.level_sizes, dim=-1)
+                value = self._logit_hierarchy.assemble_logits(list(chunks))
+            output[s.name] = value
         return output
 
 
@@ -668,11 +693,21 @@ class MultiStreamCausalConv(nn.Module):
         gated_output: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        logit_hierarchy: ByteLogitHierarchy | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
+        self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
+
+        # Identify the logit stream ID (if hierarchy is active)
+        self._logit_sid: StreamID | None = None
+        if logit_hierarchy is not None:
+            for s in stream_config.streams:
+                if s.name.type == StreamType.LOGIT and not s.read_only:
+                    self._logit_sid = s.name
+                    break
 
         sum_stream_dims = sum(s.dim for s in stream_config.streams)
         self.conv = GatedCausalConv(
@@ -686,7 +721,7 @@ class MultiStreamCausalConv(nn.Module):
             {
                 s.key: make_linear(
                     sum_stream_dims,
-                    s.dim,
+                    self._proj_dim(s),
                     bias=False,
                     mode=linear_mode,
                     **_lkw,
@@ -700,7 +735,7 @@ class MultiStreamCausalConv(nn.Module):
                 {
                     s.key: make_linear(
                         sum_stream_dims,
-                        s.dim,
+                        self._proj_dim(s),
                         bias=False,
                         mode=linear_mode,
                         **_lkw,
@@ -714,6 +749,12 @@ class MultiStreamCausalConv(nn.Module):
         for s in stream_config.streams:
             if not s.read_only:
                 self.proj_value[s.key]._zero_init = True
+
+    def _proj_dim(self, s: StreamConfig) -> int:
+        """Output projection dim: total_slots for the logit stream when hierarchy is active."""
+        if self._logit_hierarchy is not None and s.name == self._logit_sid:
+            return self._logit_hierarchy.total_slots
+        return s.dim
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
@@ -729,9 +770,13 @@ class MultiStreamCausalConv(nn.Module):
             if self.gated_output:
                 value = self.proj_value[s.key](h)
                 gate = torch.sigmoid(self.proj_gate[s.key](h))
-                output[s.name] = value * gate
+                value = value * gate
             else:
-                output[s.name] = self.proj_value[s.key](h)
+                value = self.proj_value[s.key](h)
+            if self._logit_hierarchy is not None and s.name == self._logit_sid:
+                chunks = value.split(self._logit_hierarchy.level_sizes, dim=-1)
+                value = self._logit_hierarchy.assemble_logits(list(chunks))
+            output[s.name] = value
         return output
 
 
@@ -755,6 +800,7 @@ class MultiStreamCausalConvLayers(nn.Module):
         gated_output: bool = True,
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        logit_hierarchy: ByteLogitHierarchy | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -786,6 +832,7 @@ class MultiStreamCausalConvLayers(nn.Module):
                     gated_output=gated_output,
                     linear_mode=linear_mode,
                     linear_kwargs=linear_kwargs,
+                    logit_hierarchy=logit_hierarchy,
                 )
                 for ks in kernel_sizes
             ]
@@ -1198,6 +1245,7 @@ class MultiStreamBlock(nn.Module):
         k_shift: bool = True,
         conv: MultiStreamCausalConv | None = None,
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
+        logit_hierarchy: ByteLogitHierarchy | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -1220,6 +1268,7 @@ class MultiStreamBlock(nn.Module):
             linear_mode=linear_mode,
             linear_kwargs=linear_kwargs,
             k_shift=k_shift,
+            skip_residual=True,
         )
         if mixing_config is not None:
             self.attn = CausalMultiStreamAttentionViaMixing(
@@ -1239,6 +1288,7 @@ class MultiStreamBlock(nn.Module):
             leaky_relu_slope=leaky_relu_slope,
             linear_mode=linear_mode,
             linear_kwargs=linear_kwargs,
+            logit_hierarchy=logit_hierarchy,
         )
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)
@@ -1323,7 +1373,7 @@ class MultiStreamBlock(nn.Module):
             s.name: self.attn_norms[s.key](input_streams[s.name])
             for s in self.stream_config.streams
         }
-        attn_out = self.attn(normed, skip_residual=True)
+        attn_out = self.attn(normed)
 
         x: dict[StreamID, Tensor] = {}
         for s in self.stream_config.streams:
