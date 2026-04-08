@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import random
 import string
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -28,17 +29,22 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, BoundaryComponent, HashBoundary
+from byte_modules import ByteHashComponent, HashBoundary
 from modules import RMSNorm, LearnableShift
 from multi_streams import (
     StreamType,
     StreamID,
     StreamDef,
     MultiStreamBuilder,
-    SinCosPositionComponent,
 )
-from multi_stream_attention import CausalMultiStreamAttention
-from test_harness import verify_causality
+from test_harness import (
+    MultiStreamTestModel,
+    count_params,
+    train_model,
+    evaluate_autoregressive,
+    show_examples,
+    verify_causality,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -61,12 +67,12 @@ def _random_code(category: str, length: int) -> str:
     raise ValueError(f"Unknown category: {category}")
 
 
-def make_sample(
+def _make_sample_raw(
     min_len: int = 4,
     max_len: int = 20,
     category: str | None = None,
 ) -> tuple[str, str, int, str]:
-    """Generate one copy-task sample.
+    """Generate one copy-task sample (internal, returns full detail).
 
     Returns: (full_text, code, prefix_len, category)
     """
@@ -83,31 +89,37 @@ def make_sample(
     )
 
 
-def make_batch(
+def make_sample(
+    min_len: int = 4,
+    max_len: int = 20,
+    category: str | None = None,
+) -> tuple[str, str]:
+    """Generate one copy-task sample (harness-compatible 2-tuple).
+
+    Returns: (prompt, answer)
+    """
+    full_text, code, prefix_len, _cat = _make_sample_raw(min_len, max_len, category)
+    return full_text, code[prefix_len:]
+
+
+def _make_batch_raw(
     tok: EfficientByteTokenizer,
     batch_size: int,
     min_len: int = 4,
     max_len: int = 20,
     category: str | None = None,
-) -> tuple[Tensor, Tensor, list[int]]:
+) -> tuple[Tensor, Tensor]:
     """Generate a padded batch.
-
-    Args:
-        category: if None, each sample picks a random category (mixed training).
-            If set, all samples use that category (per-category evaluation).
 
     Returns:
         input_ids: (B, max_seq_len) — full sequence including prompt + completion
         targets: (B, max_seq_len) — shifted targets (-100 for non-prediction positions)
-        code_lengths: list of code string lengths
     """
-    samples = [make_sample(min_len, max_len, category) for _ in range(batch_size)]
+    samples = [_make_sample_raw(min_len, max_len, category) for _ in range(batch_size)]
     texts = []
-    code_lengths = []
     for full_text, code, prefix_len, _cat in samples:
         target_text = full_text + code[prefix_len:]
         texts.append(target_text)
-        code_lengths.append(len(code))
 
     encoded = [torch.from_numpy(tok.encode(t)).long() for t in texts]
     max_len_seq = max(e.numel() for e in encoded)
@@ -130,100 +142,65 @@ def make_batch(
         sup_end = prompt_len + completion_len - 1
         targets[i, sup_start:sup_end] = input_ids[i, sup_start + 1 : sup_end + 1]
 
-    return input_ids, targets, code_lengths
+    return input_ids, targets
+
+
+def make_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Tensor]:
+    """Harness-compatible batch function (default length range)."""
+    return _make_batch_raw(tok, batch_size)
 
 
 # ---------------------------------------------------------------------------
-# Shared stream setup
+# Stream definitions
 # ---------------------------------------------------------------------------
 
 
-def make_stream_builder(tok: EfficientByteTokenizer) -> MultiStreamBuilder:
-    """Create the stream builder used by both model variants."""
-    return MultiStreamBuilder(
-        stream_defs=[
-            StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-            StreamDef(
-                name=StreamID(StreamType.STRUCTURAL),
-                read_only=True,
-                components=[
-                    # SinCosPositionComponent(num_freqs=4),  # 8d
-                    ByteHashComponent(
-                        tok,
-                        window=12,
-                        num_hashes=2,
-                        boundary=HashBoundary.WORD,
-                        track_hits=True,
-                    ),  # 6d
-                    ByteHashComponent(
-                        tok,
-                        window=12,
-                        num_hashes=2,
-                        boundary=HashBoundary.DIGIT,
-                        track_hits=True,
-                    ),  # 6d
-                    ByteHashComponent(
-                        tok,
-                        window=2,
-                        num_hashes=2,
-                        boundary=None,
-                        track_hits=True,
-                    ),  # 6d
-                    ByteHashComponent(
-                        tok,
-                        window=3,
-                        num_hashes=2,
-                        boundary=None,
-                        track_hits=True,
-                    ),  # 6d
-                    ByteHashComponent(
-                        tok,
-                        window=5,
-                        num_hashes=2,
-                        boundary=None,
-                        track_hits=True,
-                    ),  # 6d
-                    # BoundaryComponent(
-                    #     tok,
-                    #     word_pos_freqs=2,
-                    #     word_id_freqs=2,
-                    #     sent_pos_freqs=0,
-                    #     sent_id_freqs=0,
-                    #     para_pos_freqs=0,
-                    #     para_id_freqs=0,
-                    # ),  # 8d
-                ],
-            ),
-        ],
-        vocab_size=tok.vocab_size,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Model A: Multi-stream attention (structured read-only streams)
-# ---------------------------------------------------------------------------
-
-
-class MultiStreamCopyModel(nn.Module):
-    """Multi-stream attention: one-hot logit stream + structural read-only stream."""
-
-    def __init__(self, tok: EfficientByteTokenizer, head_dim: int = 64):
-        super().__init__()
-        self.vocab_size = tok.vocab_size
-        self.builder = make_stream_builder(tok)
-        self.attn = CausalMultiStreamAttention(
-            multi_head_dim=head_dim,
-            num_heads=1,
-            num_kv_heads=1,
-            stream_config=self.builder.config,
-            k_shift=True,
-        )
-
-    def forward(self, input_ids: Tensor) -> Tensor:
-        logit_stream = F.one_hot(input_ids, self.vocab_size).float()
-        streams, _, _ = self.builder(input_ids, logit=logit_stream)
-        out = self.attn(streams)
-        return out[StreamID(StreamType.LOGIT)]
+def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
+    """Stream definitions for the induction copy task."""
+    return [
+        StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
+        StreamDef(
+            name=StreamID(StreamType.STRUCTURAL),
+            read_only=True,
+            components=[
+                ByteHashComponent(
+                    tok,
+                    window=12,
+                    num_hashes=2,
+                    boundary=HashBoundary.WORD,
+                    track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok,
+                    window=12,
+                    num_hashes=2,
+                    boundary=HashBoundary.DIGIT,
+                    track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok,
+                    window=2,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok,
+                    window=3,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
+                ),
+                ByteHashComponent(
+                    tok,
+                    window=5,
+                    num_hashes=2,
+                    boundary=None,
+                    track_hits=True,
+                ),
+            ],
+        ),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +216,10 @@ class StandardAttentionCopyModel(nn.Module):
     output projects back to vocab_size.
     """
 
-    def __init__(self, tok: EfficientByteTokenizer, head_dim: int = 64):
+    def __init__(self, stream_defs: list[StreamDef], tok: EfficientByteTokenizer, head_dim: int = 64):
         super().__init__()
         self.vocab_size = tok.vocab_size
-        self.builder = make_stream_builder(tok)
+        self.builder = MultiStreamBuilder(stream_defs, vocab_size=tok.vocab_size)
 
         structural_dim = next(
             s.dim for s in self.builder.config.streams if s.name == StreamID(StreamType.STRUCTURAL)
@@ -281,141 +258,6 @@ class StandardAttentionCopyModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Training and evaluation
-# ---------------------------------------------------------------------------
-
-
-def train(
-    model: nn.Module,
-    tok: EfficientByteTokenizer,
-    steps: int = 2000,
-    batch_size: int = 32,
-    lr: float = 3e-3,
-    min_code_len: int = 4,
-    max_code_len: int = 16,
-    eval_every: int = 200,
-    device: str = "cpu",
-):
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
-
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  params: {n_params:,}")
-
-    for step in range(1, steps + 1):
-        model.train()
-        input_ids, targets, _ = make_batch(tok, batch_size, min_code_len, max_code_len)
-        input_ids = input_ids.to(device)
-        targets = targets.to(device)
-
-        logits = model(input_ids)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1),
-            ignore_index=-100,
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-
-        if step % eval_every == 0 or step == 1:
-            acc = evaluate(
-                model,
-                tok,
-                n_samples=200,
-                min_len=min_code_len,
-                max_len=max_code_len,
-                device=device,
-            )
-            # Report k_shift value if available
-            ks_mod = getattr(model, "k_shift_mod", None)
-            if ks_mod is None:
-                ks_mod = getattr(getattr(model, "attn", None), "k_shift_mod", None)
-            ks_str = ""
-            if ks_mod is not None:
-                ks_str = f"  k_shift={torch.sigmoid(ks_mod.shift_logit).item():.4f}"
-            print(
-                f"    step {step:5d}  loss={loss.item():.4f}  char_acc={acc:.1%}{ks_str}"
-            )
-
-    return model
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    tok: EfficientByteTokenizer,
-    n_samples: int = 200,
-    min_len: int = 4,
-    max_len: int = 16,
-    category: str | None = None,
-    device: str = "cpu",
-) -> float:
-    """Character-level accuracy on the copy task (autoregressive)."""
-    model.eval()
-    total_chars = 0
-    correct_chars = 0
-
-    for _ in range(n_samples):
-        full_text, code, prefix_len, _cat = make_sample(min_len, max_len, category)
-        remaining = code[prefix_len:]
-        n_to_predict = len(remaining)
-        if n_to_predict == 0:
-            continue
-
-        ids = torch.from_numpy(tok.encode(full_text)).long().unsqueeze(0).to(device)
-
-        predicted_bytes = []
-        for _ in range(n_to_predict):
-            logits = model(ids)
-            next_id = logits[0, -1].argmax().item()
-            predicted_bytes.append(next_id)
-            ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
-
-        expected_ids = tok.encode(remaining)
-        for j in range(min(len(predicted_bytes), len(expected_ids))):
-            total_chars += 1
-            if predicted_bytes[j] == expected_ids[j]:
-                correct_chars += 1
-        total_chars += max(0, len(expected_ids) - len(predicted_bytes))
-
-    return correct_chars / max(total_chars, 1)
-
-
-def show_examples(
-    model: nn.Module,
-    tok: EfficientByteTokenizer,
-    device: str,
-    n: int = 3,
-    category: str | None = None,
-):
-    model.eval()
-    for _ in range(n):
-        full_text, code, prefix_len, cat = make_sample(6, 14, category)
-        remaining = code[prefix_len:]
-        ids = torch.from_numpy(tok.encode(full_text)).long().unsqueeze(0).to(device)
-
-        predicted = []
-        with torch.no_grad():
-            for _ in range(len(remaining)):
-                logits = model(ids)
-                next_id = logits[0, -1].argmax().item()
-                predicted.append(next_id)
-                ids = torch.cat([ids, torch.tensor([[next_id]], device=device)], dim=1)
-
-        pred_str = tok.decode_to_str(predicted)
-        match = "OK" if pred_str == remaining else "FAIL"
-        print(
-            f"    {match:4s} [{cat:7s}] code={code!r:22s}  prefix={code[:prefix_len]!r}  "
-            f"expected={remaining!r:18s}  predicted={pred_str!r}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -424,13 +266,37 @@ if __name__ == "__main__":
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}\n")
 
+    stream_defs = make_stream_defs(tok)
+
+    MIN_CODE_LEN = 4
+    MAX_CODE_LEN = 16
+
+    # Bind training length range into batch function
+    make_train_batch = partial(_make_batch_raw, min_len=MIN_CODE_LEN, max_len=MAX_CODE_LEN)
+
+    ms_model = MultiStreamTestModel(
+        stream_defs=stream_defs,
+        vocab_size=tok.vocab_size,
+        num_heads=1,
+        head_dim=16,
+        num_layers=1,
+        k_shift=True,
+    )
+
+    flat_model = StandardAttentionCopyModel(stream_defs, tok, head_dim=16)
+
+    print("=" * 60)
+    print("Model sizes")
+    print("=" * 60)
+    ms_params = count_params(ms_model, "Multi-stream attention")
+    flat_params = count_params(flat_model, "Standard attention (flat)")
+    print()
+
     train_kwargs = dict(
         tok=tok,
         steps=2000,
         batch_size=64,
         lr=3e-2,
-        min_code_len=4,
-        max_code_len=16,
         eval_every=400,
         device=device,
     )
@@ -438,27 +304,33 @@ if __name__ == "__main__":
 
     results = {}
 
-    for name, ModelClass in [
-        ("Multi-stream attention", MultiStreamCopyModel),
-        ("Standard attention (flat)", StandardAttentionCopyModel),
-    ]:
+    models = [
+        ("Multi-stream attention", ms_model),
+        ("Standard attention (flat)", flat_model),
+    ]
+
+    for name, model in models:
         print("=" * 60)
-        print(f"{name}")
+        print(name)
         print("=" * 60)
-        model = ModelClass(tok, head_dim=16)
-        model = train(model, **train_kwargs)
+
+        def eval_fn(m, d, _min=MIN_CODE_LEN, _max=MAX_CODE_LEN):
+            return evaluate_autoregressive(
+                m, partial(make_sample, min_len=_min, max_len=_max),
+                tok, n_samples=200, device=d,
+            )
+
+        train_model(model, make_train_batch, **train_kwargs, eval_fn=eval_fn)
 
         print("\n  Final evaluation (per category x length range):")
         accs = {}
         for cat in CATEGORIES:
             for lo, hi in eval_ranges:
-                acc = evaluate(
+                acc = evaluate_autoregressive(
                     model,
+                    partial(make_sample, min_len=lo, max_len=hi, category=cat),
                     tok,
                     n_samples=200,
-                    min_len=lo,
-                    max_len=hi,
-                    category=cat,
                     device=device,
                 )
                 accs[(cat, lo, hi)] = acc
@@ -471,15 +343,14 @@ if __name__ == "__main__":
         results[name] = accs
 
         print("\n  Examples:")
-        for cat in CATEGORIES:
-            show_examples(model, tok, device, n=2, category=cat)
-
-        def _make_sample_2tuple():
-            full_text, code, prefix_len, _cat = make_sample()
-            return full_text, code[prefix_len:]
+        show_examples(
+            model,
+            partial(make_sample, min_len=6, max_len=14),
+            tok, device, n=6,
+        )
 
         verify_causality(
-            model, tok, device, make_sample_fn=_make_sample_2tuple, label=name
+            model, tok, device, make_sample_fn=make_sample, label=name
         )
         print()
 
