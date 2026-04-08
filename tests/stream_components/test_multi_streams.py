@@ -194,7 +194,7 @@ class TestMultiStreamBuilder:
         B, S = 2, 10
         ids = torch.zeros(B, S, dtype=torch.long)
         writable = torch.randn(B, S, 32)
-        streams = builder(ids, dtype=torch.float32, logit=writable)
+        streams, _, _ = builder(ids, dtype=torch.float32, logit=writable)
         assert set(streams.keys()) == {StreamID(StreamType.LOGIT), StreamID(StreamType.STRUCTURAL)}
         assert streams[StreamID(StreamType.LOGIT)].shape == (B, S, 32)
         assert streams[StreamID(StreamType.STRUCTURAL)].shape == (B, S, 8)
@@ -211,5 +211,5 @@ class TestMultiStreamBuilder:
         )
         ids = torch.zeros(1, 5, dtype=torch.long)
         writable = torch.randn(1, 5, 16)
-        streams = builder(ids, logit=writable)
+        streams, _, _ = builder(ids, logit=writable)
         assert torch.equal(streams[StreamID(StreamType.LOGIT)], writable)

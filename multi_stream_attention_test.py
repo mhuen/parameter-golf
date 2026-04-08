@@ -8,8 +8,8 @@ from torch import Tensor, nn
 from multi_streams import StreamType, StreamID
 from multi_stream_attention import (
     CastedLinear,
-    CausualMultiStreamAttentionViaMixing,
-    CausualMultiStreamAttention,
+    CausalMultiStreamAttentionViaMixing,
+    CausalMultiStreamAttention,
     MixingMode,
     MixingSource,
     MultiStreamConfig,
@@ -234,7 +234,7 @@ if __name__ == "__main__":
             mixing_config = StreamMixingConfig(
                 qk_mode=qk_mode, source=source, bottleneck_dim=16
             )
-            model = CausualMultiStreamAttentionViaMixing(
+            model = CausalMultiStreamAttentionViaMixing(
                 multi_head_dim=multi_head_dim,
                 num_heads=num_heads,
                 num_kv_heads=num_kv_heads,
@@ -250,7 +250,7 @@ if __name__ == "__main__":
             param_count = sum(p.numel() for p in model.parameters())
             print(f"  {qk_mode:8s} + {source:20s}: OK  ({param_count:,} params)")
 
-    model_std = CausualMultiStreamAttention(
+    model_std = CausalMultiStreamAttention(
         multi_head_dim=multi_head_dim,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
@@ -277,13 +277,13 @@ if __name__ == "__main__":
             num_kv_heads=num_kv_heads,
             stream_config=stream_config,
         ),
-        "standard": lambda: CausualMultiStreamAttention(
+        "standard": lambda: CausalMultiStreamAttention(
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             stream_config=stream_config,
         ),
-        "ms_additive_static": lambda: CausualMultiStreamAttentionViaMixing(
+        "ms_additive_static": lambda: CausalMultiStreamAttentionViaMixing(
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -294,7 +294,7 @@ if __name__ == "__main__":
                 bottleneck_dim=16,
             ),
         ),
-        "ms_glu_static": lambda: CausualMultiStreamAttentionViaMixing(
+        "ms_glu_static": lambda: CausalMultiStreamAttentionViaMixing(
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
@@ -305,7 +305,7 @@ if __name__ == "__main__":
                 bottleneck_dim=16,
             ),
         ),
-        "ms_glu_dyn_bn": lambda: CausualMultiStreamAttentionViaMixing(
+        "ms_glu_dyn_bn": lambda: CausalMultiStreamAttentionViaMixing(
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,

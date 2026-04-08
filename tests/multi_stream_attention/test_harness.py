@@ -26,9 +26,12 @@ from multi_streams import (
     StreamDef,
     MultiStreamBuilder,
     MultiStreamConfig,
+    CompressionType,
+    CompressedView,
 )
 from multi_stream_attention import (
-    CausualMultiStreamAttention,
+    CausalMultiStreamAttention,
+    CausalArithmeticMultiStreamAttention,
     MultiStreamBlock,
     StreamMixingConfig,
 )
@@ -167,11 +170,19 @@ class MultiStreamTestModel(nn.Module):
         mlp_hidden_dim: int | None = None,
         k_shift: bool = True,
         mixing_config: StreamMixingConfig | None = None,
+        arith_attn: CausalArithmeticMultiStreamAttention | None = None,
+        compressions: dict | None = None,
+        compress_streams: list[StreamID] | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
 
-        self.builder = MultiStreamBuilder(stream_defs, vocab_size=vocab_size)
+        self.builder = MultiStreamBuilder(
+            stream_defs,
+            vocab_size=vocab_size,
+            compressions=compressions,
+            compress_streams=compress_streams,
+        )
 
         if num_kv_heads is None:
             num_kv_heads = num_heads
@@ -191,6 +202,7 @@ class MultiStreamTestModel(nn.Module):
                         mixing_config=mixing_config,
                         mlp_hidden_dim=mlp_hidden_dim,
                         k_shift=k_shift,
+                        arith_attn=arith_attn,
                     )
                     for _ in range(num_layers)
                 ]
@@ -198,7 +210,7 @@ class MultiStreamTestModel(nn.Module):
         else:
             self.layers = nn.ModuleList(
                 [
-                    CausualMultiStreamAttention(
+                    CausalMultiStreamAttention(
                         **shared_kwargs,
                         k_shift=k_shift,
                     )
@@ -208,9 +220,14 @@ class MultiStreamTestModel(nn.Module):
 
     def forward(self, input_ids: Tensor, **provided_streams: Tensor) -> Tensor:
         logit_onehot = F.one_hot(input_ids, self.vocab_size).float()
-        streams = self.builder(input_ids, logit=logit_onehot, **provided_streams)
+        streams, compressed, views = self.builder(
+            input_ids, logit=logit_onehot, **provided_streams
+        )
         for layer in self.layers:
-            streams = layer(streams)
+            if isinstance(layer, MultiStreamBlock) and compressed is not None:
+                streams = layer(streams, compressed=compressed, views=views)
+            else:
+                streams = layer(streams)
         return streams[StreamID(StreamType.LOGIT)]
 
 
@@ -249,7 +266,7 @@ def _collect_k_shift_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:
         if ks is not None:
             results.append(("", ks))
             return results
-    # Walk model.layers (MultiStreamTestModel with CausualMultiStreamAttention or MultiStreamBlock)
+    # Walk model.layers (MultiStreamTestModel with CausalMultiStreamAttention or MultiStreamBlock)
     layers = getattr(model, "layers", None)
     if layers is not None:
         for i, layer in enumerate(layers):
@@ -291,7 +308,7 @@ def _format_alphas(model: nn.Module) -> str:
     """Format gating alpha summaries for multi-stream layers.
 
     For MultiStreamBlock layers: reports attn_alpha and mlp_alpha per writable stream.
-    For bare CausualMultiStreamAttention: reports alpha_pre_sigmoid per writable stream.
+    For bare CausalMultiStreamAttention: reports alpha_pre_sigmoid per writable stream.
     """
     layers = getattr(model, "layers", None)
     if layers is None:
@@ -311,8 +328,13 @@ def _format_alphas(model: nn.Module) -> str:
                 for name, param in mlp_alpha.items():
                     lbl = f"{prefix}mlp_α.{name}" if prefix else f"mlp_α.{name}"
                     parts.append(f"{lbl}={_format_alpha_summary(param)}")
+            arith_alpha = getattr(layer, "arith_alpha", None)
+            if arith_alpha is not None:
+                for name, param in arith_alpha.items():
+                    lbl = f"{prefix}arith_α.{name}" if prefix else f"arith_α.{name}"
+                    parts.append(f"{lbl}={_format_alpha_summary(param)}")
             continue
-        # Bare CausualMultiStreamAttention has alpha_pre_sigmoid
+        # Bare CausalMultiStreamAttention has alpha_pre_sigmoid
         alpha_ps = getattr(layer, "alpha_pre_sigmoid", None)
         if alpha_ps is not None:
             for name, param in alpha_ps.items():

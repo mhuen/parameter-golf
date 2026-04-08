@@ -37,7 +37,7 @@ from multi_streams import (
     MultiStreamBuilder,
     SinCosPositionComponent,
 )
-from multi_stream_attention import CausualMultiStreamAttention
+from multi_stream_attention import CausalMultiStreamAttention
 from test_harness import verify_causality
 
 
@@ -211,7 +211,7 @@ class MultiStreamCopyModel(nn.Module):
         super().__init__()
         self.vocab_size = tok.vocab_size
         self.builder = make_stream_builder(tok)
-        self.attn = CausualMultiStreamAttention(
+        self.attn = CausalMultiStreamAttention(
             multi_head_dim=head_dim,
             num_heads=1,
             num_kv_heads=1,
@@ -221,7 +221,7 @@ class MultiStreamCopyModel(nn.Module):
 
     def forward(self, input_ids: Tensor) -> Tensor:
         logit_stream = F.one_hot(input_ids, self.vocab_size).float()
-        streams = self.builder(input_ids, logit=logit_stream)
+        streams, _, _ = self.builder(input_ids, logit=logit_stream)
         out = self.attn(streams)
         return out[StreamID(StreamType.LOGIT)]
 
@@ -263,7 +263,7 @@ class StandardAttentionCopyModel(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         B, S = input_ids.shape
         onehot = F.one_hot(input_ids, self.vocab_size).float()
-        streams = self.builder(input_ids, logit=onehot)
+        streams, _, _ = self.builder(input_ids, logit=onehot)
         structural = streams[StreamID(StreamType.STRUCTURAL)]
         x = torch.cat([onehot, structural], dim=-1)  # (B, S, input_dim)
 

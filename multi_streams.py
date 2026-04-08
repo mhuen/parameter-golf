@@ -4,11 +4,16 @@ Defines the stream abstraction used by multi-stream attention:
 - Stream names, StreamConfig, MultiStreamConfig (data structures)
 - CompositeStream (concatenates components into a single read-only stream)
 - SinCosPositionComponent, DocBoundaryComponent (tokenizer-agnostic components)
+- CompressedView, CompressionType (stream compression framework)
 - MultiStreamBuilder (constructs stream dict from input_ids)
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -27,8 +32,6 @@ class StreamType(StrEnum):
     CONTEXT = "context"
     TOKENS = "tokens"
     STRUCTURAL = "structural"
-    REGISTER = "register"
-    COMPUTE_RESULT = "compute_result"
 
 
 @dataclass(frozen=True)
@@ -84,6 +87,38 @@ class StreamDef:
     components: list[nn.Module] | None = None
     auto_zeros: bool = False
     auto_onehot: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Stream compression framework
+# ---------------------------------------------------------------------------
+
+
+class CompressionType(StrEnum):
+    NUMBER = "number"
+
+
+@dataclass
+class CompressedView:
+    """Result of a compression function.
+
+    A compressed view selects N positions from a sequence of length S,
+    producing a shorter representation that downstream modules can
+    attend to efficiently.
+
+    Attributes:
+        positions: (B, N) int — indices into the original sequence.
+        mask: (B, N) bool — valid entries (N is padded to a fixed max).
+        metadata: compression-specific data (e.g., numeric values for NUMBER).
+    """
+
+    positions: Tensor
+    mask: Tensor
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# Type alias for compression functions: input_ids → CompressedView
+CompressionFn = Callable[[Tensor], CompressedView]
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +217,8 @@ class MultiStreamBuilder(nn.Module):
             StreamDef(Stream.CONTEXT, dim=32, auto_zeros=True),   # writable scratch
         ], vocab_size=vocab_size)
 
-        attn = CausualMultiStreamAttention(..., stream_config=builder.config)
-        streams = builder(input_ids, logit=one_hot_tensor)
+        attn = CausalMultiStreamAttention(..., stream_config=builder.config)
+        streams, compressed, views = builder(input_ids, logit=one_hot_tensor)
         out = attn(streams)
     """
 
@@ -191,10 +226,14 @@ class MultiStreamBuilder(nn.Module):
         self,
         stream_defs: list[StreamDef],
         vocab_size: int | None = None,
+        compressions: dict[CompressionType, CompressionFn] | None = None,
+        compress_streams: list[StreamID] | None = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self._defs = list(stream_defs)
+        self._compressions = compressions or {}
+        self._compress_stream_ids = compress_streams or []
 
         # Build CompositeStreams for component-based defs
         composites: dict[str, CompositeStream] = {}
@@ -245,8 +284,12 @@ class MultiStreamBuilder(nn.Module):
         input_ids: Tensor,
         dtype: torch.dtype = torch.float32,
         **provided_streams: dict[StreamID, Tensor],
-    ) -> dict[StreamID, Tensor]:
-        """Build stream dict.
+    ) -> tuple[
+        dict[StreamID, Tensor],
+        dict[CompressionType, dict[StreamID, Tensor]] | None,
+        dict[CompressionType, CompressedView] | None,
+    ]:
+        """Build stream dict and optional compressed views.
 
         Args:
             input_ids: (B, S) token IDs.
@@ -256,7 +299,11 @@ class MultiStreamBuilder(nn.Module):
                 auto_onehot, auto_zeros, or components.
 
         Returns:
-            dict mapping StreamID to tensors.
+            Tuple of:
+            - streams: dict mapping StreamID to (B, S, d) tensors.
+            - compressed: dict mapping CompressionType to
+              dict[StreamID, (B, N, d) tensors], or None if no compressions.
+            - views: dict mapping CompressionType to CompressedView, or None.
         """
         B, S = input_ids.shape
         streams: dict[StreamID, Tensor] = {}
@@ -285,4 +332,27 @@ class MultiStreamBuilder(nn.Module):
                         f"(got keys: {list(provided_streams.keys())})"
                     )
 
-        return streams
+        # --- Optional stream compression ---
+        if not self._compressions:
+            return streams, None, None
+
+        compressed: dict[CompressionType, dict[StreamID, Tensor]] = {}
+        views: dict[CompressionType, CompressedView] = {}
+
+        for comp_type, comp_fn in self._compressions.items():
+            view = comp_fn(input_ids)
+            views[comp_type] = view
+            compressed[comp_type] = {}
+            for stream_id in self._compress_stream_ids:
+                if stream_id not in streams:
+                    continue
+                full = streams[stream_id]  # (B, S, d)
+                # Gather features at compressed positions
+                idx = view.positions.clamp(0, S - 1).unsqueeze(-1)  # (B, N, 1)
+                idx = idx.expand(-1, -1, full.shape[-1])  # (B, N, d)
+                gathered = full.gather(1, idx)  # (B, N, d)
+                compressed[comp_type][stream_id] = (
+                    gathered * view.mask.unsqueeze(-1).to(dtype=gathered.dtype)
+                )
+
+        return streams, compressed, views

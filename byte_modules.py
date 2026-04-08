@@ -4,11 +4,13 @@ import math
 from collections import Counter
 from enum import StrEnum
 
+from regex import P
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
+from multi_streams import CompressedView
 
 from modules import (
     CastedLinear,
@@ -22,6 +24,7 @@ class HashBoundary(StrEnum):
     WORD = "word"  # reset at separators
     DIGIT = "digit"  # digit runs only
     CODEPOINT = "codepoint"  # multibyte sequences only
+
 
 NUM_BYTE_CATEGORIES = 8
 _BYTE_CATEGORY_DEFS = [
@@ -1378,3 +1381,589 @@ class ByteHashComponent(nn.Module):
             parts.append(torch.stack([hit_log, hit_frac], dim=-1))
 
         return torch.cat(parts, dim=-1).to(dtype=dtype)
+
+
+_NUMBER_WORDS: dict[str, int] = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+}
+
+
+class PairwiseOp(StrEnum):
+    """Operations available in DigitComputeComponent for pairwise number features."""
+
+    # Commutative arithmetic
+    ADD = "add"
+    MUL = "mul"
+    # Non-commutative arithmetic (a=oldest/first, b=most_recent/second)
+    SUB = "sub"  # a - b
+    RSUB = "rsub"  # b - a
+    DIV = "div"  # a / |b|
+    RDIV = "rdiv"  # b / |a|
+    MOD = "mod"  # fmod(a, |b|)
+    RMOD = "rmod"  # fmod(b, |a|)
+    # Comparisons
+    GT = "gt"  # a > b
+    EQ = "eq"  # a == b
+    LT = "lt"  # a < b
+
+
+_PAIRWISE_ARITH_OPS = frozenset(
+    {
+        PairwiseOp.ADD,
+        PairwiseOp.MUL,
+        PairwiseOp.SUB,
+        PairwiseOp.RSUB,
+        PairwiseOp.DIV,
+        PairwiseOp.RDIV,
+        PairwiseOp.MOD,
+        PairwiseOp.RMOD,
+    }
+)
+_PAIRWISE_CMP_OPS = frozenset({PairwiseOp.GT, PairwiseOp.EQ, PairwiseOp.LT})
+
+
+class NumberExtractor(nn.Module):
+    """Extracts detected numbers from the token stream into a CompressedView.
+
+    Zero learnable parameters. Detects numbers as:
+    1. Digit runs: contiguous ASCII digits (0-9), optionally with a single
+       decimal point, assembled into floats.
+    2. Number words: lowercased letter runs matched against a dictionary
+       (zero..twenty by default).
+
+    Returns a ``CompressedView`` with:
+    - ``positions``: (B, N_max) position of the last token of each number
+    - ``mask``: (B, N_max) valid entries
+    - ``metadata["values"]``: (B, N_max) scalar value of each number
+    - ``metadata["lengths"]``: (B, N_max) token count per number
+    - ``metadata["active_len"]``: (B, S) current digit run length at each position
+    """
+
+    _MAX_INPUT_DIGITS = 15  # float64 significant digits
+
+    def __init__(
+        self,
+        tok: EfficientByteTokenizer,
+        n_max: int = 32,
+        number_words: dict[str, int] | None = None,
+    ):
+        super().__init__()
+        self.n_max = n_max
+        self._number_words = number_words if number_words is not None else _NUMBER_WORDS
+
+        V = tok.vocab_size
+        digit_value = torch.full((V,), -1, dtype=torch.long)
+        lowercase_byte = torch.zeros(V, dtype=torch.long)
+        is_decimal = torch.zeros(V, dtype=torch.bool)
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info is None:
+                continue
+            if info.has(ByteCategory.DIGIT):
+                digit_value[tid] = info.byte_value - 0x30
+            if info.has(ByteCategory.LETTER):
+                lb = info.lowercase_byte
+                lowercase_byte[tid] = lb if lb is not None else info.byte_value
+            if info.byte_value == 0x2E:
+                is_decimal[tid] = True
+        self.register_buffer("digit_value", digit_value)
+        self.register_buffer("lowercase_byte", lowercase_byte)
+        self.register_buffer("is_decimal", is_decimal)
+
+    def _try_word_number(self, word_bytes: list[int]) -> int | None:
+        word = bytes(word_bytes).decode("ascii", errors="replace")
+        return self._number_words.get(word)
+
+    def forward(self, input_ids: Tensor) -> CompressedView:
+        B, S = input_ids.shape
+        device = input_ids.device
+        n_max = self.n_max
+        max_input_digits = self._MAX_INPUT_DIGITS
+
+        dv = self.digit_value[input_ids]  # (B, S)
+        lb = self.lowercase_byte[input_ids]  # (B, S)
+        is_dec = self.is_decimal[input_ids]  # (B, S)
+
+        # Output tensors
+        positions = torch.zeros(B, n_max, dtype=torch.long, device=device)
+        mask = torch.zeros(B, n_max, dtype=torch.bool, device=device)
+        values = torch.zeros(B, n_max, dtype=torch.float32, device=device)
+        lengths = torch.zeros(B, n_max, dtype=torch.long, device=device)
+        active_len_out = torch.zeros(B, S, dtype=torch.long, device=device)
+
+        for b in range(B):
+            num_idx = 0  # next slot in output
+            # Digit run state
+            digit_num = 0.0
+            digit_len = 0
+            digit_has_dot = False
+            digit_frac_mul = 0.0
+            in_digit_run = False
+            digit_start = 0
+            # Word run state
+            word_bytes: list[int] = []
+            in_word_run = False
+            word_start = 0
+            # Active number run (for next-digit encoding)
+            active_len = 0
+            active_has_dot = False
+
+            def _push_number(val: float, start: int, end: int) -> None:
+                nonlocal num_idx
+                if num_idx >= n_max:
+                    return
+                values[b, num_idx] = val
+                positions[b, num_idx] = end
+                lengths[b, num_idx] = end - start + 1
+                mask[b, num_idx] = True
+                num_idx += 1
+
+            for t in range(S):
+                d = dv[b, t].item()
+                l = lb[b, t].item()
+                is_dot = is_dec[b, t].item()
+
+                dot_continues_run = is_dot and in_digit_run and not digit_has_dot
+
+                # --- Finish any run that ended ---
+                # Numbers are positioned at t (the boundary token), not t-1
+                # (the last digit). This ensures strict causality: the number
+                # only appears in the compressed view when the boundary is
+                # visible, matching what happens in truncated sequences.
+                if d >= 0:
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            _push_number(float(val), word_start, t)
+                        in_word_run = False
+                        word_bytes = []
+                elif dot_continues_run:
+                    pass
+                elif l > 0:
+                    if in_digit_run:
+                        _push_number(digit_num, digit_start, t)
+                        in_digit_run = False
+                else:
+                    if in_digit_run:
+                        _push_number(digit_num, digit_start, t)
+                        in_digit_run = False
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            _push_number(float(val), word_start, t)
+                        in_word_run = False
+                        word_bytes = []
+
+                # --- Extend or start current run ---
+                if d >= 0:
+                    if not in_digit_run:
+                        digit_num = 0.0
+                        digit_len = 0
+                        digit_has_dot = False
+                        digit_frac_mul = 0.0
+                        in_digit_run = True
+                        digit_start = t
+                    if digit_len < max_input_digits:
+                        if digit_has_dot:
+                            digit_num += d * digit_frac_mul
+                            digit_frac_mul *= 0.1
+                        else:
+                            digit_num = digit_num * 10 + d
+                    digit_len += 1
+                elif dot_continues_run:
+                    digit_has_dot = True
+                    digit_frac_mul = 0.1
+                    digit_len += 1
+                elif l > 0:
+                    if not in_word_run:
+                        word_bytes = []
+                        in_word_run = True
+                        word_start = t
+                    word_bytes.append(l)
+
+                # --- Track active digit/decimal run ---
+                if d >= 0:
+                    active_len += 1
+                elif is_dot and not active_has_dot:
+                    active_len += 1
+                    active_has_dot = True
+                else:
+                    active_len = 0
+                    active_has_dot = False
+                active_len_out[b, t] = active_len
+
+            # NOTE: we intentionally do NOT flush in-progress digit/word runs
+            # at end-of-sequence. Only numbers terminated by a boundary token
+            # (non-digit after digits, non-letter after letters) are emitted.
+            # This ensures strict causality: the compressed view at position t
+            # is identical regardless of what tokens follow after t.
+
+        return CompressedView(
+            positions=positions,
+            mask=mask,
+            metadata={
+                "values": values,
+                "lengths": lengths,
+                "active_len": active_len_out,
+            },
+        )
+
+
+class DigitComputeComponent(nn.Module):
+    """Pairwise arithmetic features from recent numbers in the byte stream.
+
+    Detects numbers in two forms:
+    1. **Digit runs:** contiguous ASCII digits (0-9), assembled into integers.
+    2. **Number words:** lowercased letter runs matched against a dictionary
+       (zero..twenty).
+
+    For each C(k,2) pair of the last k detected numbers, computes a
+    configurable subset of:
+    - Arithmetic ops: ``add``, ``sub``, ``mul``, ``div``, ``mod``
+      — each represented as [sign, next_digit_onehot]
+    - Comparisons: ``gt``, ``eq``, ``lt`` — each as 0/1
+
+    Each arithmetic op is encoded as:
+    - **sign** (1 dim): +1.0 (positive), -1.0 (negative), 0.0 (zero result)
+    - **next-digit one-hot** (12 dims): over {0,1,...,9, '.', END}.
+      The digit index is determined by the "active number" — the length
+      of the contiguous digit/decimal-point run ending at the current
+      token position. If not in a digit run, index=0 (first digit).
+      This makes the output directly useful for next-token prediction:
+      the component tells the model exactly which digit to emit next.
+
+    dim per pair = n_arith * 13 + n_cmp
+
+    Args:
+        tok: byte tokenizer for byte value lookup.
+        k: number of recent numbers to track (default 2).
+        number_words: dict mapping lowercase words to their numeric value.
+            Defaults to zero..twenty.
+        ops: set of ``PairwiseOp`` values to include. Defaults to all.
+    """
+
+    # Max digits per input number (float64 significant digits)
+    _MAX_INPUT_DIGITS = 15
+
+    def __init__(
+        self,
+        tok: EfficientByteTokenizer,
+        k: int = 2,
+        number_words: dict[str, int] | None = None,
+        ops: set[PairwiseOp] | None = None,
+    ):
+        super().__init__()
+        self.k = k
+        self._num_pairs = k * (k - 1) // 2
+
+        # Resolve and store selected ops (preserving canonical order)
+        selected = frozenset(ops) if ops is not None else frozenset(PairwiseOp)
+        unknown = selected - frozenset(PairwiseOp)
+        if unknown:
+            raise ValueError(f"Unknown ops: {unknown}")
+        self._arith_ops = tuple(
+            op for op in PairwiseOp if op in selected and op in _PAIRWISE_ARITH_OPS
+        )
+        self._cmp_ops = tuple(
+            op for op in PairwiseOp if op in selected and op in _PAIRWISE_CMP_OPS
+        )
+
+        # Per arithmetic op: 1 (sign) + 12 (next-digit one-hot)
+        self._arith_dim = 1 + self.NEXT_DIGIT_VOCAB
+        # Per pair: n_arith arith ops + n_cmp comparisons
+        self._pair_dim = len(self._arith_ops) * self._arith_dim + len(self._cmp_ops)
+        self._dim = self._num_pairs * self._pair_dim
+        self._eps = 1e-8
+        self._number_words = number_words if number_words is not None else _NUMBER_WORDS
+
+        V = tok.vocab_size
+        # digit_value: token_id → 0-9 or -1
+        digit_value = torch.full((V,), -1, dtype=torch.long)
+        # lowercase_byte: token_id → lowercase ASCII byte or 0 (not a letter)
+        lowercase_byte = torch.zeros(V, dtype=torch.long)
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info is None:
+                continue
+            if info.has(ByteCategory.DIGIT):
+                digit_value[tid] = info.byte_value - 0x30
+            if info.has(ByteCategory.LETTER):
+                lb = info.lowercase_byte
+                lowercase_byte[tid] = lb if lb is not None else info.byte_value
+        # is_decimal: token_id → True if byte is '.' (0x2E)
+        is_decimal = torch.zeros(V, dtype=torch.bool)
+        for tid in range(V):
+            info = tok.token_info(tid)
+            if info is not None and info.byte_value == 0x2E:
+                is_decimal[tid] = True
+        self.register_buffer("digit_value", digit_value)
+        self.register_buffer("lowercase_byte", lowercase_byte)
+        self.register_buffer("is_decimal", is_decimal)
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @staticmethod
+    def signed_log1p(x: Tensor) -> Tensor:
+        return x.sign() * torch.log1p(x.abs())
+
+    def _try_word_number(self, word_bytes: list[int]) -> int | None:
+        """Check if a sequence of lowercase bytes matches a number word."""
+        word = bytes(word_bytes).decode("ascii", errors="replace")
+        return self._number_words.get(word)
+
+    # Next-digit one-hot vocabulary: {0..9, '.', END}
+    NEXT_DIGIT_VOCAB = 12
+    DIGIT_IDX_DOT = 10
+    DIGIT_IDX_END = 11
+
+    def _result_to_string(self, value: float) -> str:
+        """Convert arithmetic result magnitude to string for digit lookup."""
+        av = abs(value)
+        if av == int(av) and av < 1e15:
+            return str(int(av))
+        s = f"{av}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+
+    def _encode_next_digit(
+        self,
+        value: float,
+        active_len: int,
+        out: Tensor,
+        b: int,
+        t: int,
+        off: int,
+    ) -> None:
+        """Write sign + next-digit one-hot into the output tensor.
+
+        Layout at out[b, t, off:off + 1 + NEXT_DIGIT_VOCAB]:
+          [0]    sign: +1.0 (positive), -1.0 (negative), 0.0 (zero)
+          [1..12] one-hot over {0,1,...,9, '.', END}
+
+        ``active_len`` is the length of the current contiguous digit/decimal
+        run ending at token t. It indexes into the result string to pick
+        the next character.
+        """
+        # Sign
+        if value > 0:
+            out[b, t, off] = 1.0
+        elif value < 0:
+            out[b, t, off] = -1.0
+        # else 0.0 (already zero-initialized)
+
+        # Next digit one-hot
+        s = self._result_to_string(value)
+        if active_len < len(s):
+            ch = s[active_len]
+            if ch == ".":
+                idx = self.DIGIT_IDX_DOT
+            elif ch.isdigit():
+                idx = int(ch)
+            else:
+                idx = self.DIGIT_IDX_END
+        else:
+            idx = self.DIGIT_IDX_END
+        out[b, t, off + 1 + idx] = 1.0
+
+    def _compute_pairs(
+        self,
+        ring: list[float],
+        ring_idx: int,
+        ring_count: int,
+        k: int,
+        eps: float,
+        out: Tensor,
+        b: int,
+        t: int,
+        active_len: int,
+    ) -> None:
+        """Compute pairwise features and write to output tensor."""
+        if ring_count < 2:
+            return
+        n_avail = min(ring_count, k)
+        # Oldest first so a=first_seen, b=second_seen (natural left-to-right order)
+        nums = [ring[(ring_idx - 1 - i) % k] for i in range(n_avail)][::-1]
+        ad = self._arith_dim  # dims per arithmetic op (1 + NEXT_DIGIT_VOCAB)
+        pd = self._pair_dim  # dims per pair
+        Op = PairwiseOp
+
+        pair_idx = 0
+        for i in range(len(nums)):
+            for j in range(i + 1, len(nums)):
+                a, bv = nums[i], nums[j]
+                b_abs = abs(bv) + eps
+                base = pair_idx * pd
+
+                # Arithmetic ops: [sign, next_digit_onehot]
+                a_abs = abs(a) + eps
+                arith_fn = {
+                    Op.ADD: a + bv,
+                    Op.MUL: a * bv,
+                    Op.SUB: a - bv,
+                    Op.RSUB: bv - a,
+                    Op.DIV: a / b_abs,
+                    Op.RDIV: bv / a_abs,
+                    Op.MOD: math.fmod(a, b_abs),
+                    Op.RMOD: math.fmod(bv, a_abs),
+                }
+                for op_i, op in enumerate(self._arith_ops):
+                    val = arith_fn[op]
+                    off = base + op_i * ad
+                    self._encode_next_digit(val, active_len, out, b, t, off)
+
+                # Comparisons (1 dim each, after arithmetic)
+                cmp_off = base + len(self._arith_ops) * ad
+                cmp_fn = {
+                    Op.GT: float(a > bv),
+                    Op.EQ: float(a == bv),
+                    Op.LT: float(a < bv),
+                }
+                for cmp_i, op in enumerate(self._cmp_ops):
+                    out[b, t, cmp_off + cmp_i] = cmp_fn[op]
+                pair_idx += 1
+
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        B, S = input_ids.shape
+        device = input_ids.device
+        k = self.k
+
+        dv = self.digit_value[input_ids]  # (B, S), -1 or 0..9
+        lb = self.lowercase_byte[input_ids]  # (B, S), 0 or lowercase ASCII
+        id = self.is_decimal[input_ids]  # (B, S), bool for '.' tokens
+        out = torch.zeros(B, S, self._dim, device=device, dtype=dtype)
+        if self._num_pairs == 0:
+            return out
+
+        eps = self._eps
+        max_input_digits = self._MAX_INPUT_DIGITS
+
+        for b in range(B):
+            ring = [0.0] * k
+            ring_idx = 0
+            ring_count = 0
+            # Digit run state (for number detection → ring buffer)
+            digit_num = 0.0
+            digit_len = 0
+            digit_has_dot = False
+            digit_frac_mul = 0.0
+            in_digit_run = False
+            # Word run state
+            word_bytes: list[int] = []
+            in_word_run = False
+            # Active number run state (for next-digit encoding)
+            active_len = 0
+            active_has_dot = False
+
+            for t in range(S):
+                d = dv[b, t].item()
+                l = lb[b, t].item()
+                is_dot = id[b, t].item()
+                pushed = False
+
+                # A '.' continues a digit run if one is active and has no dot yet
+                dot_continues_run = is_dot and in_digit_run and not digit_has_dot
+
+                # --- Finish any run that ended ---
+                if d >= 0:
+                    # Digit: finish word run if active
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            ring[ring_idx % k] = float(val)
+                            ring_idx += 1
+                            ring_count += 1
+                            pushed = True
+                        in_word_run = False
+                        word_bytes = []
+                elif dot_continues_run:
+                    # Decimal point inside digit run — don't finish anything
+                    pass
+                elif l > 0:
+                    # Letter: finish digit run if active
+                    if in_digit_run:
+                        ring[ring_idx % k] = digit_num
+                        ring_idx += 1
+                        ring_count += 1
+                        pushed = True
+                        in_digit_run = False
+                else:
+                    # Neither digit, dot-in-run, nor letter: finish both
+                    if in_digit_run:
+                        ring[ring_idx % k] = digit_num
+                        ring_idx += 1
+                        ring_count += 1
+                        pushed = True
+                        in_digit_run = False
+                    if in_word_run:
+                        val = self._try_word_number(word_bytes)
+                        if val is not None:
+                            ring[ring_idx % k] = float(val)
+                            ring_idx += 1
+                            ring_count += 1
+                            pushed = True
+                        in_word_run = False
+                        word_bytes = []
+
+                # --- Extend or start current run ---
+                if d >= 0:
+                    if not in_digit_run:
+                        digit_num = 0.0
+                        digit_len = 0
+                        digit_has_dot = False
+                        digit_frac_mul = 0.0
+                        in_digit_run = True
+                    if digit_len < max_input_digits:
+                        if digit_has_dot:
+                            digit_num += d * digit_frac_mul
+                            digit_frac_mul *= 0.1
+                        else:
+                            digit_num = digit_num * 10 + d
+                    digit_len += 1
+                elif dot_continues_run:
+                    digit_has_dot = True
+                    digit_frac_mul = 0.1
+                    digit_len += 1
+                elif l > 0:
+                    if not in_word_run:
+                        word_bytes = []
+                        in_word_run = True
+                    word_bytes.append(l)
+
+                # --- Track active digit/decimal run for next-digit index ---
+                if d >= 0:
+                    active_len += 1
+                elif is_dot and not active_has_dot:
+                    active_len += 1
+                    active_has_dot = True
+                else:
+                    active_len = 0
+                    active_has_dot = False
+
+                self._compute_pairs(
+                    ring, ring_idx, ring_count, k, eps, out, b, t, active_len
+                )
+
+        return out

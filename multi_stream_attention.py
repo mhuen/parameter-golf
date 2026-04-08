@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -5,7 +7,14 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from modules import RMSNorm, CastedLinear, LearnableShift, make_linear
-from multi_streams import StreamType, StreamID, StreamConfig, MultiStreamConfig
+from multi_streams import (
+    StreamType,
+    StreamID,
+    StreamConfig,
+    MultiStreamConfig,
+    CompressedView,
+    CompressionType,
+)
 
 
 class MixingMode(StrEnum):
@@ -26,7 +35,7 @@ class StreamMixingConfig:
     bottleneck_dim: int = 32
 
 
-class CausualMultiStreamAttentionViaMixing(nn.Module):
+class CausalMultiStreamAttentionViaMixing(nn.Module):
     """Multi-stream self attention with learned cross-stream mixing.
 
     Each stream produces independent Q, K, V projections. Before attention,
@@ -380,7 +389,7 @@ class CausualMultiStreamAttentionViaMixing(nn.Module):
         return output_streams
 
 
-class CausualMultiStreamAttention(nn.Module):
+class CausalMultiStreamAttention(nn.Module):
     """Standard attention baseline operating on multi-stream interface.
 
     Concatenates all streams into a single vector for Q/K/V projection
@@ -643,6 +652,338 @@ class MultiStreamMLP(nn.Module):
         return output
 
 
+class CausalArithmeticMultiStreamAttention(nn.Module):
+    """Attention-based arithmetic module operating on compressed number streams.
+
+    Uses the same ``MultiStreamConfig`` interface as ``CausalMultiStreamAttention``:
+    reads all streams, writes to writable streams (primarily logit).
+
+    Architecture:
+    1. Pre-computes arithmetic results for ALL pairs (i, j) of detected
+       numbers and encodes them as next-digit one-hot sequences (non-diff).
+    2. Builds pair keys from compressed structural features of both numbers.
+    3. Attention from each position selects which pair's result to use.
+    4. Separate op selector softmax picks the operation.
+    5. Hardcoded scatter maps the selected digit → vocab_size logit delta.
+    6. Gated write-back to writable streams.
+
+    Gradients flow through pair attention weights, op selector, and gate.
+    The pre-computed digit bank is a constant (non-differentiable).
+    """
+
+    NEXT_DIGIT_VOCAB = 12
+    DIGIT_IDX_DOT = 10
+    DIGIT_IDX_END = 11
+    _MAX_RESULT_LEN = 20  # max digits in a result string
+
+    def __init__(
+        self,
+        stream_config: MultiStreamConfig,
+        tok,  # EfficientByteTokenizer
+        n_max: int = 16,
+        compressed_stream_ids: list[StreamID] | None = None,
+        d_head: int = 16,
+        n_ops: int = 5,  # add, sub, mul, div, mod
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.stream_config = stream_config
+        self.d_head = d_head
+        self.n_ops = n_ops
+        self.n_max = n_max
+        self.eps = eps
+
+        # Pre-compute pair indices (i < j)
+        pair_i, pair_j = [], []
+        for i in range(n_max):
+            for j in range(i + 1, n_max):
+                pair_i.append(i)
+                pair_j.append(j)
+        self.register_buffer("pair_i", torch.tensor(pair_i, dtype=torch.long))
+        self.register_buffer("pair_j", torch.tensor(pair_j, dtype=torch.long))
+        self._n_pairs = len(pair_i)
+
+        # Which streams are in the compressed view (for K projection)
+        # Default: all streams. Read-only ones come pre-gathered from the
+        # builder; writable ones are re-gathered each forward call so they
+        # reflect the current (post-attention) state.
+        if compressed_stream_ids is None:
+            self._compressed_ids = [s.name for s in stream_config.streams]
+        else:
+            self._compressed_ids = list(compressed_stream_ids)
+        self._compressed_id_set = set(self._compressed_ids)
+
+        # Split into read-only (pre-gathered) and writable (re-gather in forward)
+        self._readonly_compressed_ids = [
+            s.name for s in stream_config.streams
+            if s.name in self._compressed_id_set and s.read_only
+        ]
+        self._writable_compressed_ids = [
+            s.name for s in stream_config.streams
+            if s.name in self._compressed_id_set and not s.read_only
+        ]
+
+        sum_stream_dims = sum(s.dim for s in stream_config.streams)
+        sum_compressed_dims = sum(
+            s.dim for s in stream_config.streams if s.name in self._compressed_id_set
+        )
+
+        # Pair key: separate projections for number_a and number_b features
+        self.W_ka = nn.Linear(sum_compressed_dims, d_head, bias=False)
+        self.W_kb = nn.Linear(sum_compressed_dims, d_head, bias=False)
+        # Query from full-length streams
+        self.W_q = nn.Linear(sum_stream_dims, d_head, bias=True)
+        # Operation selector from full-length streams
+        self.W_op = nn.Linear(sum_stream_dims, n_ops, bias=True)
+        # Per writable stream gate (init near 0 → sigmoid ≈ 0.12)
+        self.gates = nn.ParameterDict(
+            {
+                s.key: nn.Parameter(torch.tensor(-2.0))
+                for s in stream_config.streams
+                if not s.read_only
+            }
+        )
+
+        # Hardcoded scatter: {0-9, '.', END} → token IDs
+        digit_to_tid = torch.zeros(self.NEXT_DIGIT_VOCAB, dtype=torch.long)
+        for tid in range(tok.vocab_size):
+            info = tok.token_info(tid)
+            if info is None:
+                continue
+            bv = info.byte_value
+            if 0x30 <= bv <= 0x39:
+                digit_to_tid[bv - 0x30] = tid
+            elif bv == 0x2E:
+                digit_to_tid[self.DIGIT_IDX_DOT] = tid
+        self.register_buffer("digit_to_tid", digit_to_tid)
+
+        # '-' token for sign
+        minus_tid = 0
+        for tid in range(tok.vocab_size):
+            info = tok.token_info(tid)
+            if info is not None and info.byte_value == 0x2D:
+                minus_tid = tid
+                break
+        self.register_buffer("minus_tid", torch.tensor(minus_tid, dtype=torch.long))
+
+        # Logit stream info
+        logit_cfg = next(
+            s for s in stream_config.streams if s.name == StreamID(StreamType.LOGIT)
+        )
+        self._logit_dim = logit_cfg.dim
+        self._logit_key = logit_cfg.key
+
+    @staticmethod
+    def _result_to_string(value: float) -> str:
+        av = abs(value)
+        if av == int(av) and av < 1e15:
+            return str(int(av))
+        s = f"{av}"
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s
+
+    def _build_digit_bank(self, values: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        """Pre-compute digit sequences and signs for all pairs × ops.
+
+        Args:
+            values: (B, N) number values.
+            mask: (B, N) valid mask.
+
+        Returns:
+            digit_seqs: (B, P, n_ops, max_len) int tensor of digit class indices.
+            signs: (B, P, n_ops) float tensor (+1, -1, or 0).
+        """
+        B = values.shape[0]
+        P = self._n_pairs
+        n_ops = self.n_ops
+        max_len = self._MAX_RESULT_LEN
+        eps = self.eps
+
+        digit_seqs = torch.full(
+            (B, P, n_ops, max_len),
+            self.DIGIT_IDX_END,
+            dtype=torch.long,
+            device=values.device,
+        )
+        signs = torch.zeros(B, P, n_ops, device=values.device)
+
+        vals_cpu = values.detach().cpu()
+        mask_cpu = mask.detach().cpu()
+        pi = self.pair_i.cpu()
+        pj = self.pair_j.cpu()
+
+        for b in range(B):
+            for p in range(P):
+                i, j = pi[p].item(), pj[p].item()
+                if not mask_cpu[b, i] or not mask_cpu[b, j]:
+                    continue
+                a = vals_cpu[b, i].item()
+                bv = vals_cpu[b, j].item()
+                b_abs = abs(bv) + eps
+                a_abs = abs(a) + eps
+
+                op_results = [
+                    a + bv,
+                    a - bv,
+                    a * bv,
+                    a / b_abs,
+                    math.fmod(a, b_abs),
+                ]
+                for o in range(n_ops):
+                    val = op_results[o]
+                    # Sign
+                    if val > 0:
+                        signs[b, p, o] = 1.0
+                    elif val < 0:
+                        signs[b, p, o] = -1.0
+
+                    s = self._result_to_string(val)
+                    for c in range(min(len(s), max_len)):
+                        ch = s[c]
+                        if ch == ".":
+                            digit_seqs[b, p, o, c] = self.DIGIT_IDX_DOT
+                        elif ch.isdigit():
+                            digit_seqs[b, p, o, c] = int(ch)
+                        # else stays END
+
+        return digit_seqs, signs
+
+    def forward(
+        self,
+        input_streams: dict[StreamID, Tensor],
+        compressed_streams: dict[StreamID, Tensor],
+        view: CompressedView,
+    ) -> dict[StreamID, Tensor]:
+        """Compute arithmetic attention and return update deltas.
+
+        Args:
+            input_streams: full-length streams (B, S, d).
+            compressed_streams: compressed streams (B, N, d) at number positions.
+            view: CompressedView with positions, mask, metadata (values, active_len).
+
+        Returns:
+            Update deltas for writable streams.
+        """
+        bsz = next(iter(input_streams.values())).shape[0]
+        seqlen = next(iter(input_streams.values())).shape[1]
+        device = next(iter(input_streams.values())).device
+        dtype = next(iter(input_streams.values())).dtype
+
+        positions = view.positions  # (B, N)
+        num_mask = view.mask  # (B, N)
+        num_values = view.metadata["values"]  # (B, N)
+        active_len = view.metadata["active_len"]  # (B, S) long
+        P = self._n_pairs
+        n_ops = self.n_ops
+
+        # --- 1. Pre-compute digit bank (non-differentiable) ---
+        digit_seqs, signs = self._build_digit_bank(num_values, num_mask)
+        # digit_seqs: (B, P, n_ops, max_len)
+        # signs: (B, P, n_ops)
+
+        # --- 2. Build pair keys from compressed features ---
+        # Read-only streams use pre-gathered compressed_streams from the builder;
+        # writable streams are re-gathered here from live input_streams so they
+        # reflect updates from earlier sub-layers (e.g., attention residual).
+        comp_parts = [compressed_streams[sid] for sid in self._readonly_compressed_ids]
+        if self._writable_compressed_ids:
+            N = positions.shape[1]
+            idx = positions.clamp(0, seqlen - 1).unsqueeze(-1)  # (B, N, 1)
+            mask_f = num_mask.unsqueeze(-1).to(dtype=dtype)
+            for sid in self._writable_compressed_ids:
+                full = input_streams[sid]  # (B, S, d)
+                idx_exp = idx.expand(-1, -1, full.shape[-1])  # (B, N, d)
+                comp_parts.append(full.gather(1, idx_exp) * mask_f)
+        x_comp = torch.cat(comp_parts, dim=-1)  # (B, N, d_comp)
+        feat_a = x_comp[:, self.pair_i]  # (B, P, d_comp)
+        feat_b = x_comp[:, self.pair_j]  # (B, P, d_comp)
+        K_pair = self.W_ka(feat_a) + self.W_kb(feat_b)  # (B, P, d_head)
+
+        # --- 3. Query from full streams ---
+        x_full = torch.cat(
+            [input_streams[s.name] for s in self.stream_config.streams], dim=-1
+        )  # (B, S, sum_dims)
+        Q = self.W_q(x_full)  # (B, S, d_head)
+
+        # --- 4. Pair attention with causal masking ---
+        scale = 1.0 / math.sqrt(self.d_head)
+        scores = torch.bmm(Q, K_pair.transpose(1, 2)) * scale  # (B, S, P)
+
+        # Causal: both numbers in pair must be at positions <= t
+        pos_a = positions[:, self.pair_i]  # (B, P)
+        pos_b = positions[:, self.pair_j]  # (B, P)
+        pair_pos_max = torch.maximum(pos_a, pos_b)  # (B, P)
+        t_idx = torch.arange(seqlen, device=device).view(1, -1, 1)  # (1, S, 1)
+        causal_ok = pair_pos_max.unsqueeze(1) <= t_idx  # (B, S, P)
+        # Validity: both numbers must be valid
+        pair_valid = num_mask[:, self.pair_i] & num_mask[:, self.pair_j]  # (B, P)
+        attn_mask = causal_ok & pair_valid.unsqueeze(1)  # (B, S, P)
+
+        scores = scores.masked_fill(~attn_mask, float("-inf"))
+        w_pair = F.softmax(scores, dim=-1).nan_to_num(0.0)  # (B, S, P)
+
+        # --- 5. Op selector ---
+        op_weights = F.softmax(self.W_op(x_full), dim=-1)  # (B, S, n_ops)
+
+        # --- 6. Look up digits at active_len ---
+        # active_len: (B, S) → clamp and index into digit_seqs
+        al = active_len.clamp(max=self._MAX_RESULT_LEN - 1)  # (B, S)
+        # Gather: digit_seqs is (B, P, n_ops, max_len), index with al
+        # Expand al to (B, 1, 1, S) then gather along last dim
+        # Reshape for gather: (B, P, n_ops, S)
+        al_exp = al.unsqueeze(1).unsqueeze(1).expand(bsz, P, n_ops, seqlen)
+        digit_seqs_t = digit_seqs.gather(3, al_exp)  # (B, P, n_ops, S)
+        digit_seqs_t = digit_seqs_t.permute(0, 3, 1, 2)  # (B, S, P, n_ops)
+
+        # One-hot encode
+        digit_oh = F.one_hot(digit_seqs_t, self.NEXT_DIGIT_VOCAB).to(
+            dtype
+        )  # (B, S, P, n_ops, 12)
+
+        # --- 7. Weighted combination ---
+        # w_pair: (B, S, P) × op_weights: (B, S, n_ops) → joint selection
+        # combined = sum over P and n_ops of w_pair * op_weights * digit_oh
+        combined = torch.einsum(
+            "bsp, bso, bspod -> bsd",
+            w_pair,
+            op_weights,
+            digit_oh,
+        )  # (B, S, 12)
+
+        # Sign: weighted sign for '-' token
+        # signs: (B, P, n_ops) → expand to (B, S, P, n_ops) via pair and op weights
+        weighted_sign = torch.einsum(
+            "bsp, bso, bpo -> bs",
+            w_pair,
+            op_weights,
+            signs.to(dtype),
+        )  # (B, S)
+
+        # --- 8. Scatter to logit stream ---
+        logit_delta = torch.zeros(
+            bsz, seqlen, self._logit_dim, device=device, dtype=dtype
+        )
+        tid_exp = self.digit_to_tid.view(1, 1, -1).expand(bsz, seqlen, -1)
+        logit_delta.scatter_add_(2, tid_exp, combined)
+        # Add sign to '-' token
+        minus_idx = self.minus_tid.view(1, 1, 1).expand(bsz, seqlen, 1)
+        logit_delta.scatter_add_(2, minus_idx, weighted_sign.unsqueeze(-1))
+
+        # --- 9. Gated write-back ---
+        output: dict[StreamID, Tensor] = {}
+        for s in self.stream_config.streams:
+            if s.read_only:
+                continue
+            gate = torch.sigmoid(self.gates[s.key])
+            if s.key == self._logit_key:
+                output[s.name] = gate * logit_delta
+            else:
+                output[s.name] = torch.zeros_like(input_streams[s.name])
+
+        return output
+
+
 class MultiStreamBlock(nn.Module):
     """Multi-stream transformer block: pre-norm → attention → residual → pre-norm → MLP → residual.
 
@@ -651,6 +992,9 @@ class MultiStreamBlock(nn.Module):
     scale): output = σ(β)*x + σ(α)*update. This allows the model to learn additive
     (β≈1), interpolating (α+β≈1), or full-replacement (α≈1, β≈0) behavior per
     dimension per stream.
+
+    Optional ``arith_attn``: if set, a CausalArithmeticMultiStreamAttention
+    module is applied between attention and MLP using compressed number streams.
     """
 
     def __init__(
@@ -667,6 +1011,7 @@ class MultiStreamBlock(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         k_shift: bool = True,
+        arith_attn: CausalArithmeticMultiStreamAttention | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -691,11 +1036,11 @@ class MultiStreamBlock(nn.Module):
             k_shift=k_shift,
         )
         if mixing_config is not None:
-            self.attn = CausualMultiStreamAttentionViaMixing(
+            self.attn = CausalMultiStreamAttentionViaMixing(
                 **attn_kwargs, mixing_config=mixing_config
             )
         else:
-            self.attn = CausualMultiStreamAttention(**attn_kwargs)
+            self.attn = CausalMultiStreamAttention(**attn_kwargs)
 
         # MLP
         writable_dim = sum(s.dim for s in stream_config.streams if not s.read_only)
@@ -742,7 +1087,30 @@ class MultiStreamBlock(nn.Module):
             }
         )
 
-    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
+        # Optional arithmetic attention (between attention and MLP)
+        self.arith_attn = arith_attn
+        if arith_attn is not None:
+            self.arith_alpha = nn.ParameterDict(
+                {
+                    s.key: nn.Parameter(torch.full((s.dim,), -2.0))
+                    for s in stream_config.streams
+                    if not s.read_only
+                }
+            )
+            self.arith_beta = nn.ParameterDict(
+                {
+                    s.key: nn.Parameter(torch.full((s.dim,), 2.0))
+                    for s in stream_config.streams
+                    if not s.read_only
+                }
+            )
+
+    def forward(
+        self,
+        input_streams: dict[StreamID, Tensor],
+        compressed: dict[str, dict[StreamID, Tensor]] | None = None,
+        views: dict[str, CompressedView] | None = None,
+    ) -> dict[StreamID, Tensor]:
         # --- Attention sub-layer ---
         normed = {
             s.name: self.attn_norms[s.key](input_streams[s.name])
@@ -758,6 +1126,17 @@ class MultiStreamBlock(nn.Module):
                 alpha = torch.sigmoid(self.attn_alpha[s.key])
                 beta = torch.sigmoid(self.attn_beta[s.key])
                 x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
+
+        # --- Optional arithmetic attention (between attention and MLP) ---
+        if self.arith_attn is not None and compressed is not None and views is not None:
+            num_compressed = compressed[CompressionType.NUMBER]
+            num_view = views[CompressionType.NUMBER]
+            arith_out = self.arith_attn(x, num_compressed, num_view)
+            for s in self.stream_config.streams:
+                if not s.read_only and s.name in arith_out:
+                    alpha = torch.sigmoid(self.arith_alpha[s.key])
+                    beta = torch.sigmoid(self.arith_beta[s.key])
+                    x[s.name] = beta * x[s.name] + alpha * arith_out[s.name]
 
         # --- MLP sub-layer ---
         normed = {
@@ -795,7 +1174,7 @@ if __name__ == "__main__":
     for qk_mode in MixingMode:
         for source in MixingSource:
             cfg = StreamMixingConfig(qk_mode=qk_mode, source=source, bottleneck_dim=16)
-            model = CausualMultiStreamAttentionViaMixing(**kwargs, mixing_config=cfg)
+            model = CausalMultiStreamAttentionViaMixing(**kwargs, mixing_config=cfg)
             inp = {
                 s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams
             }
@@ -804,7 +1183,7 @@ if __name__ == "__main__":
             n = sum(p.numel() for p in model.parameters())
             print(f"  {qk_mode:8s} + {source:20s}: OK  ({n:,} params)")
 
-    model = CausualMultiStreamAttention(**kwargs)
+    model = CausalMultiStreamAttention(**kwargs)
     inp = {s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams}
     out = model(inp)
     sum(v.sum() for v in out.values() if v.requires_grad).backward()
