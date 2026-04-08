@@ -15,7 +15,8 @@ With rolling hash + K-shift, a single attention head should be able to perfectly
 copy a previously seen sequence — the core induction head mechanism.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -29,7 +30,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, HashBoundary
+from byte_stream_components import ByteHashComponent, HashBoundary
 from modules import RMSNorm, LearnableShift
 from multi_streams import (
     StreamType,
@@ -216,13 +217,20 @@ class StandardAttentionCopyModel(nn.Module):
     output projects back to vocab_size.
     """
 
-    def __init__(self, stream_defs: list[StreamDef], tok: EfficientByteTokenizer, head_dim: int = 64):
+    def __init__(
+        self,
+        stream_defs: list[StreamDef],
+        tok: EfficientByteTokenizer,
+        head_dim: int = 64,
+    ):
         super().__init__()
         self.vocab_size = tok.vocab_size
         self.builder = MultiStreamBuilder(stream_defs, vocab_size=tok.vocab_size)
 
         structural_dim = next(
-            s.dim for s in self.builder.config.streams if s.name == StreamID(StreamType.STRUCTURAL)
+            s.dim
+            for s in self.builder.config.streams
+            if s.name == StreamID(StreamType.STRUCTURAL)
         )
         input_dim = tok.vocab_size + structural_dim
         self.W_q = nn.Linear(input_dim, head_dim, bias=False)
@@ -272,7 +280,9 @@ if __name__ == "__main__":
     MAX_CODE_LEN = 16
 
     # Bind training length range into batch function
-    make_train_batch = partial(_make_batch_raw, min_len=MIN_CODE_LEN, max_len=MAX_CODE_LEN)
+    make_train_batch = partial(
+        _make_batch_raw, min_len=MIN_CODE_LEN, max_len=MAX_CODE_LEN
+    )
 
     ms_model = MultiStreamTestModel(
         stream_defs=stream_defs,
@@ -316,8 +326,11 @@ if __name__ == "__main__":
 
         def eval_fn(m, d, _min=MIN_CODE_LEN, _max=MAX_CODE_LEN):
             return evaluate_autoregressive(
-                m, partial(make_sample, min_len=_min, max_len=_max),
-                tok, n_samples=200, device=d,
+                m,
+                partial(make_sample, min_len=_min, max_len=_max),
+                tok,
+                n_samples=200,
+                device=d,
             )
 
         train_model(model, make_train_batch, **train_kwargs, eval_fn=eval_fn)
@@ -346,12 +359,12 @@ if __name__ == "__main__":
         show_examples(
             model,
             partial(make_sample, min_len=6, max_len=14),
-            tok, device, n=6,
+            tok,
+            device,
+            n=6,
         )
 
-        verify_causality(
-            model, tok, device, make_sample_fn=make_sample, label=name
-        )
+        verify_causality(model, tok, device, make_sample_fn=make_sample, label=name)
         print()
 
     # Summary comparison

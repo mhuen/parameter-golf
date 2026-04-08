@@ -1,6 +1,7 @@
 """Tests for DigitSequenceComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import DigitSequenceComponent
+from byte_stream_components import DigitSequenceComponent
 
 tok = EfficientByteTokenizer()
 
@@ -21,7 +22,6 @@ def _encode(text: str) -> torch.Tensor:
 
 
 class TestDigitSequenceComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = DigitSequenceComponent(tok, id_freqs=1)
@@ -40,7 +40,7 @@ class TestDigitSequenceComponent:
         # "a1b" → BOS(0), a(1), 1(2), b(3)
         ids = _encode("a1b")
         out = comp(ids, dtype=torch.float32)
-        assert out[0, 2, 0].item() == pytest.approx(1.0)   # '1' is digit
+        assert out[0, 2, 0].item() == pytest.approx(1.0)  # '1' is digit
         assert out[0, 1, 0].item() == pytest.approx(-1.0)  # 'a' is not
         assert out[0, 3, 0].item() == pytest.approx(-1.0)  # 'b' is not
 
@@ -61,7 +61,7 @@ class TestDigitSequenceComponent:
         ids = _encode("1a2")
         out = comp(ids, dtype=torch.float32)
         # number_id sin/cos (dims 2-3) should differ between the two runs
-        id_first = out[0, 1, 2:]   # digit '1', run 1
+        id_first = out[0, 1, 2:]  # digit '1', run 1
         id_second = out[0, 3, 2:]  # digit '2', run 2
         assert not torch.allclose(id_first, id_second)
 

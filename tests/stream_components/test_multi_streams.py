@@ -1,7 +1,8 @@
 """Tests for multi_streams: SinCosPositionComponent, DocBoundaryComponent,
 CompositeStream, MultiStreamBuilder."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -27,7 +28,6 @@ from modules import sincos_encode
 
 
 class TestSinCosPositionComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = SinCosPositionComponent(num_freqs=8)
@@ -76,7 +76,6 @@ class TestSinCosPositionComponent:
 
 
 class TestDocBoundaryComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = DocBoundaryComponent(bos_id=1, num_freqs=1)
@@ -123,11 +122,10 @@ class TestDocBoundaryComponent:
 
 
 class TestCompositeStream:
-
     @torch.no_grad()
     def test_dim_sum(self):
-        c1 = SinCosPositionComponent(num_freqs=4)   # dim=8
-        c2 = SinCosPositionComponent(num_freqs=6)   # dim=12
+        c1 = SinCosPositionComponent(num_freqs=4)  # dim=8
+        c2 = SinCosPositionComponent(num_freqs=6)  # dim=12
         cs = CompositeStream([c1, c2])
         assert cs.dim == 20
 
@@ -152,16 +150,19 @@ class TestCompositeStream:
 
 
 class TestMultiStreamBuilder:
-
     @torch.no_grad()
     def test_config_with_structural(self):
         builder = MultiStreamBuilder(
             stream_defs=[
                 StreamDef(name=StreamID(StreamType.LOGIT), dim=256),
-                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
-                    SinCosPositionComponent(num_freqs=8),
-                    DocBoundaryComponent(bos_id=1, num_freqs=1),
-                ]),
+                StreamDef(
+                    name=StreamID(StreamType.STRUCTURAL),
+                    read_only=True,
+                    components=[
+                        SinCosPositionComponent(num_freqs=8),
+                        DocBoundaryComponent(bos_id=1, num_freqs=1),
+                    ],
+                ),
             ],
         )
         cfg = builder.config
@@ -186,16 +187,23 @@ class TestMultiStreamBuilder:
         builder = MultiStreamBuilder(
             stream_defs=[
                 StreamDef(name=StreamID(StreamType.LOGIT), dim=32),
-                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
-                    SinCosPositionComponent(num_freqs=4),
-                ]),
+                StreamDef(
+                    name=StreamID(StreamType.STRUCTURAL),
+                    read_only=True,
+                    components=[
+                        SinCosPositionComponent(num_freqs=4),
+                    ],
+                ),
             ],
         )
         B, S = 2, 10
         ids = torch.zeros(B, S, dtype=torch.long)
         writable = torch.randn(B, S, 32)
         streams, _, _ = builder(ids, dtype=torch.float32, logit=writable)
-        assert set(streams.keys()) == {StreamID(StreamType.LOGIT), StreamID(StreamType.STRUCTURAL)}
+        assert set(streams.keys()) == {
+            StreamID(StreamType.LOGIT),
+            StreamID(StreamType.STRUCTURAL),
+        }
         assert streams[StreamID(StreamType.LOGIT)].shape == (B, S, 32)
         assert streams[StreamID(StreamType.STRUCTURAL)].shape == (B, S, 8)
 
@@ -204,9 +212,13 @@ class TestMultiStreamBuilder:
         builder = MultiStreamBuilder(
             stream_defs=[
                 StreamDef(name=StreamID(StreamType.LOGIT), dim=16),
-                StreamDef(name=StreamID(StreamType.STRUCTURAL), read_only=True, components=[
-                    SinCosPositionComponent(),
-                ]),
+                StreamDef(
+                    name=StreamID(StreamType.STRUCTURAL),
+                    read_only=True,
+                    components=[
+                        SinCosPositionComponent(),
+                    ],
+                ),
             ],
         )
         ids = torch.zeros(1, 5, dtype=torch.long)

@@ -1,6 +1,7 @@
 """Tests for _run_length helper from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from byte_modules import _run_length
+from byte_stream_components import _run_length
 
 
 @torch.no_grad()
@@ -42,14 +43,18 @@ def test_mixed():
 
 @torch.no_grad()
 def test_batch():
-    x = torch.tensor([
-        [0, 0, 0, 1],
-        [1, 0, 0, 0],
-    ])
+    x = torch.tensor(
+        [
+            [0, 0, 0, 1],
+            [1, 0, 0, 0],
+        ]
+    )
     out = _run_length(x)
-    expected = torch.tensor([
-        [0.0, math.log1p(1), math.log1p(2), 0.0],
-        [0.0, 0.0, math.log1p(1), math.log1p(2)],
-    ])
+    expected = torch.tensor(
+        [
+            [0.0, math.log1p(1), math.log1p(2), 0.0],
+            [0.0, 0.0, math.log1p(1), math.log1p(2)],
+        ]
+    )
     assert out.shape == (2, 4)
     torch.testing.assert_close(out, expected)

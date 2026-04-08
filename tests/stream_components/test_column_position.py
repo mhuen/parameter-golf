@@ -1,6 +1,7 @@
 """Tests for ColumnPositionComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ColumnPositionComponent
+from byte_stream_components import ColumnPositionComponent
 
 tok = EfficientByteTokenizer()
 
@@ -21,7 +22,6 @@ def _encode(text: str) -> torch.Tensor:
 
 
 class TestColumnPositionComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = ColumnPositionComponent(tok, num_freqs=3)

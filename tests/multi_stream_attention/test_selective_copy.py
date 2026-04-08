@@ -11,7 +11,8 @@ Answer: only the characters matching the requested category, in order.
 Compares multi-stream attention (with context scratch stream) vs TinyGPT.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -23,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, HashBoundary, BoundaryComponent
+from byte_stream_components import ByteHashComponent, HashBoundary, BoundaryComponent
 from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,
@@ -122,7 +123,9 @@ def make_batch(
 def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-        StreamDef(name=StreamID(StreamType.CONTEXT), dim=32, auto_zeros=True),  # writable scratch
+        StreamDef(
+            name=StreamID(StreamType.CONTEXT), dim=32, auto_zeros=True
+        ),  # writable scratch
         StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),

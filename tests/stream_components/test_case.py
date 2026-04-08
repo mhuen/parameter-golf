@@ -1,6 +1,7 @@
 """Tests for CaseComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import CaseComponent
+from byte_stream_components import CaseComponent
 
 tok = EfficientByteTokenizer()
 
@@ -39,9 +40,9 @@ def test_case_states():
     ids = _encode("AbC")
     out = comp(ids, dtype=torch.float32)
     # Positions 0,1,2 are A, b, C
-    assert out[0, 0, 0].item() == pytest.approx(1.0)   # A -> upper
+    assert out[0, 0, 0].item() == pytest.approx(1.0)  # A -> upper
     assert out[0, 1, 0].item() == pytest.approx(-1.0)  # b -> lower
-    assert out[0, 2, 0].item() == pytest.approx(1.0)   # C -> upper
+    assert out[0, 2, 0].item() == pytest.approx(1.0)  # C -> upper
 
 
 @torch.no_grad()

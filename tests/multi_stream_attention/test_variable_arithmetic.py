@@ -26,15 +26,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import random
 import string
 import torch
-from torch import Stream, Tensor
+from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import (
+from byte_modules import NumberExtractor
+from byte_stream_components import (
     ByteHashComponent,
     BoundaryComponent,
     HashBoundary,
     DigitSequenceComponent,
-    NumberExtractor,
     ByteCategoryComponent,
     MultiByteStateComponent,
     CaseComponent,

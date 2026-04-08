@@ -1,6 +1,7 @@
 """Tests for ByteCategoryComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteCategoryComponent
+from byte_stream_components import ByteCategoryComponent
 
 tok = EfficientByteTokenizer()
 
@@ -21,7 +22,6 @@ def _encode(text: str) -> torch.Tensor:
 
 
 class TestByteCategoryComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = ByteCategoryComponent(tok, embed_dim=4)

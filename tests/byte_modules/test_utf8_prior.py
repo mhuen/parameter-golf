@@ -1,4 +1,6 @@
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import math
@@ -98,9 +100,7 @@ def test_after_complete_two_byte_is_ready():
     prior = _make_prior()
     # Prepend BOS so the bounded lookback can find the lead byte
     raw = tok.encode("é")  # bytes: 0xC3, 0xA9
-    ids = torch.tensor(
-        [[tok.bos_id] + raw.tolist()], dtype=torch.long
-    )
+    ids = torch.tensor([[tok.bos_id] + raw.tolist()], dtype=torch.long)
     _, token_mask = prior(ids)
     # Last position (0xA9) completes the 2-byte sequence -> READY
     cont_ids = _cont_tids()

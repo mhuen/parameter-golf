@@ -1,6 +1,7 @@
 """Tests for RepeatedByteComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import RepeatedByteComponent
+from byte_stream_components import RepeatedByteComponent
 
 tok = EfficientByteTokenizer()
 
@@ -52,8 +53,8 @@ def test_all_same():
     out = comp(ids, dtype=torch.float32)
     # Positions 0,1,2 are a, a, a
     assert out[0, 0, 0].item() == pytest.approx(-1.0)  # first position always -1
-    assert out[0, 1, 0].item() == pytest.approx(1.0)   # matches previous
-    assert out[0, 2, 0].item() == pytest.approx(1.0)   # matches previous
+    assert out[0, 1, 0].item() == pytest.approx(1.0)  # matches previous
+    assert out[0, 2, 0].item() == pytest.approx(1.0)  # matches previous
 
 
 @torch.no_grad()

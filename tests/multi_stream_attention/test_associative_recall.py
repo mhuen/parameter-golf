@@ -12,7 +12,8 @@ Compares:
 2. TinyGPT baseline sized to approximately match parameter count.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -24,7 +25,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, HashBoundary
+from byte_stream_components import ByteHashComponent, HashBoundary
 from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,
@@ -113,7 +114,9 @@ if __name__ == "__main__":
 
     # --- Stream definitions for multi-stream model ---
     stream_defs = [
-        StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),  # caller provides one-hot
+        StreamDef(
+            name=StreamID(StreamType.LOGIT), dim=tok.vocab_size
+        ),  # caller provides one-hot
         StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),

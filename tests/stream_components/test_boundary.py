@@ -1,6 +1,7 @@
 """Tests for BoundaryComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import BoundaryComponent
+from byte_stream_components import BoundaryComponent
 
 tok = EfficientByteTokenizer()
 
@@ -32,7 +33,6 @@ def _make(**kwargs):
 
 
 class TestBoundaryComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = _make()

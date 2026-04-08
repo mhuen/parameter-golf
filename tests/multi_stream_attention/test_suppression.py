@@ -21,18 +21,17 @@ Key anti-reward-hacking measures:
 Compares multi-stream attention (with context stream) vs TinyGPT baseline.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import random
-import string
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, HashBoundary
+from byte_stream_components import ByteHashComponent, HashBoundary
 from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,

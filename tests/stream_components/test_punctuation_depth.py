@@ -1,6 +1,7 @@
 """Tests for PunctuationDepthComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import PunctuationDepthComponent
+from byte_stream_components import PunctuationDepthComponent
 
 tok = EfficientByteTokenizer()
 
@@ -53,10 +54,10 @@ def test_quote_toggle():
     # Quote cumsum: 0, 1, 1, 2, 2
     # Quote state: -1, +1, +1, -1, -1
     assert out[0, 0, 1].item() == pytest.approx(-1.0)  # a: outside
-    assert out[0, 1, 1].item() == pytest.approx(1.0)    # ": inside (odd)
-    assert out[0, 2, 1].item() == pytest.approx(1.0)    # b: inside (odd)
-    assert out[0, 3, 1].item() == pytest.approx(-1.0)   # ": outside (even)
-    assert out[0, 4, 1].item() == pytest.approx(-1.0)   # c: outside (even)
+    assert out[0, 1, 1].item() == pytest.approx(1.0)  # ": inside (odd)
+    assert out[0, 2, 1].item() == pytest.approx(1.0)  # b: inside (odd)
+    assert out[0, 3, 1].item() == pytest.approx(-1.0)  # ": outside (even)
+    assert out[0, 4, 1].item() == pytest.approx(-1.0)  # c: outside (even)
 
 
 @torch.no_grad()

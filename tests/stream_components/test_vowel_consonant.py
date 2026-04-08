@@ -1,6 +1,7 @@
 """Tests for VowelConsonantComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import VowelConsonantComponent
+from byte_stream_components import VowelConsonantComponent
 
 tok = EfficientByteTokenizer()
 
@@ -39,7 +40,7 @@ def test_vowel_consonant_states():
     ids = _encode("abc")
     out = comp(ids, dtype=torch.float32)
     # Positions 0,1,2 are a, b, c
-    assert out[0, 0, 0].item() == pytest.approx(1.0)   # a -> vowel
+    assert out[0, 0, 0].item() == pytest.approx(1.0)  # a -> vowel
     assert out[0, 1, 0].item() == pytest.approx(-1.0)  # b -> consonant
     assert out[0, 2, 0].item() == pytest.approx(-1.0)  # c -> consonant
 

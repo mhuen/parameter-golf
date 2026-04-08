@@ -11,7 +11,8 @@ No word boundaries are used since the patterns are continuous character streams.
 Multiple hash window sizes (3, 5, 8) cover different period lengths.
 """
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -23,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteHashComponent, HashBoundary
+from byte_stream_components import ByteHashComponent, HashBoundary
 from multi_streams import StreamType, StreamID, StreamDef, SinCosPositionComponent
 from test_harness import (
     TinyGPT,
@@ -292,7 +293,9 @@ if __name__ == "__main__":
         print("\n  Examples:")
         show_examples(model, make_eval_sample(), tok, device=device, n=5)
 
-        verify_causality(model, tok, device, make_sample_fn=make_eval_sample(), label=name)
+        verify_causality(
+            model, tok, device, make_sample_fn=make_eval_sample(), label=name
+        )
         print()
 
     # --- Summary comparison ---

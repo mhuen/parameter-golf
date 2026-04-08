@@ -1,6 +1,7 @@
 """Tests for DistanceBias from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -22,7 +23,7 @@ def test_small_distances_identity():
 def test_large_distances_log_spaced():
     db = DistanceBias(num_buckets=32, max_distance=128)
     max_exact = 16
-    buckets = db.distance_to_bucket[max_exact : 129]
+    buckets = db.distance_to_bucket[max_exact:129]
     # All should be in [16, 31]
     assert (buckets >= max_exact).all()
     assert (buckets <= 31).all()

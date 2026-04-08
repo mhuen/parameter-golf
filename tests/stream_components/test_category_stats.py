@@ -1,6 +1,7 @@
 """Tests for ByteCategoryStatsComponent from byte_modules."""
 
-import sys, os
+import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteCategoryStatsComponent
+from byte_stream_components import ByteCategoryStatsComponent
 
 tok = EfficientByteTokenizer()
 
@@ -21,7 +22,6 @@ def _encode(text: str) -> torch.Tensor:
 
 
 class TestByteCategoryStatsComponent:
-
     @torch.no_grad()
     def test_shape(self):
         comp = ByteCategoryStatsComponent(tok)
@@ -60,7 +60,7 @@ class TestByteCategoryStatsComponent:
         # At pos 2: letter=1/3, digit=1/3
         ids = _encode("a1")
         out = comp(ids, dtype=torch.float32)
-        digit_frac = out[0, 2, 0].item()   # digit is index 0
+        digit_frac = out[0, 2, 0].item()  # digit is index 0
         letter_frac = out[0, 2, 1].item()  # letter is index 1
         assert digit_frac == pytest.approx(1.0 / 3.0)
         assert letter_frac == pytest.approx(1.0 / 3.0)

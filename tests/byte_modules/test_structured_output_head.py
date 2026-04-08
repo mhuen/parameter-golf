@@ -13,7 +13,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import ByteLogitHierarchy, StructuredLogitsAdapter, StructuredOutputHead
+from byte_modules import (
+    ByteLogitHierarchy,
+    StructuredLogitsAdapter,
+    StructuredOutputHead,
+)
 
 tok = EfficientByteTokenizer()
 V = tok.vocab_size
@@ -23,7 +27,9 @@ LOGIT_SOFTCAP = 30.0
 
 
 def _make_head(**kwargs):
-    defaults = dict(model_dim=MODEL_DIM, vocab_size=V, tok=tok, logit_softcap=LOGIT_SOFTCAP)
+    defaults = dict(
+        model_dim=MODEL_DIM, vocab_size=V, tok=tok, logit_softcap=LOGIT_SOFTCAP
+    )
     defaults.update(kwargs)
     return StructuredOutputHead(**defaults)
 
@@ -318,7 +324,9 @@ def test_hierarchy_assemble_with_priors():
     token_prior = torch.zeros(B, S, V)
     token_prior[..., :50] = float("-inf")
     ngram_logp = F.log_softmax(torch.randn(B, S, V), dim=-1)
-    log_p = hier.assemble(per_level, cat_prior=cat_prior, token_prior=token_prior, ngram_logp=ngram_logp)
+    log_p = hier.assemble(
+        per_level, cat_prior=cat_prior, token_prior=token_prior, ngram_logp=ngram_logp
+    )
     sums = log_p.exp().sum(dim=-1)
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 

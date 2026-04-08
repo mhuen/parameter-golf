@@ -1,11 +1,13 @@
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import math
 import torch
 import pytest
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_modules import DigitComputeComponent, PairwiseOp
+from byte_stream_components import DigitComputeComponent, PairwiseOp
 
 tok = EfficientByteTokenizer()
 
@@ -31,11 +33,12 @@ def _result_to_string(value: float) -> str:
 
 # ===== Shape / dim =====
 
+
 @torch.no_grad()
 def test_dim_default():
     comp = _make()
     n_arith = 8  # ADD, MUL, SUB, RSUB, DIV, RDIV, MOD, RMOD
-    n_cmp = 3    # GT, EQ, LT
+    n_cmp = 3  # GT, EQ, LT
     # 1 pair (k=2), each arith op = 13 dims (1 sign + 12 one-hot)
     expected = 1 * (n_arith * 13 + n_cmp)
     assert comp.dim == expected
@@ -76,6 +79,7 @@ def test_output_dtype():
 
 
 # ===== Number parsing =====
+
 
 @torch.no_grad()
 def test_single_number_no_output():
@@ -124,6 +128,7 @@ def test_number_word_parsing():
 
 
 # ===== Next-digit encoding =====
+
 
 def _get_next_digit_idx(one_hot_12: torch.Tensor) -> int:
     """Extract the active index from a 12-dim one-hot vector."""
@@ -201,6 +206,7 @@ def test_next_digit_dot_in_result():
 
 # ===== Arithmetic ops =====
 
+
 def _assert_op_at(
     text: str,
     op: PairwiseOp,
@@ -218,7 +224,9 @@ def _assert_op_at(
     if expected_first_digit is not None:
         one_hot = last[1:13]
         idx = _get_next_digit_idx(one_hot)
-        assert idx == expected_first_digit, f"Expected digit idx {expected_first_digit}, got {idx}"
+        assert idx == expected_first_digit, (
+            f"Expected digit idx {expected_first_digit}, got {idx}"
+        )
 
 
 @torch.no_grad()
@@ -278,6 +286,7 @@ def test_rmod():
 
 # ===== Comparisons =====
 
+
 @torch.no_grad()
 def test_gt():
     comp = _make(ops={PairwiseOp.GT})
@@ -317,6 +326,7 @@ def test_lt():
 
 # ===== Number words =====
 
+
 @torch.no_grad()
 def test_number_word_three_plus_five():
     comp = _make(ops={PairwiseOp.ADD})
@@ -351,6 +361,7 @@ def test_unknown_word_ignored():
 
 
 # ===== Ring buffer =====
+
 
 @torch.no_grad()
 def test_ring_buffer_overwrites_oldest():
@@ -387,6 +398,7 @@ def test_k3_three_pairs():
 
 # ===== Causality =====
 
+
 @torch.no_grad()
 def test_causality():
     """Output at position t should not change when tokens after t change."""
@@ -401,6 +413,7 @@ def test_causality():
 
 
 # ===== Batch =====
+
 
 @torch.no_grad()
 def test_batch_independent():
@@ -423,6 +436,7 @@ def test_batch_independent():
 
 # ===== Zero result =====
 
+
 @torch.no_grad()
 def test_zero_result_sign():
     """Zero result should have sign = 0.0."""
@@ -434,6 +448,7 @@ def test_zero_result_sign():
 
 
 # ===== Negative result =====
+
 
 @torch.no_grad()
 def test_negative_result_sign_and_digits():
@@ -448,6 +463,7 @@ def test_negative_result_sign_and_digits():
 
 
 # ===== Float results via DIV =====
+
 
 @torch.no_grad()
 def test_div_float_result_digits():
@@ -468,6 +484,7 @@ def test_div_float_result_digits():
 
 
 # ===== Long integration test =====
+
 
 @torch.no_grad()
 def test_long_sequence_integration():
@@ -592,7 +609,9 @@ def test_long_sequence_integration():
             add_val = a + bv
             expected_sign = 1.0 if add_val > 0 else (-1.0 if add_val < 0 else 0.0)
             actual_sign = out[0, t, 0].item()
-            assert actual_sign == expected_sign, f"t={t}: ADD sign expected {expected_sign}, got {actual_sign}"
+            assert actual_sign == expected_sign, (
+                f"t={t}: ADD sign expected {expected_sign}, got {actual_sign}"
+            )
 
             s = _result_to_string(add_val)
             if active_len < len(s):
@@ -606,16 +625,21 @@ def test_long_sequence_integration():
             else:
                 exp_idx = 11
             actual_idx = _get_next_digit_idx(out[0, t, 1:13])
-            assert actual_idx == exp_idx, f"t={t}: ADD digit idx expected {exp_idx}, got {actual_idx} (result='{s}', active_len={active_len})"
+            assert actual_idx == exp_idx, (
+                f"t={t}: ADD digit idx expected {exp_idx}, got {actual_idx} (result='{s}', active_len={active_len})"
+            )
 
             # SUB (second op)
             sub_val = a - bv
             sub_sign_exp = 1.0 if sub_val > 0 else (-1.0 if sub_val < 0 else 0.0)
             sub_sign_act = out[0, t, ad].item()
-            assert sub_sign_act == sub_sign_exp, f"t={t}: SUB sign expected {sub_sign_exp}, got {sub_sign_act}"
+            assert sub_sign_act == sub_sign_exp, (
+                f"t={t}: SUB sign expected {sub_sign_exp}, got {sub_sign_act}"
+            )
 
 
 # ===== Edge cases =====
+
 
 @torch.no_grad()
 def test_empty_input():
