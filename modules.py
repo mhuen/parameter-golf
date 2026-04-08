@@ -451,6 +451,34 @@ class GatedCausalConv(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Logit capping
+# ---------------------------------------------------------------------------
+
+
+def softcap_linear(x: Tensor, cap: float, knee: float | None = None) -> Tensor:
+    """Soft-cap with an exactly linear core and smooth rational tails.
+
+    Exactly identity in ``[-knee, knee]`` (gradient = 1).  Outside, a rational
+    function smoothly asymptotes to ``±cap``.  C1-continuous at the knee.
+
+    Compared to ``cap * tanh(x / cap)`` which always compresses gradients,
+    this preserves perfect unit gradients for normal-magnitude values and only
+    compresses outliers.
+
+    Args:
+        x: input tensor.
+        cap: asymptotic bound (output ∈ (-cap, cap)).
+        knee: boundary of the linear region.  Default ``0.8 * cap``.
+    """
+    if knee is None:
+        knee = 0.8 * cap
+    r = cap - knee  # remaining headroom above knee
+    excess = (x.abs() - knee).clamp(min=0)
+    compression = excess.square() / (r + excess)
+    return torch.where(x >= 0, x - compression, x + compression)
+
+
+# ---------------------------------------------------------------------------
 # Mixed-precision utilities
 # ---------------------------------------------------------------------------
 
