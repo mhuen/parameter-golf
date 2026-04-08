@@ -69,3 +69,25 @@ def test_unbalanced_negative():
     # Depth: -1, -2
     assert out[0, 0, 0].item() == pytest.approx(-1.0)
     assert out[0, 1, 0].item() == pytest.approx(-2.0)
+
+
+@torch.no_grad()
+def test_bos_reset():
+    """Bracket depth and quote state reset at document boundary."""
+    import numpy as np
+
+    comp = PunctuationDepthComponent(tok)
+    doc1 = tok.encode('(("hello"')
+    doc2 = tok.encode('(a"b")')
+    multi = np.concatenate([[tok.bos_id], doc1, [tok.bos_id], doc2])
+    ids_multi = torch.tensor(multi, dtype=torch.long).unsqueeze(0)
+    out_multi = comp(ids_multi, dtype=torch.float32)
+
+    solo = np.concatenate([[tok.bos_id], doc2])
+    ids_solo = torch.tensor(solo, dtype=torch.long).unsqueeze(0)
+    out_solo = comp(ids_solo, dtype=torch.float32)
+
+    doc2_start = 1 + len(doc1)
+    torch.testing.assert_close(
+        out_multi[0, doc2_start:], out_solo[0], atol=1e-5, rtol=1e-5
+    )

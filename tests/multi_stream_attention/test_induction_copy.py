@@ -43,6 +43,7 @@ from test_harness import (
     count_params,
     train_model,
     evaluate_autoregressive,
+    evaluate_packed,
     show_examples,
     verify_causality,
 )
@@ -270,6 +271,15 @@ class StandardAttentionCopyModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack", action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}\n")
@@ -309,8 +319,12 @@ if __name__ == "__main__":
         lr=3e-2,
         eval_every=400,
         device=device,
+        pack_documents=args.pack,
     )
     eval_ranges = [(4, 8), (8, 12), (12, 16), (16, 20)]
+
+    if args.pack:
+        print("*** Document packing enabled (2 docs/seq, BOS-separated) ***\n")
 
     results = {}
 
@@ -324,14 +338,21 @@ if __name__ == "__main__":
         print(name)
         print("=" * 60)
 
-        def eval_fn(m, d, _min=MIN_CODE_LEN, _max=MAX_CODE_LEN):
-            return evaluate_autoregressive(
-                m,
-                partial(make_sample, min_len=_min, max_len=_max),
-                tok,
-                n_samples=200,
-                device=d,
-            )
+        if args.pack:
+            def eval_fn(m, d, _min=MIN_CODE_LEN, _max=MAX_CODE_LEN):
+                return evaluate_packed(
+                    m, partial(_make_batch_raw, min_len=_min, max_len=_max),
+                    tok, n_samples=200, device=d,
+                )
+        else:
+            def eval_fn(m, d, _min=MIN_CODE_LEN, _max=MAX_CODE_LEN):
+                return evaluate_autoregressive(
+                    m,
+                    partial(make_sample, min_len=_min, max_len=_max),
+                    tok,
+                    n_samples=200,
+                    device=d,
+                )
 
         train_model(model, make_train_batch, **train_kwargs, eval_fn=eval_fn)
 
@@ -354,6 +375,12 @@ if __name__ == "__main__":
                 )
             )
         results[name] = accs
+
+        if args.pack:
+            packed_acc = evaluate_packed(
+                model, make_train_batch, tok, n_samples=200, device=device,
+            )
+            print(f"\n  Packed accuracy: {packed_acc:.1%}")
 
         print("\n  Examples:")
         show_examples(

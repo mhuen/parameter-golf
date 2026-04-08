@@ -117,3 +117,27 @@ class TestBoundaryComponent:
         out_f16 = comp(ids, dtype=torch.float16)
         assert out_f32.dtype == torch.float32
         assert out_f16.dtype == torch.float16
+
+    @torch.no_grad()
+    def test_bos_reset(self):
+        """Doc2 output in multi-doc sequence matches doc2 encoded alone."""
+        import numpy as np
+
+        comp = _make()
+        doc1 = tok.encode("ab cd ef.")
+        doc2 = tok.encode("gh ij.")
+        # Multi-doc: [BOS, doc1..., BOS, doc2...]
+        multi = np.concatenate([[tok.bos_id], doc1, [tok.bos_id], doc2])
+        ids_multi = torch.tensor(multi, dtype=torch.long).unsqueeze(0)
+        out_multi = comp(ids_multi, dtype=torch.float32)
+
+        # Solo: [BOS, doc2...]
+        solo = np.concatenate([[tok.bos_id], doc2])
+        ids_solo = torch.tensor(solo, dtype=torch.long).unsqueeze(0)
+        out_solo = comp(ids_solo, dtype=torch.float32)
+
+        # Doc2 starts at position 1 + len(doc1) in multi-doc
+        doc2_start = 1 + len(doc1)
+        torch.testing.assert_close(
+            out_multi[0, doc2_start:], out_solo[0], atol=1e-5, rtol=1e-5
+        )

@@ -61,6 +61,7 @@ from test_harness import (
     count_params,
     train_model,
     evaluate_autoregressive,
+    evaluate_packed,
     show_examples,
     verify_causality,
 )
@@ -306,6 +307,15 @@ def build_arith_model(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack", action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}")
@@ -381,7 +391,11 @@ if __name__ == "__main__":
         lr=3e-2,
         eval_every=500,
         device=device,
+        pack_documents=args.pack,
     )
+
+    if args.pack:
+        print("*** Document packing enabled (2 docs/seq, BOS-separated) ***\n")
 
     results: dict[str, dict[str, float]] = {}
     for name, model in reversed(models):
@@ -389,10 +403,16 @@ if __name__ == "__main__":
         print(name)
         print("=" * 70)
 
-        def eval_fn(m, d):
-            return evaluate_autoregressive(
-                m, make_sample_l1, tok, n_samples=200, device=d
-            )
+        if args.pack:
+            def eval_fn(m, d):
+                return evaluate_packed(
+                    m, make_batch_mixed, tok, n_samples=200, device=d
+                )
+        else:
+            def eval_fn(m, d):
+                return evaluate_autoregressive(
+                    m, make_sample_l1, tok, n_samples=200, device=d
+                )
 
         train_model(model, make_batch_mixed, **train_kwargs, eval_fn=eval_fn)
 
@@ -412,6 +432,12 @@ if __name__ == "__main__":
             )
             level_results[level_name] = acc
             print(f"  {level_name} accuracy: {acc:.1%}")
+
+        if args.pack:
+            packed_acc = evaluate_packed(
+                model, make_batch_mixed, tok, n_samples=300, device=device,
+            )
+            print(f"  Packed accuracy: {packed_acc:.1%}")
 
         # Per-op evaluation on L1
         print("  L1 per-op:")

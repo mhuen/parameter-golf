@@ -33,6 +33,7 @@ from test_harness import (
     count_params,
     train_model,
     evaluate_autoregressive,
+    evaluate_packed,
     show_examples,
     verify_causality,
 )
@@ -109,6 +110,16 @@ def make_batch(tok: EfficientByteTokenizer, batch_size: int) -> tuple[Tensor, Te
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack",
+        action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
 
@@ -155,8 +166,17 @@ if __name__ == "__main__":
     )
 
     train_kwargs = dict(
-        tok=tok, steps=2000, batch_size=64, lr=3e-2, eval_every=400, device=device
+        tok=tok,
+        steps=2000,
+        batch_size=64,
+        lr=3e-2,
+        eval_every=400,
+        device=device,
+        pack_documents=args.pack,
     )
+
+    if args.pack:
+        print("*** Document packing enabled (2 docs/seq, BOS-separated) ***\n")
 
     models = [
         ("Multi-Stream Attention (1 head, head_dim=32, 1 layer)", ms_model),
@@ -169,10 +189,37 @@ if __name__ == "__main__":
         print("=" * 60)
         count_params(model, name)
 
-        def eval_fn(m, d):
-            return evaluate_autoregressive(m, make_sample, tok, n_samples=200, device=d)
+        if args.pack:
+
+            def eval_fn(m, d):
+                return evaluate_packed(m, make_batch, tok, n_samples=200, device=d)
+        else:
+
+            def eval_fn(m, d):
+                return evaluate_autoregressive(
+                    m, make_sample, tok, n_samples=200, device=d
+                )
 
         train_model(model, make_batch, **train_kwargs, eval_fn=eval_fn)
+
+        # Always report both single-doc and packed accuracy at the end
+        single_acc = evaluate_autoregressive(
+            model,
+            make_sample,
+            tok,
+            n_samples=200,
+            device=device,
+        )
+        print(f"\n  Single-doc accuracy: {single_acc:.1%}")
+        if args.pack:
+            packed_acc = evaluate_packed(
+                model,
+                make_batch,
+                tok,
+                n_samples=200,
+                device=device,
+            )
+            print(f"  Packed accuracy:     {packed_acc:.1%}")
 
         print("\n  Examples:")
         show_examples(model, make_sample, tok, device, n=5)

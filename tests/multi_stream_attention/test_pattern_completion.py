@@ -32,6 +32,7 @@ from test_harness import (
     count_params,
     train_model,
     evaluate_autoregressive,
+    evaluate_packed,
     show_examples,
     verify_causality,
 )
@@ -202,6 +203,15 @@ def build_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack", action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}\n")
@@ -236,7 +246,11 @@ if __name__ == "__main__":
         lr=3e-2,
         eval_every=400,
         device=device,
+        pack_documents=args.pack,
     )
+
+    if args.pack:
+        print("*** Document packing enabled (2 docs/seq, BOS-separated) ***\n")
 
     results = {}
 
@@ -248,14 +262,16 @@ if __name__ == "__main__":
         print(f"Training: {name}")
         print("=" * 60)
 
-        def eval_fn(m, d):
-            return evaluate_autoregressive(
-                m,
-                make_eval_sample(),
-                tok,
-                n_samples=200,
-                device=d,
-            )
+        if args.pack:
+            def eval_fn(m, d):
+                return evaluate_packed(
+                    m, make_train_batch, tok, n_samples=200, device=d,
+                )
+        else:
+            def eval_fn(m, d):
+                return evaluate_autoregressive(
+                    m, make_eval_sample(), tok, n_samples=200, device=d,
+                )
 
         model = train_model(
             model,
@@ -266,13 +282,14 @@ if __name__ == "__main__":
 
         # --- Overall evaluation ---
         overall_acc = evaluate_autoregressive(
-            model,
-            make_eval_sample(),
-            tok,
-            n_samples=500,
-            device=device,
+            model, make_eval_sample(), tok, n_samples=500, device=device,
         )
-        print(f"\n  Overall accuracy: {overall_acc:.1%}")
+        print(f"\n  Single-doc accuracy: {overall_acc:.1%}")
+        if args.pack:
+            packed_acc = evaluate_packed(
+                model, make_train_batch, tok, n_samples=500, device=device,
+            )
+            print(f"  Packed accuracy:     {packed_acc:.1%}")
 
         # --- Per-period evaluation ---
         print("\n  Per-period accuracy:")

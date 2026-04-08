@@ -32,6 +32,7 @@ from test_harness import (
     count_params,
     train_model,
     evaluate_autoregressive,
+    evaluate_packed,
     show_examples,
     verify_causality,
 )
@@ -155,6 +156,15 @@ def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack", action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
     print(f"Device: {device}, vocab_size: {tok.vocab_size}\n")
@@ -191,6 +201,9 @@ if __name__ == "__main__":
     gpt_params = count_params(gpt_model, "TinyGPT")
     print(f"\n  Param ratio (GPT / MS): {gpt_params / ms_params:.2f}x\n")
 
+    if args.pack:
+        print("*** Document packing enabled (2 docs/seq, BOS-separated) ***\n")
+
     # --- Training ---
     train_kwargs = dict(
         make_batch_fn=make_batch,
@@ -200,17 +213,23 @@ if __name__ == "__main__":
         lr=3e-2,
         eval_every=400,
         device=device,
+        pack_documents=args.pack,
     )
 
-    def ms_eval_fn(model, dev):
-        return evaluate_autoregressive(
-            model, make_sample, tok, n_samples=200, device=dev
-        )
-
-    def gpt_eval_fn(model, dev):
-        return evaluate_autoregressive(
-            model, make_sample, tok, n_samples=200, device=dev
-        )
+    if args.pack:
+        def ms_eval_fn(model, dev):
+            return evaluate_packed(model, make_batch, tok, n_samples=200, device=dev)
+        def gpt_eval_fn(model, dev):
+            return evaluate_packed(model, make_batch, tok, n_samples=200, device=dev)
+    else:
+        def ms_eval_fn(model, dev):
+            return evaluate_autoregressive(
+                model, make_sample, tok, n_samples=200, device=dev
+            )
+        def gpt_eval_fn(model, dev):
+            return evaluate_autoregressive(
+                model, make_sample, tok, n_samples=200, device=dev
+            )
 
     print("=" * 60)
     print("Training Multi-stream")
@@ -245,10 +264,12 @@ if __name__ == "__main__":
             "letters": letters_acc,
             "digits": digits_acc,
         }
-        print(
-            f"  {name:15s}  overall={overall:.1%}  "
-            f"letters={letters_acc:.1%}  digits={digits_acc:.1%}"
-        )
+        line = f"  {name:15s}  overall={overall:.1%}  letters={letters_acc:.1%}  digits={digits_acc:.1%}"
+        if args.pack:
+            packed = evaluate_packed(model, make_batch, tok, n_samples=400, device=device)
+            results[name]["packed"] = packed
+            line += f"  packed={packed:.1%}"
+        print(line)
 
     # --- Show examples per category ---
     for name, model in [("Multi-stream", ms_model), ("TinyGPT", gpt_model)]:

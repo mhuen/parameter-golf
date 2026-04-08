@@ -140,3 +140,24 @@ class TestByteHashComponent:
         ids_batch = ids.expand(2, -1)
         out = comp(ids_batch, dtype=torch.float32)
         torch.testing.assert_close(out[0], out[1])
+
+    @torch.no_grad()
+    def test_bos_reset(self):
+        """Hash features reset at document boundary."""
+        import numpy as np
+
+        comp = _make()
+        doc1 = tok.encode("hello world")
+        doc2 = tok.encode("foo bar")
+        multi = np.concatenate([[tok.bos_id], doc1, [tok.bos_id], doc2])
+        ids_multi = torch.tensor(multi, dtype=torch.long).unsqueeze(0)
+        out_multi = comp(ids_multi, dtype=torch.float32)
+
+        solo = np.concatenate([[tok.bos_id], doc2])
+        ids_solo = torch.tensor(solo, dtype=torch.long).unsqueeze(0)
+        out_solo = comp(ids_solo, dtype=torch.float32)
+
+        doc2_start = 1 + len(doc1)
+        torch.testing.assert_close(
+            out_multi[0, doc2_start:], out_solo[0], atol=1e-5, rtol=1e-5
+        )

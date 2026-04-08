@@ -77,3 +77,24 @@ class TestDigitSequenceComponent:
         # Same run → same number_id
         torch.testing.assert_close(out[0, 1, 2:], out[0, 2, 2:])
         torch.testing.assert_close(out[0, 1, 2:], out[0, 3, 2:])
+
+    @torch.no_grad()
+    def test_bos_reset(self):
+        """Number IDs reset at document boundary."""
+        import numpy as np
+
+        comp = DigitSequenceComponent(tok, id_freqs=1)
+        doc1 = tok.encode("12 34")
+        doc2 = tok.encode("56 78")
+        multi = np.concatenate([[tok.bos_id], doc1, [tok.bos_id], doc2])
+        ids_multi = torch.tensor(multi, dtype=torch.long).unsqueeze(0)
+        out_multi = comp(ids_multi, dtype=torch.float32)
+
+        solo = np.concatenate([[tok.bos_id], doc2])
+        ids_solo = torch.tensor(solo, dtype=torch.long).unsqueeze(0)
+        out_solo = comp(ids_solo, dtype=torch.float32)
+
+        doc2_start = 1 + len(doc1)
+        torch.testing.assert_close(
+            out_multi[0, doc2_start:], out_solo[0], atol=1e-5, rtol=1e-5
+        )

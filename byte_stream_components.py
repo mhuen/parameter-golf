@@ -80,6 +80,7 @@ class BoundaryComponent(nn.Module):
     ):
         super().__init__()
         self.base = base
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
 
         is_separator = torch.tensor(
@@ -120,15 +121,17 @@ class BoundaryComponent(nn.Module):
     def dim(self) -> int:
         return self._dim
 
-    def _pos_within(self, is_boundary: Tensor, input_ids: Tensor) -> Tensor:
+    def _pos_within(
+        self, is_boundary: Tensor, input_ids: Tensor, reset_mask: Tensor
+    ) -> Tensor:
         """Compute causal position within current segment.
 
         Uses cummax to track the last boundary position — only depends on
-        positions ≤ t.  If no boundary seen yet, distance is from position 0.
+        positions ≤ t.  Resets at BOS (document boundary).
         """
         B, S = input_ids.shape
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
-        is_b = is_boundary[input_ids].bool()
+        is_b = is_boundary[input_ids].bool() | reset_mask
         last_b_pos = (
             torch.where(is_b, positions, torch.zeros_like(positions))
             .cummax(dim=1)
@@ -142,22 +145,28 @@ class BoundaryComponent(nn.Module):
         input_ids: Tensor,
         id_freqs: int,
         pos_freqs: int,
+        reset_mask: Tensor,
     ) -> list[Tensor]:
         """Encode one boundary type as sin/cos features (causal)."""
         parts = []
         if id_freqs > 0:
-            boundary_id = is_marker[input_ids].cumsum(dim=1)  # causal
+            boundary_id = _segmented_cumsum(is_marker[input_ids], reset_mask)
             parts.append(sincos_encode(boundary_id, id_freqs, self.base))
         if pos_freqs > 0:
-            pos_within = self._pos_within(is_marker, input_ids)  # causal
+            pos_within = self._pos_within(is_marker, input_ids, reset_mask)
             parts.append(sincos_encode(pos_within, pos_freqs, self.base))
         return parts
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        reset_mask = input_ids == self.bos_id
         parts: list[Tensor] = []
         parts.extend(
             self._encode_boundary(
-                self.is_separator, input_ids, self.word_id_freqs, self.word_pos_freqs
+                self.is_separator,
+                input_ids,
+                self.word_id_freqs,
+                self.word_pos_freqs,
+                reset_mask,
             )
         )
         parts.extend(
@@ -166,6 +175,7 @@ class BoundaryComponent(nn.Module):
                 input_ids,
                 self.sent_id_freqs,
                 self.sent_pos_freqs,
+                reset_mask,
             )
         )
         if self.has_newline:
@@ -175,6 +185,7 @@ class BoundaryComponent(nn.Module):
                     input_ids,
                     self.para_id_freqs,
                     self.para_pos_freqs,
+                    reset_mask,
                 )
             )
         return torch.cat(parts, dim=-1).to(dtype=dtype)
@@ -217,6 +228,7 @@ class MultiByteStateComponent(nn.Module):
         super().__init__()
         self.id_freqs = id_freqs
         self.base = base
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
         token_byte_type = torch.zeros(V, dtype=torch.long)
         for tid in range(V):
@@ -291,10 +303,45 @@ class MultiByteStateComponent(nn.Module):
                 | (byte_type == self.BT_LEAD_3)
                 | (byte_type == self.BT_LEAD_4)
             )
-            codepoint_id = is_lead.long().cumsum(dim=1)  # causal
+            reset_mask = input_ids == self.bos_id
+            codepoint_id = _segmented_cumsum(is_lead.long(), reset_mask)
             parts.append(sincos_encode(codepoint_id, self.id_freqs, self.base))
 
         return torch.cat(parts, dim=-1).to(dtype=dtype)
+
+
+def _segmented_cumsum(x: Tensor, reset_mask: Tensor) -> Tensor:
+    """Cumulative sum along dim=1 that restarts where reset_mask is True.
+
+    Args:
+        x: (B, S) numeric tensor.
+        reset_mask: (B, S) boolean — True at document starts (BOS positions).
+
+    When reset_mask is all-False, equivalent to ``x.cumsum(dim=1)``.
+    Uses only static-shape ops (works with torch.compile fullgraph).
+    """
+    was_long = x.dtype == torch.long
+    xf = x.float() if was_long else x
+    full = torch.cumsum(xf, dim=1)
+    correction_at_reset = full - xf
+    neg_inf = torch.tensor(-float("inf"), device=x.device, dtype=xf.dtype)
+    sparse = torch.where(reset_mask, correction_at_reset, neg_inf)
+    carried, _ = torch.cummax(sparse, dim=1)
+    carried = torch.where(carried.isinf(), torch.zeros_like(carried), carried)
+    result = full - carried
+    return result.long() if was_long else result
+
+
+def _segmented_cumsum_2d(x: Tensor, reset_mask: Tensor) -> Tensor:
+    """Segmented cumsum for multi-channel (B, S, C) tensors.
+
+    Reshapes to (B*C, S), applies _segmented_cumsum, reshapes back.
+    """
+    B, S, C = x.shape
+    xr = x.permute(0, 2, 1).reshape(B * C, S)  # (B*C, S)
+    rm = reset_mask.unsqueeze(1).expand(B, C, S).reshape(B * C, S)
+    result = _segmented_cumsum(xr, rm)
+    return result.reshape(B, C, S).permute(0, 2, 1)
 
 
 def _run_length(cat_ids: Tensor) -> Tensor:
@@ -396,6 +443,7 @@ class ColumnPositionComponent(nn.Module):
         super().__init__()
         self.num_freqs = num_freqs
         self.base = base
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
         is_newline = torch.zeros(V, dtype=torch.long)
         for tid in range(V):
@@ -411,7 +459,7 @@ class ColumnPositionComponent(nn.Module):
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
-        is_nl = self.is_newline[input_ids].bool()
+        is_nl = self.is_newline[input_ids].bool() | (input_ids == self.bos_id)
         last_nl = (
             torch.where(is_nl, positions, torch.zeros_like(positions))
             .cummax(dim=1)
@@ -438,6 +486,7 @@ class DigitSequenceComponent(nn.Module):
         super().__init__()
         self.id_freqs = id_freqs
         self.base = base
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
         is_digit = torch.zeros(V, dtype=torch.long)
         digit_mask = tok.mask(ByteCategory.DIGIT)
@@ -469,7 +518,8 @@ class DigitSequenceComponent(nn.Module):
             run_start = torch.zeros_like(is_dig)
             run_start[:, 0] = is_dig[:, 0]
             run_start[:, 1:] = is_dig[:, 1:] & ~is_dig[:, :-1]
-            number_id = run_start.long().cumsum(dim=1)  # causal
+            reset_mask = input_ids == self.bos_id
+            number_id = _segmented_cumsum(run_start.long(), reset_mask)
             parts.append(sincos_encode(number_id, self.id_freqs, self.base))
 
         return torch.cat(parts, dim=-1).to(dtype=dtype)
@@ -508,6 +558,7 @@ class PunctuationDepthComponent(nn.Module):
 
     def __init__(self, tok: EfficientByteTokenizer):
         super().__init__()
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
         is_open = torch.zeros(V, dtype=torch.long)
         is_close = torch.zeros(V, dtype=torch.long)
@@ -531,11 +582,12 @@ class PunctuationDepthComponent(nn.Module):
         return 2
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        opens = self.is_open[input_ids].cumsum(dim=1)  # causal
-        closes = self.is_close[input_ids].cumsum(dim=1)  # causal
+        reset_mask = input_ids == self.bos_id
+        opens = _segmented_cumsum(self.is_open[input_ids], reset_mask)
+        closes = _segmented_cumsum(self.is_close[input_ids], reset_mask)
         bracket_depth = (opens - closes).float()
 
-        quote_count = self.is_quote[input_ids].cumsum(dim=1)  # causal
+        quote_count = _segmented_cumsum(self.is_quote[input_ids], reset_mask)
         quote_state = torch.where(quote_count % 2 == 1, 1.0, -1.0)
 
         return torch.stack([bracket_depth, quote_state], dim=-1).to(dtype=dtype)
@@ -568,6 +620,7 @@ class ByteCategoryStatsComponent(nn.Module):
 
     def __init__(self, tok: EfficientByteTokenizer):
         super().__init__()
+        self.bos_id = tok.bos_id
         V = tok.vocab_size
         token_to_cat_oh = torch.zeros(V, self.NUM_STATS_CATS)
         for ci, cat in enumerate(_STATS_CATEGORIES):
@@ -582,12 +635,14 @@ class ByteCategoryStatsComponent(nn.Module):
         return self.NUM_STATS_CATS
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        B, S = input_ids.shape
+        reset_mask = input_ids == self.bos_id
         cat_oh = self.token_to_cat_oh[input_ids]  # (B, S, 6)
-        cumcounts = cat_oh.cumsum(dim=1)  # causal
-        positions = torch.arange(
-            1, input_ids.shape[1] + 1, device=input_ids.device, dtype=torch.float32
+        cumcounts = _segmented_cumsum_2d(cat_oh, reset_mask)
+        seg_pos = _segmented_cumsum(
+            torch.ones(B, S, device=input_ids.device), reset_mask
         )
-        fractions = cumcounts / positions[None, :, None]
+        fractions = cumcounts / seg_pos.unsqueeze(-1).clamp(min=1)
         return fractions.to(dtype=dtype)
 
 
@@ -628,6 +683,7 @@ class ByteHashComponent(nn.Module):
         hit_bucket_size: int = 251,
     ):
         super().__init__()
+        self.bos_id = tok.bos_id
         self.window = window
         self.num_hashes = num_hashes
         self.boundary = boundary
@@ -694,29 +750,37 @@ class ByteHashComponent(nn.Module):
         return 2 * self.num_hashes + (2 if self.track_hits else 0)
 
     def _effective_lookback(self, input_ids: Tensor) -> Tensor:
-        """Per-position lookback depth. -1 means inactive (hash = 0)."""
+        """Per-position lookback depth. -1 means inactive (hash = 0).
+
+        BOS positions reset the lookback so hashes don't span documents.
+        """
         B, S = input_ids.shape
         device = input_ids.device
         positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+        is_bos = input_ids == self.bos_id
 
         if self.boundary is None:
-            return positions  # full window always
+            # BOS acts as a boundary that caps the lookback
+            last_bos = (
+                torch.where(is_bos, positions, torch.full_like(positions, -1))
+                .cummax(dim=1)
+                .values
+            )
+            return torch.where(is_bos, torch.full_like(positions, -1), positions - last_bos - 1)
 
         elif self.boundary == HashBoundary.WORD:
-            is_sep = self.is_separator[input_ids]
-            # Use -1 sentinel so first word (before any separator) is included
+            # BOS acts as a separator
+            is_sep = self.is_separator[input_ids] | is_bos
             last_sep = (
                 torch.where(is_sep, positions, torch.full_like(positions, -1))
                 .cummax(dim=1)
                 .values
             )
-            # pos_in_word: 1 at first byte of word, 2 at second, ...
-            # 0 at separator itself
             pos_in_word = positions - last_sep
-            return pos_in_word - 1  # -1 at separator → inactive
+            return pos_in_word - 1  # -1 at separator/BOS → inactive
 
         elif self.boundary == HashBoundary.DIGIT:
-            is_dig = self.is_digit_buf[input_ids]
+            is_dig = self.is_digit_buf[input_ids] & ~is_bos
             run_start = torch.zeros_like(is_dig)
             run_start[:, 0] = is_dig[:, 0]
             run_start[:, 1:] = is_dig[:, 1:] & ~is_dig[:, :-1]
@@ -729,8 +793,8 @@ class ByteHashComponent(nn.Module):
             return torch.where(is_dig, pos_in_run, torch.full_like(positions, -1))
 
         elif self.boundary == HashBoundary.CODEPOINT:
-            is_mb = self.is_multibyte[input_ids]
-            is_lead = self.is_lead_byte[input_ids]
+            is_mb = self.is_multibyte[input_ids] & ~is_bos
+            is_lead = self.is_lead_byte[input_ids] & ~is_bos
             last_lead = (
                 torch.where(is_lead, positions, torch.full_like(positions, -1))
                 .cummax(dim=1)
@@ -777,16 +841,17 @@ class ByteHashComponent(nn.Module):
 
         # Hit count: how many previous positions share the same hash bucket
         if self.track_hits:
+            reset_mask = input_ids == self.bos_id
             Q = self.hit_bucket_size
             bucket = hit_bucket % Q  # (B, S), values in [0, Q)
             one_hot = F.one_hot(bucket, Q).float()  # (B, S, Q)
-            cumcount = one_hot.cumsum(dim=1)  # (B, S, Q), causal
+            cumcount = _segmented_cumsum_2d(one_hot, reset_mask)
             hits = (
                 cumcount.gather(2, bucket.unsqueeze(-1)).squeeze(-1) - 1
             )  # exclude self
-            # Segment count so far (for fraction): cumsum of active positions
+            # Segment count so far (for fraction): segmented cumsum of active positions
             is_active = (eff_lb >= 0).float()
-            seg_count = is_active.cumsum(dim=1).clamp(min=1)
+            seg_count = _segmented_cumsum(is_active, reset_mask).clamp(min=1)
             hit_frac = hits / seg_count
             hit_log = hits.clamp(min=0).log1p()
             parts.append(torch.stack([hit_log, hit_frac], dim=-1))
@@ -897,6 +962,7 @@ class DigitComputeComponent(nn.Module):
         ops: set[PairwiseOp] | None = None,
     ):
         super().__init__()
+        self.bos_id = tok.bos_id
         self.k = k
         self._num_pairs = k * (k - 1) // 2
 
@@ -1102,6 +1168,22 @@ class DigitComputeComponent(nn.Module):
             active_has_dot = False
 
             for t in range(S):
+                # Reset all state at document boundaries
+                if input_ids[b, t].item() == self.bos_id:
+                    ring = [0.0] * k
+                    ring_idx = 0
+                    ring_count = 0
+                    digit_num = 0.0
+                    digit_len = 0
+                    digit_has_dot = False
+                    digit_frac_mul = 0.0
+                    in_digit_run = False
+                    word_bytes = []
+                    in_word_run = False
+                    active_len = 0
+                    active_has_dot = False
+                    continue  # BOS output stays zeros
+
                 d = dv[b, t].item()
                 l = lb[b, t].item()
                 is_dot = id[b, t].item()

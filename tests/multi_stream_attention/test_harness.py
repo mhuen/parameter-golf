@@ -349,6 +349,50 @@ def _format_alphas(model: nn.Module) -> str:
     return "  " + " ".join(parts)
 
 
+def _pack_batch(
+    make_batch_fn: MakeBatchFn,
+    tok: EfficientByteTokenizer,
+    batch_size: int,
+    docs_per_seq: int = 2,
+) -> tuple[Tensor, Tensor]:
+    """Pack multiple documents per sequence, each prefixed with BOS.
+
+    Generates ``docs_per_seq`` independent batches, strips trailing padding
+    from each row, and concatenates them as ``[BOS doc_1 BOS doc_2 ...]``.
+    The result is re-padded to uniform length.
+
+    Returns: (input_ids, targets) — same contract as any MakeBatchFn.
+    """
+    batches = [make_batch_fn(tok, batch_size) for _ in range(docs_per_seq)]
+
+    packed_ids_list: list[Tensor] = []
+    packed_tgt_list: list[Tensor] = []
+    bos = torch.tensor([tok.bos_id], dtype=torch.long)
+    ignore = torch.tensor([-100], dtype=torch.long)
+
+    for i in range(batch_size):
+        row_parts_ids: list[Tensor] = []
+        row_parts_tgt: list[Tensor] = []
+        for ids_batch, tgt_batch in batches:
+            doc_ids = ids_batch[i]
+            doc_len = int((doc_ids != tok.pad_id).sum().item())
+            row_parts_ids.append(bos)
+            row_parts_ids.append(doc_ids[:doc_len])
+            row_parts_tgt.append(ignore)
+            row_parts_tgt.append(tgt_batch[i, :doc_len])
+        packed_ids_list.append(torch.cat(row_parts_ids))
+        packed_tgt_list.append(torch.cat(row_parts_tgt))
+
+    max_len = max(r.numel() for r in packed_ids_list)
+    padded_ids = torch.full((batch_size, max_len), tok.pad_id, dtype=torch.long)
+    padded_tgt = torch.full((batch_size, max_len), -100, dtype=torch.long)
+    for i, (ri, rt) in enumerate(zip(packed_ids_list, packed_tgt_list)):
+        padded_ids[i, : ri.numel()] = ri
+        padded_tgt[i, : rt.numel()] = rt
+
+    return padded_ids, padded_tgt
+
+
 def train_model(
     model: nn.Module,
     make_batch_fn: MakeBatchFn,
@@ -359,15 +403,24 @@ def train_model(
     eval_fn: Callable | None = None,
     eval_every: int = 400,
     device: str = "cpu",
+    pack_documents: bool = False,
 ) -> nn.Module:
-    """Generic training loop for synthetic tasks."""
+    """Generic training loop for synthetic tasks.
+
+    Args:
+        pack_documents: if True, pack 2 documents per sequence (each prefixed
+            with BOS) so that cross-document causal attention is exercised.
+    """
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
 
     for step in range(1, steps + 1):
         model.train()
-        input_ids, targets = make_batch_fn(tok, batch_size)
+        if pack_documents:
+            input_ids, targets = _pack_batch(make_batch_fn, tok, batch_size)
+        else:
+            input_ids, targets = make_batch_fn(tok, batch_size)
         input_ids = input_ids.to(device)
         targets = targets.to(device)
 
@@ -389,8 +442,9 @@ def train_model(
 
             ks_str = _format_k_shifts(model)
             alpha_str = _format_alphas(model)
+            pack_str = " [packed]" if pack_documents else ""
             print(
-                f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}{ks_str}{alpha_str}"
+                f"    step {step:5d}  loss={loss.item():.4f}  acc={acc:.1%}{ks_str}{alpha_str}{pack_str}"
             )
 
     return model
@@ -436,6 +490,45 @@ def evaluate_autoregressive(
             if predicted[j] == expected_ids[j]:
                 correct += 1
         total += max(0, len(expected_ids) - len(predicted))
+
+    return correct / max(total, 1)
+
+
+@torch.no_grad()
+def evaluate_packed(
+    model: nn.Module,
+    make_batch_fn: MakeBatchFn,
+    tok: EfficientByteTokenizer,
+    n_samples: int = 200,
+    device: str = "cpu",
+    docs_per_seq: int = 2,
+) -> float:
+    """Teacher-forced accuracy on packed (multi-document) sequences.
+
+    Packs ``docs_per_seq`` documents per row, runs a single forward pass,
+    then scores each document independently: for every supervised position
+    the argmax prediction must match the target.
+
+    Returns: fraction of correctly predicted supervised tokens.
+    """
+    model.eval()
+    total = 0
+    correct = 0
+    remaining = n_samples
+
+    while remaining > 0:
+        bsz = min(remaining, 64)
+        input_ids, targets = _pack_batch(make_batch_fn, tok, bsz, docs_per_seq)
+        input_ids = input_ids.to(device)
+        targets = targets.to(device)
+
+        logits = model(input_ids)  # (B, S, V)
+        preds = logits.argmax(dim=-1)  # (B, S)
+
+        mask = targets != -100
+        total += int(mask.sum().item())
+        correct += int((preds[mask] == targets[mask]).sum().item())
+        remaining -= bsz * docs_per_seq  # each row has docs_per_seq documents
 
     return correct / max(total, 1)
 
