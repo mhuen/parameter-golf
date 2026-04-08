@@ -397,7 +397,10 @@ def test_assemble_logits_scatter_correctness():
                 idx = hier.level_indices[i, t].item()
                 level_logit = logits[0, 0, idx].item()
                 if hier._is_leaf[i]:
-                    level_logit = LOGIT_SOFTCAP * math.tanh(level_logit / LOGIT_SOFTCAP)
+                    from modules import softcap_linear
+                    level_logit = softcap_linear(
+                        torch.tensor(level_logit), cap=LOGIT_SOFTCAP
+                    ).item()
                 expected += level_logit
         assert abs(flat[0, 0, t].item() - expected) < 1e-5, (
             f"Token {t}: got {flat[0, 0, t].item()}, expected {expected}"

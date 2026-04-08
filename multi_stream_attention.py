@@ -818,7 +818,7 @@ class MultiStreamCausalConvLayers(nn.Module):
 
         self.norms = nn.ModuleList(
             [
-                nn.ModuleDict({s.key: RMSNorm() for s in stream_config.streams})
+                nn.ModuleDict({s.key: RMSNorm() for s in stream_config.streams if s.normalize})
                 for _ in range(num_layers)
             ]
         )
@@ -869,7 +869,9 @@ class MultiStreamCausalConvLayers(nn.Module):
         for layer_idx in range(self.num_layers):
             norms = self.norms[layer_idx]
             normed = {
-                s.name: norms[s.key](x[s.name]) for s in self.stream_config.streams
+                s.name: norms[s.key](x[s.name]) if s.normalize
+                else x[s.name]
+                for s in self.stream_config.streams
             }
             conv_out = self.convs[layer_idx](normed)
             for s in self.stream_config.streams:
@@ -1250,12 +1252,12 @@ class MultiStreamBlock(nn.Module):
         super().__init__()
         self.stream_config = stream_config
 
-        # Per-stream norms (weight-free RMSNorm)
+        # Per-stream norms (weight-free RMSNorm) — only for streams with normalize=True
         self.attn_norms = nn.ModuleDict(
-            {s.key: RMSNorm() for s in stream_config.streams}
+            {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
         )
         self.mlp_norms = nn.ModuleDict(
-            {s.key: RMSNorm() for s in stream_config.streams}
+            {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
         )
 
         # Attention
@@ -1327,7 +1329,7 @@ class MultiStreamBlock(nn.Module):
         self.conv = conv
         if conv is not None:
             self.conv_norms = nn.ModuleDict(
-                {s.key: RMSNorm() for s in stream_config.streams}
+                {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
             )
             self.conv_alpha = nn.ParameterDict(
                 {
@@ -1370,7 +1372,8 @@ class MultiStreamBlock(nn.Module):
     ) -> dict[StreamID, Tensor]:
         # --- Attention sub-layer ---
         normed = {
-            s.name: self.attn_norms[s.key](input_streams[s.name])
+            s.name: self.attn_norms[s.key](input_streams[s.name]) if s.normalize
+            else input_streams[s.name]
             for s in self.stream_config.streams
         }
         attn_out = self.attn(normed)
@@ -1387,7 +1390,8 @@ class MultiStreamBlock(nn.Module):
         # --- Optional causal conv (between attention and MLP) ---
         if self.conv is not None:
             normed = {
-                s.name: self.conv_norms[s.key](x[s.name])
+                s.name: self.conv_norms[s.key](x[s.name]) if s.normalize
+                else x[s.name]
                 for s in self.stream_config.streams
             }
             conv_out = self.conv(normed)
@@ -1410,7 +1414,9 @@ class MultiStreamBlock(nn.Module):
 
         # --- MLP sub-layer ---
         normed = {
-            s.name: self.mlp_norms[s.key](x[s.name]) for s in self.stream_config.streams
+            s.name: self.mlp_norms[s.key](x[s.name]) if s.normalize
+            else x[s.name]
+            for s in self.stream_config.streams
         }
         mlp_out = self.mlp(normed)
 
