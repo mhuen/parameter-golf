@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 from multi_streams import CompressedView
+from number_detection import detect_numbers
 
 from modules import CastedLinear, softcap_linear
 
@@ -778,9 +779,9 @@ class NumberExtractor(nn.Module):
     - ``metadata["values"]``: (B, N_max) scalar value of each number
     - ``metadata["lengths"]``: (B, N_max) token count per number
     - ``metadata["active_len"]``: (B, S) current digit run length at each position
-    """
 
-    _MAX_INPUT_DIGITS = 15  # float64 significant digits
+    Fully vectorized — no .item(), torch.compile(fullgraph=True) safe.
+    """
 
     def __init__(
         self,
@@ -790,7 +791,8 @@ class NumberExtractor(nn.Module):
     ):
         super().__init__()
         self.n_max = n_max
-        self._number_words = number_words if number_words is not None else _NUMBER_WORDS
+        number_words = number_words if number_words is not None else _NUMBER_WORDS
+        self.bos_id = tok.bos_id
 
         V = tok.vocab_size
         digit_value = torch.full((V,), -1, dtype=torch.long)
@@ -811,140 +813,40 @@ class NumberExtractor(nn.Module):
         self.register_buffer("lowercase_byte", lowercase_byte)
         self.register_buffer("is_decimal", is_decimal)
 
-    def _try_word_number(self, word_bytes: list[int]) -> int | None:
-        word = bytes(word_bytes).decode("ascii", errors="replace")
-        return self._number_words.get(word)
+        # Pre-compute word number patterns as integer byte sequences
+        word_groups: dict[int, list[tuple[list[int], int]]] = {}
+        for word, val in number_words.items():
+            byte_seq = [ord(c) for c in word]
+            word_groups.setdefault(len(byte_seq), []).append((byte_seq, val))
+        self._word_lengths: tuple[int, ...] = tuple(sorted(word_groups.keys()))
+        for wl, group in word_groups.items():
+            pats = torch.tensor([p for p, _v in group], dtype=torch.long)
+            vals = torch.tensor([_v for _p, _v in group], dtype=torch.long)
+            self.register_buffer(f"_word_pat_{wl}", pats)
+            self.register_buffer(f"_word_val_{wl}", vals)
 
     def forward(self, input_ids: Tensor) -> CompressedView:
-        B, S = input_ids.shape
-        device = input_ids.device
-        n_max = self.n_max
-        max_input_digits = self._MAX_INPUT_DIGITS
+        word_pats = {wl: getattr(self, f"_word_pat_{wl}") for wl in self._word_lengths}
+        word_vals = {wl: getattr(self, f"_word_val_{wl}") for wl in self._word_lengths}
 
-        dv = self.digit_value[input_ids]  # (B, S)
-        lb = self.lowercase_byte[input_ids]  # (B, S)
-        is_dec = self.is_decimal[input_ids]  # (B, S)
-
-        # Output tensors
-        positions = torch.zeros(B, n_max, dtype=torch.long, device=device)
-        mask = torch.zeros(B, n_max, dtype=torch.bool, device=device)
-        values = torch.zeros(B, n_max, dtype=torch.float32, device=device)
-        lengths = torch.zeros(B, n_max, dtype=torch.long, device=device)
-        active_len_out = torch.zeros(B, S, dtype=torch.long, device=device)
-
-        for b in range(B):
-            num_idx = 0  # next slot in output
-            # Digit run state
-            digit_num = 0.0
-            digit_len = 0
-            digit_has_dot = False
-            digit_frac_mul = 0.0
-            in_digit_run = False
-            digit_start = 0
-            # Word run state
-            word_bytes: list[int] = []
-            in_word_run = False
-            word_start = 0
-            # Active number run (for next-digit encoding)
-            active_len = 0
-            active_has_dot = False
-
-            def _push_number(val: float, start: int, end: int) -> None:
-                nonlocal num_idx
-                if num_idx >= n_max:
-                    return
-                values[b, num_idx] = val
-                positions[b, num_idx] = end
-                lengths[b, num_idx] = end - start + 1
-                mask[b, num_idx] = True
-                num_idx += 1
-
-            for t in range(S):
-                d = dv[b, t].item()
-                l = lb[b, t].item()
-                is_dot = is_dec[b, t].item()
-
-                dot_continues_run = is_dot and in_digit_run and not digit_has_dot
-
-                # --- Finish any run that ended ---
-                # Numbers are positioned at t (the boundary token), not t-1
-                # (the last digit). This ensures strict causality: the number
-                # only appears in the compressed view when the boundary is
-                # visible, matching what happens in truncated sequences.
-                if d >= 0:
-                    if in_word_run:
-                        val = self._try_word_number(word_bytes)
-                        if val is not None:
-                            _push_number(float(val), word_start, t)
-                        in_word_run = False
-                        word_bytes = []
-                elif dot_continues_run:
-                    pass
-                elif l > 0:
-                    if in_digit_run:
-                        _push_number(digit_num, digit_start, t)
-                        in_digit_run = False
-                else:
-                    if in_digit_run:
-                        _push_number(digit_num, digit_start, t)
-                        in_digit_run = False
-                    if in_word_run:
-                        val = self._try_word_number(word_bytes)
-                        if val is not None:
-                            _push_number(float(val), word_start, t)
-                        in_word_run = False
-                        word_bytes = []
-
-                # --- Extend or start current run ---
-                if d >= 0:
-                    if not in_digit_run:
-                        digit_num = 0.0
-                        digit_len = 0
-                        digit_has_dot = False
-                        digit_frac_mul = 0.0
-                        in_digit_run = True
-                        digit_start = t
-                    if digit_len < max_input_digits:
-                        if digit_has_dot:
-                            digit_num += d * digit_frac_mul
-                            digit_frac_mul *= 0.1
-                        else:
-                            digit_num = digit_num * 10 + d
-                    digit_len += 1
-                elif dot_continues_run:
-                    digit_has_dot = True
-                    digit_frac_mul = 0.1
-                    digit_len += 1
-                elif l > 0:
-                    if not in_word_run:
-                        word_bytes = []
-                        in_word_run = True
-                        word_start = t
-                    word_bytes.append(l)
-
-                # --- Track active digit/decimal run ---
-                if d >= 0:
-                    active_len += 1
-                elif is_dot and not active_has_dot:
-                    active_len += 1
-                    active_has_dot = True
-                else:
-                    active_len = 0
-                    active_has_dot = False
-                active_len_out[b, t] = active_len
-
-            # NOTE: we intentionally do NOT flush in-progress digit/word runs
-            # at end-of-sequence. Only numbers terminated by a boundary token
-            # (non-digit after digits, non-letter after letters) are emitted.
-            # This ensures strict causality: the compressed view at position t
-            # is identical regardless of what tokens follow after t.
+        detected = detect_numbers(
+            input_ids,
+            self.digit_value,
+            self.lowercase_byte,
+            self.is_decimal,
+            self.bos_id,
+            self._word_lengths,
+            word_pats,
+            word_vals,
+            n_max=self.n_max,
+        )
 
         return CompressedView(
-            positions=positions,
-            mask=mask,
+            positions=detected.positions,
+            mask=detected.mask,
             metadata={
-                "values": values,
-                "lengths": lengths,
-                "active_len": active_len_out,
+                "values": detected.values,
+                "lengths": detected.lengths,
+                "active_len": detected.active_len,
             },
         )

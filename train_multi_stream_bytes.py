@@ -730,7 +730,7 @@ def main():
 
     # --- Wrap for training ---
     train_wrapper = MultiStreamGPTForTraining(base_model)
-    compiled_model = torch.compile(train_wrapper, dynamic=False, fullgraph=False)
+    compiled_model = torch.compile(train_wrapper, dynamic=False, fullgraph=True)
     model = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
