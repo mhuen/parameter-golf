@@ -36,14 +36,22 @@ def affine_scan(a: Tensor, b: Tensor) -> Tensor:
     Returns:
         y: (B, S) scan result.
     """
-    S = a.shape[1]
+    B, S = a.shape
     a_cur = a.clone()
     b_cur = b.clone()
     offset = 1
     while offset < S:
         # Shifted versions (identity padding: a=1, b=0)
-        a_prev = F.pad(a_cur[:, :-offset], (offset, 0), value=1.0)
-        b_prev = F.pad(b_cur[:, :-offset], (offset, 0), value=0.0)
+        # Use cat instead of F.pad to generate simpler LLVM IR
+        # (F.pad triggers an LLVM SLP vectorizer assertion in some Triton builds)
+        a_prev = torch.cat(
+            [torch.ones(B, offset, dtype=a.dtype, device=a.device),
+             a_cur[:, :-offset]], dim=1,
+        )
+        b_prev = torch.cat(
+            [torch.zeros(B, offset, dtype=b.dtype, device=b.device),
+             b_cur[:, :-offset]], dim=1,
+        )
         # Compose: (a_cur, b_cur) ∘ (a_prev, b_prev) = (a_cur*a_prev, a_cur*b_prev + b_cur)
         b_cur = a_cur * b_prev + b_cur
         a_cur = a_cur * a_prev
