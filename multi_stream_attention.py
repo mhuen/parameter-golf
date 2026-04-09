@@ -600,6 +600,7 @@ class MultiStreamMLP(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
+        logit_normalization_factor: float = 0.0,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -607,6 +608,19 @@ class MultiStreamMLP(nn.Module):
         self.leaky_relu_slope = leaky_relu_slope
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
+
+        # LOGIT stream scaling: divide by normalization factor before concat.
+        # Only for LOGIT streams that are NOT already RMSNorm'd (normalize=False).
+        self._logit_scale: float | None = None
+        self._logit_ids: set[StreamID] = set()
+        if logit_normalization_factor > 0:
+            self._logit_ids = {
+                s.name
+                for s in stream_config.streams
+                if s.name.type == StreamType.LOGIT and not s.normalize
+            }
+            if self._logit_ids:
+                self._logit_scale = 1.0 / logit_normalization_factor
 
         # Identify the logit stream ID (if hierarchy is active)
         self._logit_sid: StreamID | None = None
@@ -661,9 +675,18 @@ class MultiStreamMLP(nn.Module):
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
-        x = torch.cat(
-            [input_streams[s.name] for s in self.stream_config.streams], dim=-1
-        )
+        if self._logit_scale is not None:
+            parts = []
+            for s in self.stream_config.streams:
+                t = input_streams[s.name]
+                if s.name in self._logit_ids:
+                    t = t * self._logit_scale
+                parts.append(t)
+            x = torch.cat(parts, dim=-1)
+        else:
+            x = torch.cat(
+                [input_streams[s.name] for s in self.stream_config.streams], dim=-1
+            )
         h = F.leaky_relu(self.fc_up(x), negative_slope=self.leaky_relu_slope)
         h = h.square()
 
@@ -1297,6 +1320,7 @@ class MultiStreamBlock(nn.Module):
         conv: MultiStreamCausalConv | None = None,
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
+        logit_normalization_factor: float = 0.0,
         attn_alpha_init: float = -1.0,
         attn_beta_init: float = 5.0,
         mlp_alpha_init: float = -3.0,
@@ -1348,6 +1372,7 @@ class MultiStreamBlock(nn.Module):
             linear_mode=linear_mode,
             linear_kwargs=linear_kwargs,
             logit_hierarchy=logit_hierarchy,
+            logit_normalization_factor=logit_normalization_factor,
         )
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)

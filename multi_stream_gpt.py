@@ -457,6 +457,7 @@ class MultiStreamGPT(nn.Module):
                     conv=conv_i,
                     arith_attn=arith_i,
                     logit_hierarchy=components.logit_hierarchy,
+                    logit_normalization_factor=logit_softcap,
                 )
             )
 
