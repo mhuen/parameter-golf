@@ -102,7 +102,9 @@ class DetectedNumbers:
     # Per-position (B, S) masks and values
     is_number_boundary: Tensor  # True at first non-member token after a number run
     number_value_at_boundary: Tensor  # float64, number value (meaningful at boundaries)
-    number_start_at_boundary: Tensor  # long, start position of the number (at boundaries)
+    number_start_at_boundary: (
+        Tensor  # long, start position of the number (at boundaries)
+    )
     active_len: Tensor  # long, length of current digit/dot run at each position
 
     # Compact arrays (B, n_max)
@@ -112,7 +114,9 @@ class DetectedNumbers:
     mask: Tensor  # bool, valid entries
 
     # Per-position (B, S) cumulative count (resets at BOS)
-    num_count: Tensor  # long, how many numbers detected up to this position (in current doc)
+    num_count: (
+        Tensor  # long, how many numbers detected up to this position (in current doc)
+    )
 
 
 def detect_numbers(
@@ -177,9 +181,15 @@ def detect_numbers(
 
     # Count dots within each candidate run (to enforce "at most one dot")
     dot_cum = dot_after_digit.long().cumsum(dim=1)
-    dot_cum_before_start = torch.where(
-        ext_start, F.pad(dot_cum[:, :-1], (1, 0), value=0), torch.zeros_like(dot_cum)
-    ).cummax(dim=1).values
+    dot_cum_before_start = (
+        torch.where(
+            ext_start,
+            F.pad(dot_cum[:, :-1], (1, 0), value=0),
+            torch.zeros_like(dot_cum),
+        )
+        .cummax(dim=1)
+        .values
+    )
     dots_in_run = dot_cum - dot_cum_before_start  # (B, S)
 
     # A dot is valid only if it's the first dot in its run
@@ -212,22 +222,30 @@ def detect_numbers(
     # Detect "seen a dot in this run"
     dot_in_ext = valid_dot.long()
     dot_cum_ext = dot_in_ext.cumsum(dim=1)
-    dot_cum_before_ext_start = torch.where(
-        ext_start_clean,
-        F.pad(dot_cum_ext[:, :-1], (1, 0), value=0),
-        torch.zeros_like(dot_cum_ext),
-    ).cummax(dim=1).values
+    dot_cum_before_ext_start = (
+        torch.where(
+            ext_start_clean,
+            F.pad(dot_cum_ext[:, :-1], (1, 0), value=0),
+            torch.zeros_like(dot_cum_ext),
+        )
+        .cummax(dim=1)
+        .values
+    )
     dots_in_ext_run = dot_cum_ext - dot_cum_before_ext_start  # (B, S)
     seen_dot = dots_in_ext_run > 0  # (B, S)
 
     # Count digits (not dots) after the first dot in this run
     digit_after_dot = is_digit & seen_dot & ext_member
     frac_cum = digit_after_dot.long().cumsum(dim=1)
-    frac_cum_before_start = torch.where(
-        ext_start_clean,
-        F.pad(frac_cum[:, :-1], (1, 0), value=0),
-        torch.zeros_like(frac_cum),
-    ).cummax(dim=1).values
+    frac_cum_before_start = (
+        torch.where(
+            ext_start_clean,
+            F.pad(frac_cum[:, :-1], (1, 0), value=0),
+            torch.zeros_like(frac_cum),
+        )
+        .cummax(dim=1)
+        .values
+    )
     n_frac_digits = (frac_cum - frac_cum_before_start) * ext_member.long()  # (B, S)
 
     # Number value at each position in the run
@@ -240,8 +258,12 @@ def detect_numbers(
     # = ext_end shifted right by 1
     # Exclude BOS: in the sequential code, BOS resets state before checking
     # for run endings, so in-progress runs at BOS are silently discarded.
-    digit_boundary = F.pad(ext_end_clean[:, :-1], (1, 0), value=False) & ~is_bos  # (B, S)
-    digit_boundary_value = F.pad(digit_run_value[:, :-1], (1, 0), value=0.0)  # (B, S) float64
+    digit_boundary = (
+        F.pad(ext_end_clean[:, :-1], (1, 0), value=False) & ~is_bos
+    )  # (B, S)
+    digit_boundary_value = F.pad(
+        digit_run_value[:, :-1], (1, 0), value=0.0
+    )  # (B, S) float64
 
     # Start position of each digit run: propagate ext_start position through the run
     seq_pos = torch.arange(S, device=device).expand(B, S)  # (B, S)
@@ -256,16 +278,22 @@ def detect_numbers(
     # -- Phase 4: Detect word numbers --
     # Letter run detection
     is_letter_clean = is_letter & ~is_bos  # BOS breaks letter runs too
-    letter_start = is_letter_clean & ~F.pad(is_letter_clean[:, :-1], (1, 0), value=False)
+    letter_start = is_letter_clean & ~F.pad(
+        is_letter_clean[:, :-1], (1, 0), value=False
+    )
     letter_end = is_letter_clean & ~F.pad(is_letter_clean[:, 1:], (0, 1), value=False)
 
     # Run length at each position (within letter runs)
     letter_cum = is_letter_clean.long().cumsum(dim=1)
-    letter_cum_before_start = torch.where(
-        letter_start,
-        F.pad(letter_cum[:, :-1], (1, 0), value=0),
-        torch.zeros_like(letter_cum),
-    ).cummax(dim=1).values
+    letter_cum_before_start = (
+        torch.where(
+            letter_start,
+            F.pad(letter_cum[:, :-1], (1, 0), value=0),
+            torch.zeros_like(letter_cum),
+        )
+        .cummax(dim=1)
+        .values
+    )
     letter_run_len = (letter_cum - letter_cum_before_start) * is_letter_clean.long()
 
     # Match words by length
@@ -287,9 +315,9 @@ def detect_numbers(
         # Compare each window against each pattern
         # patterns: (N, L) → (1, 1, N, L)
         # windows: (B, S-L+1, L) → (B, S-L+1, 1, L)
-        matches = (
-            windows.unsqueeze(2) == patterns.unsqueeze(0).unsqueeze(0)
-        ).all(dim=-1)  # (B, S-L+1, N)
+        matches = (windows.unsqueeze(2) == patterns.unsqueeze(0).unsqueeze(0)).all(
+            dim=-1
+        )  # (B, S-L+1, N)
         any_match = matches.any(dim=-1)  # (B, S-L+1)
 
         # Get the matched value (first match per position)
@@ -301,7 +329,9 @@ def detect_numbers(
         # The word boundary (first non-letter after run) is at i+L
         # Pad to get boundary at the correct position
         if L < S:
-            boundary_at = F.pad(any_match, (L, 0), value=False)  # (B, S+1) → trim to (B, S)
+            boundary_at = F.pad(
+                any_match, (L, 0), value=False
+            )  # (B, S+1) → trim to (B, S)
             boundary_at = boundary_at[:, :S]
             val_at = F.pad(matched_val, (L, 0), value=0.0)[:, :S]
         else:
@@ -328,8 +358,12 @@ def detect_numbers(
 
     # -- Phase 5: Combine digit and word boundaries --
     is_number_boundary = digit_boundary | word_boundary
-    number_value = torch.where(digit_boundary, digit_boundary_value, word_boundary_value)
-    number_start = torch.where(digit_boundary, digit_start_at_boundary, word_start_at_boundary)
+    number_value = torch.where(
+        digit_boundary, digit_boundary_value, word_boundary_value
+    )
+    number_start = torch.where(
+        digit_boundary, digit_start_at_boundary, word_start_at_boundary
+    )
 
     # -- Phase 6: Active digit/dot run length --
     # active_len tracks the length of the current contiguous digit-or-single-dot run
@@ -338,11 +372,15 @@ def detect_numbers(
     # This matches the original: active_has_dot is per-run state
     # We reuse ext_member: active run = contiguous ext_member positions
     active_cum = ext_member.long().cumsum(dim=1)
-    active_cum_before_start = torch.where(
-        ext_start_clean,
-        F.pad(active_cum[:, :-1], (1, 0), value=0),
-        torch.zeros_like(active_cum),
-    ).cummax(dim=1).values
+    active_cum_before_start = (
+        torch.where(
+            ext_start_clean,
+            F.pad(active_cum[:, :-1], (1, 0), value=0),
+            torch.zeros_like(active_cum),
+        )
+        .cummax(dim=1)
+        .values
+    )
     active_len = (active_cum - active_cum_before_start) * ext_member.long()  # (B, S)
 
     # -- Phase 7: Compact into (B, n_max) arrays --
@@ -350,9 +388,11 @@ def detect_numbers(
     bos_positions = is_bos  # (B, S)
     num_cum = is_number_boundary.long().cumsum(dim=1)
     # Subtract count at most recent BOS to get document-local count
-    num_at_bos = torch.where(
-        bos_positions, num_cum, torch.zeros_like(num_cum)
-    ).cummax(dim=1).values
+    num_at_bos = (
+        torch.where(bos_positions, num_cum, torch.zeros_like(num_cum))
+        .cummax(dim=1)
+        .values
+    )
     num_count = num_cum - num_at_bos  # (B, S), document-local count
 
     # Scatter into compact arrays
@@ -360,7 +400,9 @@ def detect_numbers(
     compact_idx = (num_count - 1).clamp(min=0, max=n_max)  # 0-indexed; n_max = dummy
     valid_boundary = is_number_boundary & (num_count >= 1) & (num_count <= n_max)
     # Route non-boundary (and overflow) positions to the dummy slot
-    scatter_idx = torch.where(valid_boundary, compact_idx, torch.full_like(compact_idx, n_max))
+    scatter_idx = torch.where(
+        valid_boundary, compact_idx, torch.full_like(compact_idx, n_max)
+    )
 
     positions_out = torch.zeros(B, n_max + 1, dtype=torch.long, device=device)
     values_out = torch.zeros(B, n_max + 1, dtype=torch.float32, device=device)
@@ -399,12 +441,77 @@ def detect_numbers(
 DIGIT_IDX_DOT = 10
 DIGIT_IDX_END = 11
 NEXT_DIGIT_VOCAB = 12
-_MAX_RESULT_DIGITS = 15  # matches float64 precision
+MAX_RESULT_DIGITS = 15  # matches float64 precision
+
+
+def extract_digit_at(
+    values: Tensor,
+    position: Tensor,
+    max_len: int = MAX_RESULT_DIGITS,
+) -> Tensor:
+    """Extract the digit character at a specific position for each value.
+
+    Optimized version of ``extract_digit_sequences(...).gather(-1, pos)``
+    that avoids the Python loop entirely -- computes only the one needed digit
+    per element in a single vectorized pass.
+
+    Args:
+        values: (...) float tensor of numeric values.
+        position: (...) long tensor of 0-indexed positions into the digit
+            representation (same shape as *values*).
+        max_len: positions >= max_len map to END.
+
+    Returns:
+        (...) long tensor of character indices (0-9 = digit, 10 = dot, 11 = END).
+    """
+    av = values.abs().double()
+    int_part = av.long()
+    frac_part = av - int_part.double()
+
+    # Number of integer digits
+    n_int = torch.where(
+        int_part > 0,
+        torch.floor(torch.log10(int_part.double().clamp(min=0.5))) + 1,
+        torch.ones_like(av),
+    ).long()
+
+    is_integer = (frac_part < 1e-15) | (av >= 1e15)
+    has_frac = ~is_integer & (av > 0)
+
+    # Integer digit at this position
+    power = (n_int - 1 - position).clamp(min=0)
+    int_digit = (int_part // (10**power)) % 10
+
+    # Fractional digit at this position
+    frac_pos = (position - n_int).clamp(min=0)
+    frac_scaled = (frac_part * (10.0 ** (frac_pos + 1).double())).long()
+    frac_digit = frac_scaled % 10
+
+    # Classify position
+    in_int = position < n_int
+    at_dot = (position == n_int) & has_frac
+    in_frac = (position > n_int) & has_frac
+
+    end_val = torch.full_like(int_digit, DIGIT_IDX_END)
+    char_idx = torch.where(
+        in_int,
+        int_digit,
+        torch.where(
+            at_dot,
+            torch.full_like(int_digit, DIGIT_IDX_DOT),
+            torch.where(in_frac, frac_digit, end_val),
+        ),
+    )
+
+    # Beyond representable range -> END
+    char_idx = torch.where(position >= max_len, end_val, char_idx)
+
+    return char_idx
 
 
 def extract_digit_sequences(
     values: Tensor,
-    max_len: int = _MAX_RESULT_DIGITS,
+    max_len: int = MAX_RESULT_DIGITS,
 ) -> Tensor:
     """Convert numeric values to their digit-character sequences.
 

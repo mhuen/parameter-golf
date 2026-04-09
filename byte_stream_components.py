@@ -17,8 +17,9 @@ from byte_modules import (
 from number_detection import (
     affine_scan,
     detect_numbers,
-    extract_digit_sequences,
+    extract_digit_at,
     NEXT_DIGIT_VOCAB,
+    MAX_RESULT_DIGITS,
 )
 
 
@@ -775,7 +776,9 @@ class ByteHashComponent(nn.Module):
                 .cummax(dim=1)
                 .values
             )
-            return torch.where(is_bos, torch.full_like(positions, -1), positions - last_bos - 1)
+            return torch.where(
+                is_bos, torch.full_like(positions, -1), positions - last_bos - 1
+            )
 
         elif self.boundary == HashBoundary.WORD:
             # BOS acts as a separator
@@ -1124,10 +1127,11 @@ class DigitComputeComponent(nn.Module):
                     result = torch.fmod(b_val, a_abs)
 
                 sign = torch.sign(result)
-                digit_seqs = extract_digit_sequences(result)
-                al_clamped = active_len.clamp(max=digit_seqs.shape[-1] - 1)
-                next_char = digit_seqs.gather(2, al_clamped.unsqueeze(-1)).squeeze(-1)
-                next_oh = F.one_hot(next_char, num_classes=NEXT_DIGIT_VOCAB).to(dtype=dtype)
+                al_clamped = active_len.clamp(max=MAX_RESULT_DIGITS - 1)
+                next_char = extract_digit_at(result, al_clamped)
+                next_oh = F.one_hot(next_char, num_classes=NEXT_DIGIT_VOCAB).to(
+                    dtype=dtype
+                )
 
                 off = base + op_i * ad
                 out[:, :, off] = sign.to(dtype) * valid.squeeze(-1)
@@ -1144,4 +1148,3 @@ class DigitComputeComponent(nn.Module):
                 out[:, :, cmp_off + cmp_i] = cmp_val * valid.squeeze(-1)
 
         return out
-
