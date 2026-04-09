@@ -444,7 +444,7 @@ def compute_bigram_log_probs(
     Reads shard files directly with numpy, counts consecutive-token bigrams,
     smooths, normalizes, and returns ``(V, V)`` float32 log-probabilities.
     """
-    files = sorted(glob.glob(train_pattern))
+    files = [Path(p) for p in sorted(glob.glob(train_pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
 
