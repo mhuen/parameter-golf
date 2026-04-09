@@ -303,15 +303,15 @@ class MultiStreamGPT(nn.Module):
         # Pre-processing conv (MultiStreamCausalConvLayers)
         num_preconv_layers: int = 2,
         preconv_kernel_size: int | list[int] = 4,
-        preconv_groups: int | None = None,
+        preconv_groups: int = 12,
         preconv_channel_shuffle: bool = True,
         # Per-block conv mapping: list[int|None], length=num_layers
         block_conv_map: list[int | None] | None = None,
         block_conv_kernel_size: int | list[int] = 4,
         block_conv_groups: int | list[int] = 1,
         # Arithmetic mapping: list[int|None], length=num_layers
-        arith_map: list[int | None] | None = None,
-        arith_n_max: int = 16,
+        block_arith_map: list[int | None] | None = None,
+        block_arith_n_max: int = 16,
         # Attention config
         mixing_config: StreamMixingConfig | None = None,
         mlp_hidden_dim: int | None = None,
@@ -327,6 +327,8 @@ class MultiStreamGPT(nn.Module):
         linear_kwargs: dict | None = None,
         # Conv input filtering (None = exclude TOKENS)
         conv_input_streams: list[StreamID] | None = None,
+        # Conv output filtering (None = exclude LOGIT, only write to context)
+        conv_output_streams: list[StreamID] | None = None,
         # Init noise
         init_noise_std: float = 0.01,
     ):
@@ -345,12 +347,19 @@ class MultiStreamGPT(nn.Module):
         per_heads = _broadcast(num_heads, num_layers, "num_heads")
         per_kv_heads = _broadcast(num_kv_heads, num_layers, "num_kv_heads")
 
-        # -- Conv input stream filtering (default: exclude TOKENS) --
+        # -- Conv input (+output) stream filtering (default: exclude TOKENS) --
         if conv_input_streams is None:
             conv_input_streams = [
                 s.name
                 for s in stream_config.streams
                 if s.name.type != StreamType.TOKENS
+            ]
+
+        if conv_output_streams is None:
+            conv_output_streams = [
+                s.name
+                for s in stream_config.streams
+                if not s.read_only and s.name.type != StreamType.LOGIT
             ]
 
         # -- Bigram prior --
@@ -365,19 +374,19 @@ class MultiStreamGPT(nn.Module):
                 stream_config=stream_config,
                 num_layers=num_preconv_layers,
                 kernel_size=preconv_kernel_size,
-                conv_groups=preconv_groups
-                if preconv_groups is not None
-                else num_preconv_layers,
+                conv_groups=preconv_groups,
                 logit_hierarchy=components.logit_hierarchy,
                 input_stream_ids=conv_input_streams,
+                output_stream_ids=conv_output_streams,
                 conv_channel_shuffle=preconv_channel_shuffle,
+                logit_normalization_factor=logit_softcap,
             )
 
         # -- Arithmetic attention instances --
-        arith_map_validated, num_arith = _build_instance_map(
-            arith_map, num_layers, "arith_map"
+        block_arith_map_validated, num_arith = _build_instance_map(
+            block_arith_map, num_layers, "arith_map"
         )
-        self._arith_map = arith_map_validated
+        self._block_arith_map = block_arith_map_validated
         self.arith_attns = nn.ModuleList()
         if num_arith > 0:
             compressed_sids = [s.name for s in stream_config.streams]
@@ -386,7 +395,7 @@ class MultiStreamGPT(nn.Module):
                     CausalArithmeticMultiStreamAttention(
                         stream_config=stream_config,
                         tok=components.tok,
-                        n_max=arith_n_max,
+                        n_max=block_arith_n_max,
                         compressed_stream_ids=compressed_sids,
                     )
                 )
@@ -414,9 +423,8 @@ class MultiStreamGPT(nn.Module):
                     kernel_size=bconv_ks[j],
                     conv_groups=bconv_g[j],
                     logit_hierarchy=components.logit_hierarchy,
-                    linear_mode=linear_mode,
-                    linear_kwargs=linear_kwargs,
                     input_stream_ids=conv_input_streams,
+                    logit_normalization_factor=logit_softcap,
                 )
             )
 
@@ -429,8 +437,8 @@ class MultiStreamGPT(nn.Module):
                 else None
             )
             arith_i = (
-                self.arith_attns[arith_map_validated[i]]
-                if arith_map_validated[i] is not None
+                self.arith_attns[block_arith_map_validated[i]]
+                if block_arith_map_validated[i] is not None
                 else None
             )
             self.blocks.append(

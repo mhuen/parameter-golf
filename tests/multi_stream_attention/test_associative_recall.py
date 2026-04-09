@@ -174,6 +174,8 @@ if __name__ == "__main__":
         num_layers=1,
         multi_head_dim=32,
         mlp_hidden_dim=16,
+        num_preconv_layers=1,
+        # preconv_groups=1,
     )
 
     train_kwargs = dict(

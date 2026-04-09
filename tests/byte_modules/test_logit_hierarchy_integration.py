@@ -157,12 +157,16 @@ def test_conv_hierarchy_output_shape():
 
 @torch.no_grad()
 def test_conv_hierarchy_proj_dim():
+    """Conv with hierarchy uses total_slots for the logit output dim (not vocab_size)."""
     hier = _make_hierarchy()
     cfg = _make_stream_config()
     conv = MultiStreamCausalConv(cfg, logit_hierarchy=hier)
-    logit_key = StreamConfig(StreamID(StreamType.LOGIT), dim=LOGIT_DIM).key
-    weight = conv.proj_value[logit_key].weight
-    assert weight.shape[0] == hier.total_slots
+    # The internal _out_dims should use total_slots for the logit stream
+    logit_idx = next(
+        i for i, s in enumerate(conv.output_streams)
+        if s.name.type == StreamType.LOGIT
+    )
+    assert conv._out_dims[logit_idx] == hier.total_slots
 
 
 def test_conv_hierarchy_gradient_flow():
@@ -173,9 +177,11 @@ def test_conv_hierarchy_gradient_flow():
     out = conv(streams)
     loss = out[StreamID(StreamType.LOGIT)].sum()
     loss.backward()
-    logit_key = StreamConfig(StreamID(StreamType.LOGIT), dim=LOGIT_DIM).key
-    for name, param in conv.proj_value[logit_key].named_parameters():
-        assert param.grad is not None, f"No gradient for proj_value.{name}"
+    # Gradients should flow through hierarchy assembly back to conv parameters
+    for name, param in conv.conv.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No gradient for conv.{name}"
+            assert param.grad.abs().sum() > 0, f"Zero gradient for conv.{name}"
 
 
 # --------------------------------------------------------------------------

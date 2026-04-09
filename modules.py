@@ -414,6 +414,10 @@ class GatedCausalConv(nn.Module):
     - ungated: out = leaky_relu(conv(x)).square()
 
     Uses causal (left) padding so output[t] only depends on input[t-k+1..t].
+
+    Std-dev repair: conv output is divided by ``sqrt(fan_in)`` where
+    ``fan_in = kernel_size * (dim // groups)``, normalizing the sum of
+    weighted input terms to preserve unit variance.
     """
 
     def __init__(
@@ -423,22 +427,40 @@ class GatedCausalConv(nn.Module):
         groups: int = 0,
         gated: bool = True,
         channel_shift: int = 0,
+        out_dim: int | None = None,
     ):
         super().__init__()
+        out_dim = dim if out_dim is None else out_dim
         groups = dim if groups <= 0 else groups
+
+        if dim % groups != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by groups ({groups})")
+        if out_dim % groups != 0:
+            raise ValueError(
+                f"out_dim ({out_dim}) must be divisible by groups ({groups})"
+            )
+
         self.pad = kernel_size - 1
         self.gated = gated
         # Shifting only matters when groups partition channels into 2+ groups
         self.channel_shift = channel_shift if groups not in (1, dim) else 0
 
+        # Std-dev repair: 1/sqrt(fan_in) to normalize conv output variance
+        fan_in = kernel_size * (dim // groups)
+        self._conv_std_repair = 1.0 / math.sqrt(fan_in)
+
         if gated:
-            self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
+            self.conv_gate = nn.Conv1d(
+                dim, out_dim, kernel_size, groups=groups, bias=False
+            )
             self.conv_value = nn.Conv1d(
-                dim, dim, kernel_size, groups=groups, bias=False
+                dim, out_dim, kernel_size, groups=groups, bias=False
             )
             self.conv_value._zero_init = True
         else:
-            self.conv = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
+            self.conv = nn.Conv1d(
+                dim, out_dim, kernel_size, groups=groups, bias=False
+            )
 
     def forward(self, x: Tensor) -> Tensor:
         h = x.transpose(1, 2)
@@ -446,13 +468,14 @@ class GatedCausalConv(nn.Module):
         if self.channel_shift:
             h = torch.roll(h, shifts=self.channel_shift, dims=1)
         if self.gated:
-            gate = torch.sigmoid(self.conv_gate(h))
-            value = F.silu(self.conv_value(h))
+            gate = torch.sigmoid(self.conv_gate(h) * self._conv_std_repair)
+            value = F.silu(self.conv_value(h) * self._conv_std_repair)
             out = gate * value
         else:
-            out = F.leaky_relu(self.conv(h), negative_slope=0.5).square()
-        if self.channel_shift:
-            out = torch.roll(out, shifts=-self.channel_shift, dims=1)
+            out = F.leaky_relu(
+                self.conv(h) * self._conv_std_repair, negative_slope=0.5
+            ).square()
+        # No output unroll — model learns output channel assignment regardless
         return out.transpose(1, 2)
 
 
