@@ -324,6 +324,8 @@ class MultiStreamGPT(nn.Module):
         # Linear mode
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
+        # Conv input filtering (None = exclude TOKENS)
+        conv_input_streams: list[StreamID] | None = None,
         # Init noise
         init_noise_std: float = 0.01,
     ):
@@ -342,6 +344,13 @@ class MultiStreamGPT(nn.Module):
         per_heads = _broadcast(num_heads, num_layers, "num_heads")
         per_kv_heads = _broadcast(num_kv_heads, num_layers, "num_kv_heads")
 
+        # -- Conv input stream filtering (default: exclude TOKENS) --
+        if conv_input_streams is None:
+            conv_input_streams = [
+                s.name for s in stream_config.streams
+                if s.name.type != StreamType.TOKENS
+            ]
+
         # -- Bigram prior --
         self.bigram_prior: BigramPriorLayer | None = None
         if include_bigram_prior:
@@ -356,6 +365,7 @@ class MultiStreamGPT(nn.Module):
                 kernel_size=preconv_kernel_size,
                 conv_groups=preconv_groups,
                 logit_hierarchy=components.logit_hierarchy,
+                input_stream_ids=conv_input_streams,
             )
 
         # -- Arithmetic attention instances --
@@ -401,6 +411,7 @@ class MultiStreamGPT(nn.Module):
                     logit_hierarchy=components.logit_hierarchy,
                     linear_mode=linear_mode,
                     linear_kwargs=linear_kwargs,
+                    input_stream_ids=conv_input_streams,
                 )
             )
 

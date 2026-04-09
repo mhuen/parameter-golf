@@ -678,9 +678,9 @@ class MultiStreamMLP(nn.Module):
 
 
 class MultiStreamCausalConv(nn.Module):
-    """Causal conv that reads all streams but only writes to writable streams.
+    """Causal conv that reads selected streams but only writes to writable streams.
 
-    Shared convolution on concatenated streams, then per-stream gated output
+    Shared convolution on concatenated input streams, then per-stream gated output
     projections.  Follows the same interface as ``MultiStreamMLP``.
     """
 
@@ -694,12 +694,20 @@ class MultiStreamCausalConv(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
+        input_stream_ids: list[StreamID] | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
+
+        # Determine which streams are concatenated as conv input
+        if input_stream_ids is not None:
+            id_set = set(input_stream_ids)
+            self._input_streams = [s for s in stream_config.streams if s.name in id_set]
+        else:
+            self._input_streams = list(stream_config.streams)
 
         # Identify the logit stream ID (if hierarchy is active)
         self._logit_sid: StreamID | None = None
@@ -709,9 +717,9 @@ class MultiStreamCausalConv(nn.Module):
                     self._logit_sid = s.name
                     break
 
-        sum_stream_dims = sum(s.dim for s in stream_config.streams)
+        input_dim = sum(s.dim for s in self._input_streams)
         self.conv = GatedCausalConv(
-            dim=sum_stream_dims,
+            dim=input_dim,
             kernel_size=kernel_size,
             groups=conv_groups,
             gated=gated_conv,
@@ -720,7 +728,7 @@ class MultiStreamCausalConv(nn.Module):
         self.proj_value = nn.ModuleDict(
             {
                 s.key: make_linear(
-                    sum_stream_dims,
+                    input_dim,
                     self._proj_dim(s),
                     bias=False,
                     mode=linear_mode,
@@ -734,7 +742,7 @@ class MultiStreamCausalConv(nn.Module):
             self.proj_gate = nn.ModuleDict(
                 {
                     s.key: make_linear(
-                        sum_stream_dims,
+                        input_dim,
                         self._proj_dim(s),
                         bias=False,
                         mode=linear_mode,
@@ -759,7 +767,7 @@ class MultiStreamCausalConv(nn.Module):
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
         x = torch.cat(
-            [input_streams[s.name] for s in self.stream_config.streams], dim=-1
+            [input_streams[s.name] for s in self._input_streams], dim=-1
         )
         h = self.conv(x)
 
@@ -801,6 +809,7 @@ class MultiStreamCausalConvLayers(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
+        input_stream_ids: list[StreamID] | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -833,6 +842,7 @@ class MultiStreamCausalConvLayers(nn.Module):
                     linear_mode=linear_mode,
                     linear_kwargs=linear_kwargs,
                     logit_hierarchy=logit_hierarchy,
+                    input_stream_ids=input_stream_ids,
                 )
                 for ks in kernel_sizes
             ]
