@@ -139,7 +139,7 @@ class Hyperparameters:
     # Bigram prior
     include_bigram_prior = bool(int(os.environ.get("INCLUDE_BIGRAM_PRIOR", "1")))
     bigram_prior_lr = float(os.environ.get("BIGRAM_PRIOR_LR", 0.01))
-    bigram_init_sequences = int(os.environ.get("BIGRAM_INIT_SEQUENCES", 500))
+    bigram_init_sequences = int(os.environ.get("BIGRAM_INIT_SEQUENCES", 1000000))
     bigram_init_smoothing = float(os.environ.get("BIGRAM_INIT_SMOOTHING", 1.0))
 
     # Optimizer
