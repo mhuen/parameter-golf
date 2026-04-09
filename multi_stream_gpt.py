@@ -447,6 +447,7 @@ class MultiStreamGPT(nn.Module):
                 if block_arith_map_validated[i] is not None
                 else None
             )
+            is_last_block = i == num_layers - 1
             self.blocks.append(
                 MultiStreamBlock(
                     multi_head_dim=per_mhd[i],
@@ -464,6 +465,7 @@ class MultiStreamGPT(nn.Module):
                     arith_attn=arith_i,
                     logit_hierarchy=components.logit_hierarchy,
                     logit_normalization_factor=logit_softcap,
+                    mlp_output_stream_ids=[_LOGIT_SID] if is_last_block else None,
                 )
             )
 

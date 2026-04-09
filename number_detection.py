@@ -37,15 +37,6 @@ def affine_scan(a: Tensor, b: Tensor) -> Tensor:
         y: (B, S) scan result.
     """
     S = a.shape[1]
-    n_steps = max(1, math.ceil(math.log2(S)))
-    for _ in range(n_steps):
-        half = a.shape[1] - (a.shape[1] // 2)  # not used, see below
-        # Shift a and b right by 2^k positions, pad with identity (a=1, b=0)
-        # But offset doubles each iteration — instead, we accumulate by doubling
-        pass  # see correct implementation below
-
-    # Correct iterative-doubling implementation:
-    # We compose affine transforms pairwise at increasing distances.
     a_cur = a.clone()
     b_cur = b.clone()
     offset = 1

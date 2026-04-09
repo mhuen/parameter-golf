@@ -601,6 +601,8 @@ class MultiStreamMLP(nn.Module):
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
         logit_normalization_factor: float = 0.0,
+        input_stream_ids: list[StreamID] | None = None,
+        output_stream_ids: list[StreamID] | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -609,6 +611,21 @@ class MultiStreamMLP(nn.Module):
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
 
+        # Determine which streams are concatenated as MLP input
+        if input_stream_ids is not None:
+            id_set = set(input_stream_ids)
+            self._input_streams = [s for s in stream_config.streams if s.name in id_set]
+        else:
+            self._input_streams = list(stream_config.streams)
+
+        # Determine which writable streams this MLP outputs to
+        all_writable = [s for s in stream_config.streams if not s.read_only]
+        if output_stream_ids is not None:
+            out_set = set(output_stream_ids)
+            self._output_streams = [s for s in all_writable if s.name in out_set]
+        else:
+            self._output_streams = all_writable
+
         # LOGIT stream scaling: divide by normalization factor before concat.
         # Only for LOGIT streams that are NOT already RMSNorm'd (normalize=False).
         self._logit_scale: float | None = None
@@ -616,7 +633,7 @@ class MultiStreamMLP(nn.Module):
         if logit_normalization_factor > 0:
             self._logit_ids = {
                 s.name
-                for s in stream_config.streams
+                for s in self._input_streams
                 if s.name.type == StreamType.LOGIT and not s.normalize
             }
             if self._logit_ids:
@@ -630,7 +647,7 @@ class MultiStreamMLP(nn.Module):
                     self._logit_sid = s.name
                     break
 
-        sum_stream_dims = sum(s.dim for s in stream_config.streams)
+        sum_stream_dims = sum(s.dim for s in self._input_streams)
         self.fc_up = make_linear(
             sum_stream_dims,
             hidden_dim,
@@ -648,8 +665,7 @@ class MultiStreamMLP(nn.Module):
                     mode=linear_mode,
                     **_lkw,
                 )
-                for s in stream_config.streams
-                if not s.read_only
+                for s in self._output_streams
             }
         )
         if gated_output:
@@ -662,8 +678,7 @@ class MultiStreamMLP(nn.Module):
                         mode=linear_mode,
                         **_lkw,
                     )
-                    for s in stream_config.streams
-                    if not s.read_only
+                    for s in self._output_streams
                 }
             )
 
@@ -674,10 +689,10 @@ class MultiStreamMLP(nn.Module):
         return s.dim
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
-        """Returns update deltas for writable streams only."""
+        """Returns update deltas for output streams only."""
         if self._logit_scale is not None:
             parts = []
-            for s in self.stream_config.streams:
+            for s in self._input_streams:
                 t = input_streams[s.name]
                 if s.name in self._logit_ids:
                     t = t * self._logit_scale
@@ -685,15 +700,13 @@ class MultiStreamMLP(nn.Module):
             x = torch.cat(parts, dim=-1)
         else:
             x = torch.cat(
-                [input_streams[s.name] for s in self.stream_config.streams], dim=-1
+                [input_streams[s.name] for s in self._input_streams], dim=-1
             )
         h = F.leaky_relu(self.fc_up(x), negative_slope=self.leaky_relu_slope)
         h = h.square()
 
         output: dict[StreamID, Tensor] = {}
-        for s in self.stream_config.streams:
-            if s.read_only:
-                continue
+        for s in self._output_streams:
             if self.gated_output:
                 value = self.proj_value[s.key](h)
                 gate = torch.sigmoid(self.proj_gate[s.key](h))
@@ -705,6 +718,11 @@ class MultiStreamMLP(nn.Module):
                 value = self._logit_hierarchy.assemble_logits(list(chunks))
             output[s.name] = value
         return output
+
+    @property
+    def output_streams(self) -> list[StreamConfig]:
+        """Stream configs this MLP writes to."""
+        return list(self._output_streams)
 
 
 class MultiStreamCausalConv(nn.Module):
@@ -1321,6 +1339,8 @@ class MultiStreamBlock(nn.Module):
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
         logit_normalization_factor: float = 0.0,
+        mlp_input_stream_ids: list[StreamID] | None = None,
+        mlp_output_stream_ids: list[StreamID] | None = None,
         attn_alpha_init: float = -1.0,
         attn_beta_init: float = 5.0,
         mlp_alpha_init: float = -3.0,
@@ -1373,7 +1393,10 @@ class MultiStreamBlock(nn.Module):
             linear_kwargs=linear_kwargs,
             logit_hierarchy=logit_hierarchy,
             logit_normalization_factor=logit_normalization_factor,
+            input_stream_ids=mlp_input_stream_ids,
+            output_stream_ids=mlp_output_stream_ids,
         )
+        mlp_out_streams = self.mlp.output_streams
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)
         # output = σ(β) * x + σ(α) * update
@@ -1395,15 +1418,13 @@ class MultiStreamBlock(nn.Module):
         self.mlp_alpha = nn.ParameterDict(
             {
                 s.key: nn.Parameter(torch.full((s.dim,), mlp_alpha_init))
-                for s in stream_config.streams
-                if not s.read_only
+                for s in mlp_out_streams
             }
         )
         self.mlp_beta = nn.ParameterDict(
             {
                 s.key: nn.Parameter(torch.full((s.dim,), mlp_beta_init))
-                for s in stream_config.streams
-                if not s.read_only
+                for s in mlp_out_streams
             }
         )
 
@@ -1504,10 +1525,12 @@ class MultiStreamBlock(nn.Module):
         for s in self.stream_config.streams:
             if s.read_only:
                 output[s.name] = x[s.name]
-            else:
+            elif s.name in mlp_out:
                 alpha = torch.sigmoid(self.mlp_alpha[s.key])
                 beta = torch.sigmoid(self.mlp_beta[s.key])
                 output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
+            else:
+                output[s.name] = x[s.name]
 
         return output
 
