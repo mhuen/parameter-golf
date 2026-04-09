@@ -139,7 +139,7 @@ class Hyperparameters:
     # Bigram prior
     include_bigram_prior = bool(int(os.environ.get("INCLUDE_BIGRAM_PRIOR", "1")))
     bigram_prior_lr = float(os.environ.get("BIGRAM_PRIOR_LR", 0.01))
-    bigram_init_smoothing = float(os.environ.get("BIGRAM_INIT_SMOOTHING", 0.0))
+    bigram_init_smoothing = float(os.environ.get("BIGRAM_INIT_SMOOTHING", 0.1))
 
     # Optimizer
     builder_lr = float(os.environ.get("BUILDER_LR", 0.01))
@@ -436,7 +436,7 @@ def compute_bigram_log_probs(
     train_pattern: str,
     tok: EfficientByteTokenizer,
     vocab_size: int,
-    smoothing: float = 0.0,
+    smoothing: float = 0.1,
     max_data_bytes: int = 1_000_000,
 ) -> Tensor:
     """Compute bigram log-probabilities from training data.
