@@ -184,12 +184,22 @@ def _load_input_ids(
             f"No .bin shards found in {data_dir}. Set DATA_PATH or pass --data-dir."
         )
     tok = EfficientByteTokenizer()
-    tokens = load_shard_byte260(shards[0], tok)
-    tokens = (
-        torch.from_numpy(tokens) if not isinstance(tokens, torch.Tensor) else tokens
-    )
     total_needed = seq_len * batch_size
-    tokens = tokens.long()[:total_needed]
+    chunks = []
+    collected = 0
+    for shard in shards:
+        t = load_shard_byte260(shard, tok)
+        t = torch.from_numpy(t) if not isinstance(t, torch.Tensor) else t
+        chunks.append(t)
+        collected += t.numel()
+        if collected >= total_needed:
+            break
+    tokens = torch.cat(chunks).long()[:total_needed]
+    if tokens.numel() < total_needed:
+        raise RuntimeError(
+            f"Not enough tokens: need {total_needed} but only found {tokens.numel()} "
+            f"across {len(shards)} shard(s)"
+        )
     return tokens.reshape(batch_size, seq_len)
 
 
