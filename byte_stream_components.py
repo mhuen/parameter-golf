@@ -131,73 +131,55 @@ class BoundaryComponent(nn.Module):
     def dim(self) -> int:
         return self._dim
 
-    def _pos_within(
-        self, is_boundary: Tensor, input_ids: Tensor, reset_mask: Tensor
-    ) -> Tensor:
-        """Compute causal position within current segment.
-
-        Uses cummax to track the last boundary position — only depends on
-        positions ≤ t.  Resets at BOS (document boundary).
-        """
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
-        positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
-        is_b = is_boundary[input_ids].bool() | reset_mask
+        device = input_ids.device
+        reset_mask = input_ids == self.bos_id
+        positions = torch.arange(S, device=device).unsqueeze(0).expand(B, S)
+
+        # Stack all marker lookups into (B, S, N) and batch the expensive ops
+        marker_bufs = [self.is_separator, self.is_sentence_end]
+        freq_configs = [
+            (self.word_id_freqs, self.word_pos_freqs),
+            (self.sent_id_freqs, self.sent_pos_freqs),
+        ]
+        if self.has_newline:
+            marker_bufs.append(self.is_newline)
+            freq_configs.append((self.para_id_freqs, self.para_pos_freqs))
+        N = len(marker_bufs)
+
+        markers = torch.stack(
+            [buf[input_ids] for buf in marker_bufs], dim=-1
+        )  # (B, S, N)
+
+        # Batched segmented cumsum: 1 call instead of N
+        boundary_ids = _segmented_cumsum_2d(markers, reset_mask)  # (B, S, N)
+
+        # Batched pos-within: 1 cummax instead of N
+        is_b = markers.bool() | reset_mask.unsqueeze(-1)  # (B, S, N)
+        is_b_flat = is_b.permute(0, 2, 1).reshape(B * N, S)
+        pos_flat = positions.unsqueeze(1).expand(B, N, S).reshape(B * N, S)
         last_b_pos = (
-            torch.where(is_b, positions, torch.zeros_like(positions))
+            torch.where(is_b_flat, pos_flat, torch.zeros_like(pos_flat))
             .cummax(dim=1)
             .values
         )
-        return positions - last_b_pos
+        pos_within = (pos_flat - last_b_pos).reshape(B, N, S).permute(
+            0, 2, 1
+        )  # (B, S, N)
 
-    def _encode_boundary(
-        self,
-        is_marker: Tensor,
-        input_ids: Tensor,
-        id_freqs: int,
-        pos_freqs: int,
-        reset_mask: Tensor,
-    ) -> list[Tensor]:
-        """Encode one boundary type as sin/cos features (causal)."""
-        parts = []
-        if id_freqs > 0:
-            boundary_id = _segmented_cumsum(is_marker[input_ids], reset_mask)
-            parts.append(sincos_encode(boundary_id, id_freqs, self.base))
-        if pos_freqs > 0:
-            pos_within = self._pos_within(is_marker, input_ids, reset_mask)
-            parts.append(sincos_encode(pos_within, pos_freqs, self.base))
-        return parts
-
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        reset_mask = input_ids == self.bos_id
+        # Encode each boundary type with its own freq counts
         parts: list[Tensor] = []
-        parts.extend(
-            self._encode_boundary(
-                self.is_separator,
-                input_ids,
-                self.word_id_freqs,
-                self.word_pos_freqs,
-                reset_mask,
-            )
-        )
-        parts.extend(
-            self._encode_boundary(
-                self.is_sentence_end,
-                input_ids,
-                self.sent_id_freqs,
-                self.sent_pos_freqs,
-                reset_mask,
-            )
-        )
-        if self.has_newline:
-            parts.extend(
-                self._encode_boundary(
-                    self.is_newline,
-                    input_ids,
-                    self.para_id_freqs,
-                    self.para_pos_freqs,
-                    reset_mask,
+        for i, (id_freqs, pos_freqs) in enumerate(freq_configs):
+            if id_freqs > 0:
+                parts.append(
+                    sincos_encode(boundary_ids[:, :, i], id_freqs, self.base)
                 )
-            )
+            if pos_freqs > 0:
+                parts.append(
+                    sincos_encode(pos_within[:, :, i], pos_freqs, self.base)
+                )
+
         return torch.cat(parts, dim=-1).to(dtype=dtype)
 
 
