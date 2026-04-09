@@ -287,6 +287,30 @@ def sincos_encode(ids: Tensor, num_freqs: int, base: float = 10000.0) -> Tensor:
     return torch.cat([angles.sin(), angles.cos()], dim=-1)
 
 
+def binary_embedding(num_classes: int, dim: int) -> Tensor:
+    """Deterministic binary embedding for a small number of classes.
+
+    Encodes class indices ``0..num_classes-1`` as ``{-1, +1}`` vectors using
+    binary digits, giving maximal separation (cosine similarity ≤ 0 between
+    any two distinct classes) with no learnable parameters.
+
+    Requires ``2 ** dim >= num_classes``.
+
+    Returns:
+        Float tensor of shape ``(num_classes, dim)`` with values in {-1, +1}.
+    """
+    if num_classes > 2**dim:
+        raise ValueError(
+            f"binary_embedding: dim={dim} can encode at most {2**dim} classes, "
+            f"got num_classes={num_classes}"
+        )
+    rows = [
+        [float((i >> b) & 1) * 2 - 1 for b in range(dim)]
+        for i in range(num_classes)
+    ]
+    return torch.tensor(rows)
+
+
 # Stream components (SinCosPositionComponent, DocBoundaryComponent, CompositeStream)
 # have moved to multi_streams.py.  sincos_encode remains here as a shared utility.
 

@@ -9,7 +9,7 @@ from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
-from modules import sincos_encode
+from modules import binary_embedding, sincos_encode
 from byte_modules import (
     BYTE_CATEGORY_DEFS,
     NUM_BYTE_CATEGORIES,
@@ -30,9 +30,12 @@ class HashBoundary(StrEnum):
 
 
 class ByteCategoryComponent(nn.Module):
-    """Byte category (8 classes) as learned embedding stream component.
+    """Byte category (8 classes) as fixed sin/cos embedding stream component.
 
     Categories: BOS, PAD, DIGIT, LETTER, SEPARATOR, PUNCTUATION, SYMBOL, MULTIBYTE.
+
+    Uses a deterministic sin/cos encoding so category embeddings are distinct
+    and reproducible without any learnable parameters.
     """
 
     def __init__(self, tok: EfficientByteTokenizer, embed_dim: int = 4):
@@ -45,7 +48,7 @@ class ByteCategoryComponent(nn.Module):
                 if mask[tid]:
                     token_to_cat[tid] = ci
         self.register_buffer("token_to_cat", token_to_cat)
-        self.embed = nn.Embedding(NUM_BYTE_CATEGORIES, embed_dim)
+        self.register_buffer("embed", binary_embedding(NUM_BYTE_CATEGORIES, embed_dim))
         self._dim = embed_dim
 
     @property
@@ -54,7 +57,7 @@ class ByteCategoryComponent(nn.Module):
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         cat_ids = self.token_to_cat[input_ids]  # (B, S), per-token lookup
-        return self.embed(cat_ids).to(dtype=dtype)
+        return self.embed[cat_ids].to(dtype=dtype)
 
 
 class BoundaryComponent(nn.Module):
