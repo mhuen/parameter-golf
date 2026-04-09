@@ -422,11 +422,14 @@ class GatedCausalConv(nn.Module):
         kernel_size: int = 4,
         groups: int = 0,
         gated: bool = True,
+        channel_shift: int = 0,
     ):
         super().__init__()
         groups = dim if groups <= 0 else groups
         self.pad = kernel_size - 1
         self.gated = gated
+        # Shifting only matters when groups partition channels into 2+ groups
+        self.channel_shift = channel_shift if groups not in (1, dim) else 0
 
         if gated:
             self.conv_gate = nn.Conv1d(dim, dim, kernel_size, groups=groups, bias=False)
@@ -440,14 +443,17 @@ class GatedCausalConv(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         h = x.transpose(1, 2)
         h = F.pad(h, (self.pad, 0))
+        if self.channel_shift:
+            h = torch.roll(h, shifts=self.channel_shift, dims=1)
         if self.gated:
             gate = torch.sigmoid(self.conv_gate(h))
             value = F.silu(self.conv_value(h))
-            return (gate * value).transpose(1, 2)
+            out = gate * value
         else:
-            return (
-                F.leaky_relu(self.conv(h), negative_slope=0.5).square().transpose(1, 2)
-            )
+            out = F.leaky_relu(self.conv(h), negative_slope=0.5).square()
+        if self.channel_shift:
+            out = torch.roll(out, shifts=-self.channel_shift, dims=1)
+        return out.transpose(1, 2)
 
 
 # ---------------------------------------------------------------------------

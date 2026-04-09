@@ -303,7 +303,8 @@ class MultiStreamGPT(nn.Module):
         # Pre-processing conv (MultiStreamCausalConvLayers)
         num_preconv_layers: int = 2,
         preconv_kernel_size: int | list[int] = 4,
-        preconv_groups: int = 1,
+        preconv_groups: int | None = None,
+        preconv_channel_shuffle: bool = True,
         # Per-block conv mapping: list[int|None], length=num_layers
         block_conv_map: list[int | None] | None = None,
         block_conv_kernel_size: int | list[int] = 4,
@@ -347,7 +348,8 @@ class MultiStreamGPT(nn.Module):
         # -- Conv input stream filtering (default: exclude TOKENS) --
         if conv_input_streams is None:
             conv_input_streams = [
-                s.name for s in stream_config.streams
+                s.name
+                for s in stream_config.streams
                 if s.name.type != StreamType.TOKENS
             ]
 
@@ -363,9 +365,12 @@ class MultiStreamGPT(nn.Module):
                 stream_config=stream_config,
                 num_layers=num_preconv_layers,
                 kernel_size=preconv_kernel_size,
-                conv_groups=preconv_groups,
+                conv_groups=preconv_groups
+                if preconv_groups is not None
+                else num_preconv_layers,
                 logit_hierarchy=components.logit_hierarchy,
                 input_stream_ids=conv_input_streams,
+                conv_channel_shuffle=preconv_channel_shuffle,
             )
 
         # -- Arithmetic attention instances --

@@ -695,6 +695,7 @@ class MultiStreamCausalConv(nn.Module):
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
         input_stream_ids: list[StreamID] | None = None,
+        channel_shift: int = 0,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -722,6 +723,7 @@ class MultiStreamCausalConv(nn.Module):
             dim=input_dim,
             kernel_size=kernel_size,
             groups=conv_groups,
+            channel_shift=channel_shift,
             gated=gated_conv,
         )
 
@@ -766,9 +768,7 @@ class MultiStreamCausalConv(nn.Module):
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
-        x = torch.cat(
-            [input_streams[s.name] for s in self._input_streams], dim=-1
-        )
+        x = torch.cat([input_streams[s.name] for s in self._input_streams], dim=-1)
         h = self.conv(x)
 
         output: dict[StreamID, Tensor] = {}
@@ -810,6 +810,7 @@ class MultiStreamCausalConvLayers(nn.Module):
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
         input_stream_ids: list[StreamID] | None = None,
+        conv_channel_shuffle: bool = True,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -825,9 +826,27 @@ class MultiStreamCausalConvLayers(nn.Module):
                 )
             kernel_sizes = kernel_size
 
+        # Compute per-layer channel shifts for cross-group mixing.
+        # Only meaningful when groups partition channels into 2+ groups
+        # (not depthwise and not full conv).
+        shift_step = 0
+        if conv_channel_shuffle and num_layers > 1:
+            if input_stream_ids is not None:
+                id_set = set(input_stream_ids)
+                input_dim = sum(
+                    s.dim for s in stream_config.streams if s.name in id_set
+                )
+            else:
+                input_dim = sum(s.dim for s in stream_config.streams)
+            effective_groups = input_dim if conv_groups <= 0 else conv_groups
+            if 1 < effective_groups < input_dim:
+                shift_step = input_dim // effective_groups
+
         self.norms = nn.ModuleList(
             [
-                nn.ModuleDict({s.key: RMSNorm() for s in stream_config.streams if s.normalize})
+                nn.ModuleDict(
+                    {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -843,8 +862,9 @@ class MultiStreamCausalConvLayers(nn.Module):
                     linear_kwargs=linear_kwargs,
                     logit_hierarchy=logit_hierarchy,
                     input_stream_ids=input_stream_ids,
+                    channel_shift=i * shift_step,
                 )
-                for ks in kernel_sizes
+                for i, ks in enumerate(kernel_sizes)
             ]
         )
         self.alphas = nn.ModuleList(
@@ -872,15 +892,12 @@ class MultiStreamCausalConvLayers(nn.Module):
             ]
         )
 
-    def forward(
-        self, input_streams: dict[StreamID, Tensor]
-    ) -> dict[StreamID, Tensor]:
+    def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         x = dict(input_streams)
         for layer_idx in range(self.num_layers):
             norms = self.norms[layer_idx]
             normed = {
-                s.name: norms[s.key](x[s.name]) if s.normalize
-                else x[s.name]
+                s.name: norms[s.key](x[s.name]) if s.normalize else x[s.name]
                 for s in self.stream_config.streams
             }
             conv_out = self.convs[layer_idx](normed)
@@ -956,11 +973,13 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
 
         # Split into read-only (pre-gathered) and writable (re-gather in forward)
         self._readonly_compressed_ids = [
-            s.name for s in stream_config.streams
+            s.name
+            for s in stream_config.streams
             if s.name in self._compressed_id_set and s.read_only
         ]
         self._writable_compressed_ids = [
-            s.name for s in stream_config.streams
+            s.name
+            for s in stream_config.streams
             if s.name in self._compressed_id_set and not s.read_only
         ]
 
@@ -1382,7 +1401,8 @@ class MultiStreamBlock(nn.Module):
     ) -> dict[StreamID, Tensor]:
         # --- Attention sub-layer ---
         normed = {
-            s.name: self.attn_norms[s.key](input_streams[s.name]) if s.normalize
+            s.name: self.attn_norms[s.key](input_streams[s.name])
+            if s.normalize
             else input_streams[s.name]
             for s in self.stream_config.streams
         }
@@ -1400,8 +1420,7 @@ class MultiStreamBlock(nn.Module):
         # --- Optional causal conv (between attention and MLP) ---
         if self.conv is not None:
             normed = {
-                s.name: self.conv_norms[s.key](x[s.name]) if s.normalize
-                else x[s.name]
+                s.name: self.conv_norms[s.key](x[s.name]) if s.normalize else x[s.name]
                 for s in self.stream_config.streams
             }
             conv_out = self.conv(normed)
@@ -1424,8 +1443,7 @@ class MultiStreamBlock(nn.Module):
 
         # --- MLP sub-layer ---
         normed = {
-            s.name: self.mlp_norms[s.key](x[s.name]) if s.normalize
-            else x[s.name]
+            s.name: self.mlp_norms[s.key](x[s.name]) if s.normalize else x[s.name]
             for s in self.stream_config.streams
         }
         mlp_out = self.mlp(normed)
@@ -1510,8 +1528,7 @@ if __name__ == "__main__":
                 gated_output=gated_out,
             )
             inp = {
-                s.name: torch.randn(bsz, seqlen, s.dim)
-                for s in stream_config.streams
+                s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams
             }
             out = conv(inp)
             assert set(out.keys()) == {
@@ -1534,10 +1551,7 @@ if __name__ == "__main__":
             num_layers=num_layers,
             kernel_size=ks,
         )
-        inp = {
-            s.name: torch.randn(bsz, seqlen, s.dim)
-            for s in stream_config.streams
-        }
+        inp = {s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams}
         out = layers(inp)
         assert set(out.keys()) == {s.name for s in stream_config.streams}
         for s in stream_config.streams:
