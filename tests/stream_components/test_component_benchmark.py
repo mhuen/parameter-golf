@@ -92,48 +92,73 @@ def _build_component_registry(
         (
             "ByteHash_word_w20",
             ByteHashComponent(
-                tok, window=20, num_hashes=2,
-                boundary=HashBoundary.WORD, track_hits=True,
+                tok,
+                window=20,
+                num_hashes=2,
+                boundary=HashBoundary.WORD,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w2",
             ByteHashComponent(
-                tok, window=2, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=2,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w3",
             ByteHashComponent(
-                tok, window=3, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=3,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w5",
             ByteHashComponent(
-                tok, window=5, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=5,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w8",
             ByteHashComponent(
-                tok, window=8, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=8,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_digit_w8",
             ByteHashComponent(
-                tok, window=8, num_hashes=2,
-                boundary=HashBoundary.DIGIT, track_hits=True,
+                tok,
+                window=8,
+                num_hashes=2,
+                boundary=HashBoundary.DIGIT,
+                track_hits=True,
             ),
         ),
         (
             "Boundary",
             BoundaryComponent(
                 tok,
-                word_pos_freqs=3, word_id_freqs=3,
-                sent_pos_freqs=2, sent_id_freqs=2,
-                para_pos_freqs=2, para_id_freqs=2,
+                word_pos_freqs=3,
+                word_id_freqs=3,
+                sent_pos_freqs=2,
+                sent_id_freqs=2,
+                para_pos_freqs=2,
+                para_id_freqs=2,
             ),
         ),
     ]
@@ -150,20 +175,19 @@ def _load_input_ids(
     data_dir: Path | None = None,
 ) -> torch.Tensor:
     """Load the first shard and return a (batch_size, seq_len) input_ids tensor."""
-    data_dir = data_dir or Path(
-        os.environ.get("DATA_PATH", str(_DEFAULT_DATA_DIR))
-    )
+    data_dir = data_dir or Path(os.environ.get("DATA_PATH", str(_DEFAULT_DATA_DIR)))
     shards = sorted(data_dir.glob("fineweb_val_*.bin"))
     if not shards:
         shards = sorted(data_dir.glob("fineweb_train_*.bin"))
     if not shards:
         raise FileNotFoundError(
-            f"No .bin shards found in {data_dir}. "
-            "Set DATA_PATH or pass --data-dir."
+            f"No .bin shards found in {data_dir}. Set DATA_PATH or pass --data-dir."
         )
     tok = EfficientByteTokenizer()
     tokens = load_shard_byte260(shards[0], tok)
-    tokens = torch.from_numpy(tokens) if not isinstance(tokens, torch.Tensor) else tokens
+    tokens = (
+        torch.from_numpy(tokens) if not isinstance(tokens, torch.Tensor) else tokens
+    )
     total_needed = seq_len * batch_size
     tokens = tokens.long()[:total_needed]
     return tokens.reshape(batch_size, seq_len)
@@ -301,7 +325,9 @@ def print_results(
 ) -> None:
     """Pretty-print benchmark results."""
     print()
-    print(f"Input shape: ({batch_size}, {seq_len})  device: {device}  compile: {compile}")
+    print(
+        f"Input shape: ({batch_size}, {seq_len})  device: {device}  compile: {compile}"
+    )
     print()
     print(f"{'Component':<25} {'Dim':>5} {'Mean(ms)':>10} {'Min(ms)':>10} ", end="")
     if save:
@@ -329,9 +355,9 @@ def print_results(
     # Warn if regression checked fewer tokens than the full sequence
     if not save:
         partial = [
-            r for r in results
-            if r.get("ref_tokens") is not None
-            and r["ref_tokens"] < r["total_tokens"]
+            r
+            for r in results
+            if r.get("ref_tokens") is not None and r["ref_tokens"] < r["total_tokens"]
         ]
         if partial:
             ref_t = partial[0]["ref_tokens"]
@@ -361,7 +387,9 @@ class TestComponentRegression:
     """Verify each component output matches saved reference vectors."""
 
     @torch.no_grad()
-    def test_all_components_match_reference(self, benchmark_results: list[dict]) -> None:
+    def test_all_components_match_reference(
+        self, benchmark_results: list[dict]
+    ) -> None:
         """Each component with a saved reference must match exactly."""
         any_checked = False
         failures = []
@@ -371,18 +399,15 @@ class TestComponentRegression:
                 continue  # no reference saved yet
             any_checked = True
             if reg:
-                failures.append(
-                    f"{r['label']}: max_diff={r.get('max_diff', '?')}"
-                )
+                failures.append(f"{r['label']}: max_diff={r.get('max_diff', '?')}")
 
         if not any_checked:
             pytest.skip(
-                "No reference vectors found. "
-                "Run with --save to create them first."
+                "No reference vectors found. Run with --save to create them first."
             )
 
-        assert not failures, (
-            "Component regression(s) detected:\n  " + "\n  ".join(failures)
+        assert not failures, "Component regression(s) detected:\n  " + "\n  ".join(
+            failures
         )
 
     @torch.no_grad()
@@ -404,35 +429,49 @@ def main() -> None:
         description="Benchmark and regression-test stream components."
     )
     parser.add_argument(
-        "--save", action="store_true",
+        "--save",
+        action="store_true",
         help="Save current outputs as reference vectors.",
     )
     parser.add_argument(
-        "--seq-len", type=int, default=_DEFAULT_SEQ_LEN,
+        "--seq-len",
+        type=int,
+        default=_DEFAULT_SEQ_LEN,
         help=f"Sequence length to benchmark (default: {_DEFAULT_SEQ_LEN}).",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=_DEFAULT_BATCH_SIZE,
+        "--batch-size",
+        type=int,
+        default=_DEFAULT_BATCH_SIZE,
         help=f"Batch size (default: {_DEFAULT_BATCH_SIZE}).",
     )
     parser.add_argument(
-        "--repeats", type=int, default=_DEFAULT_REPEATS,
+        "--repeats",
+        type=int,
+        default=_DEFAULT_REPEATS,
         help=f"Number of timed repeats per component (default: {_DEFAULT_REPEATS}).",
     )
     parser.add_argument(
-        "--data-dir", type=str, default=None,
+        "--data-dir",
+        type=str,
+        default=None,
         help="Path to byte260 data directory (default: auto-detect).",
     )
     parser.add_argument(
-        "--device", type=str, default="cpu",
+        "--device",
+        type=str,
+        default="cpu",
         help="Device to run on, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu).",
     )
     parser.add_argument(
-        "--compile", action="store_true",
+        "--compile",
+        action="store_true",
         help="Wrap each component with torch.compile(fullgraph=True).",
     )
     parser.add_argument(
-        "--compile-warmup", type=int, default=10,
+        "--compile-warmup",
+        type=int,
+        default=10,
         help="Max warm-up iterations when --compile is set (default: 10). "
         "Exits early once consecutive times converge.",
     )
@@ -450,8 +489,12 @@ def main() -> None:
         compile_warmup=args.compile_warmup,
     )
     print_results(
-        results, save=args.save, batch_size=args.batch_size, seq_len=args.seq_len,
-        device=args.device, compile=args.compile,
+        results,
+        save=args.save,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        device=args.device,
+        compile=args.compile,
     )
 
     # Exit with error if any regressions
