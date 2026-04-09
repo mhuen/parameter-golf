@@ -29,6 +29,7 @@ from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
+    MultiStreamGPTTestModel,
     count_params,
     train_model,
     evaluate_autoregressive,
@@ -160,7 +161,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--pack", action="store_true",
+        "--pack",
+        action="store_true",
         help="Pack 2 documents per sequence (each prefixed with BOS)",
     )
     args = parser.parse_args()
@@ -199,6 +201,21 @@ if __name__ == "__main__":
         mlp_mult=2,
     )
     gpt_params = count_params(gpt_model, "TinyGPT")
+
+    print()
+    print("=" * 60)
+    print("MultiStreamGPT (full model)")
+    print("=" * 60)
+    msgpt_model = MultiStreamGPTTestModel(
+        tok=tok,
+        vocab_size=tok.vocab_size,
+        num_heads=2,
+        num_kv_heads=2,
+        num_layers=1,
+        multi_head_dim=32,
+        mlp_hidden_dim=16,
+    )
+    msgpt_params = count_params(msgpt_model, "MultiStreamGPT")
     print(f"\n  Param ratio (GPT / MS): {gpt_params / ms_params:.2f}x\n")
 
     if args.pack:
@@ -208,24 +225,28 @@ if __name__ == "__main__":
     train_kwargs = dict(
         make_batch_fn=make_batch,
         tok=tok,
-        steps=2000,
+        steps=1000,
         batch_size=64,
         lr=3e-2,
-        eval_every=400,
+        eval_every=200,
         device=device,
         pack_documents=args.pack,
     )
 
     if args.pack:
+
         def ms_eval_fn(model, dev):
             return evaluate_packed(model, make_batch, tok, n_samples=200, device=dev)
+
         def gpt_eval_fn(model, dev):
             return evaluate_packed(model, make_batch, tok, n_samples=200, device=dev)
     else:
+
         def ms_eval_fn(model, dev):
             return evaluate_autoregressive(
                 model, make_sample, tok, n_samples=200, device=dev
             )
+
         def gpt_eval_fn(model, dev):
             return evaluate_autoregressive(
                 model, make_sample, tok, n_samples=200, device=dev
@@ -242,6 +263,12 @@ if __name__ == "__main__":
     print("=" * 60)
     gpt_model = train_model(gpt_model, eval_fn=gpt_eval_fn, **train_kwargs)
 
+    print()
+    print("=" * 60)
+    print("Training MultiStreamGPT")
+    print("=" * 60)
+    msgpt_model = train_model(msgpt_model, eval_fn=ms_eval_fn, **train_kwargs)
+
     # --- Per-category evaluation ---
     print()
     print("=" * 60)
@@ -249,7 +276,11 @@ if __name__ == "__main__":
     print("=" * 60)
 
     results = {}
-    for name, model in [("Multi-stream", ms_model), ("TinyGPT", gpt_model)]:
+    for name, model in [
+        ("Multi-stream", ms_model),
+        ("TinyGPT", gpt_model),
+        ("MultiStreamGPT", msgpt_model),
+    ]:
         overall = evaluate_autoregressive(
             model, make_sample, tok, n_samples=400, device=device
         )
@@ -266,13 +297,19 @@ if __name__ == "__main__":
         }
         line = f"  {name:15s}  overall={overall:.1%}  letters={letters_acc:.1%}  digits={digits_acc:.1%}"
         if args.pack:
-            packed = evaluate_packed(model, make_batch, tok, n_samples=400, device=device)
+            packed = evaluate_packed(
+                model, make_batch, tok, n_samples=400, device=device
+            )
             results[name]["packed"] = packed
             line += f"  packed={packed:.1%}"
         print(line)
 
     # --- Show examples per category ---
-    for name, model in [("Multi-stream", ms_model), ("TinyGPT", gpt_model)]:
+    for name, model in [
+        ("Multi-stream", ms_model),
+        ("TinyGPT", gpt_model),
+        ("MultiStreamGPT", msgpt_model),
+    ]:
         print()
         print(f"  Examples — {name}")
         print(f"  {'─' * 50}")
@@ -291,6 +328,9 @@ if __name__ == "__main__":
     )
     verify_causality(
         gpt_model, tok, device, make_sample_fn=make_sample, label="TinyGPT"
+    )
+    verify_causality(
+        msgpt_model, tok, device, make_sample_fn=make_sample, label="MultiStreamGPT"
     )
 
     # --- Summary comparison ---

@@ -30,6 +30,7 @@ from multi_streams import StreamType, StreamID, StreamDef
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
+    MultiStreamGPTTestModel,
     count_params,
     train_model,
     evaluate_autoregressive,
@@ -165,12 +166,22 @@ if __name__ == "__main__":
         mlp_mult=2,
     )
 
+    msgpt_model = MultiStreamGPTTestModel(
+        tok=tok,
+        vocab_size=tok.vocab_size,
+        num_heads=1,
+        num_kv_heads=1,
+        num_layers=1,
+        multi_head_dim=32,
+        mlp_hidden_dim=16,
+    )
+
     train_kwargs = dict(
         tok=tok,
-        steps=2000,
+        steps=1000,
         batch_size=64,
         lr=3e-2,
-        eval_every=400,
+        eval_every=200,
         device=device,
         pack_documents=args.pack,
     )
@@ -181,6 +192,7 @@ if __name__ == "__main__":
     models = [
         ("Multi-Stream Attention (1 head, head_dim=32, 1 layer)", ms_model),
         ("TinyGPT (dim=64, 1 layer, 2 heads, mlp_mult=2)", gpt_model),
+        ("MultiStreamGPT (1H, 1L, mhd=32)", msgpt_model),
     ]
 
     for name, model in models:

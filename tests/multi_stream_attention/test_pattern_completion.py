@@ -29,6 +29,7 @@ from multi_streams import StreamType, StreamID, StreamDef, SinCosPositionCompone
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
+    MultiStreamGPTTestModel,
     count_params,
     train_model,
     evaluate_autoregressive,
@@ -207,7 +208,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--pack", action="store_true",
+        "--pack",
+        action="store_true",
         help="Pack 2 documents per sequence (each prefixed with BOS)",
     )
     args = parser.parse_args()
@@ -236,15 +238,26 @@ if __name__ == "__main__":
         num_heads=2,
     )
 
+    msgpt_model = MultiStreamGPTTestModel(
+        tok=tok,
+        vocab_size=tok.vocab_size,
+        num_heads=1,
+        num_kv_heads=1,
+        num_layers=1,
+        multi_head_dim=16,
+        mlp_hidden_dim=16,
+    )
+
     count_params(ms_model, "Multi-stream")
     count_params(gpt_model, "TinyGPT")
+    count_params(msgpt_model, "MultiStreamGPT")
 
     train_kwargs = dict(
         tok=tok,
-        steps=2000,
+        steps=1000,
         batch_size=64,
         lr=3e-2,
-        eval_every=400,
+        eval_every=200,
         device=device,
         pack_documents=args.pack,
     )
@@ -257,20 +270,31 @@ if __name__ == "__main__":
     for name, model in [
         ("Multi-stream attention", ms_model),
         ("TinyGPT", gpt_model),
+        ("MultiStreamGPT", msgpt_model),
     ]:
         print("=" * 60)
         print(f"Training: {name}")
         print("=" * 60)
 
         if args.pack:
+
             def eval_fn(m, d):
                 return evaluate_packed(
-                    m, make_train_batch, tok, n_samples=200, device=d,
+                    m,
+                    make_train_batch,
+                    tok,
+                    n_samples=200,
+                    device=d,
                 )
         else:
+
             def eval_fn(m, d):
                 return evaluate_autoregressive(
-                    m, make_eval_sample(), tok, n_samples=200, device=d,
+                    m,
+                    make_eval_sample(),
+                    tok,
+                    n_samples=200,
+                    device=d,
                 )
 
         model = train_model(
@@ -282,12 +306,20 @@ if __name__ == "__main__":
 
         # --- Overall evaluation ---
         overall_acc = evaluate_autoregressive(
-            model, make_eval_sample(), tok, n_samples=500, device=device,
+            model,
+            make_eval_sample(),
+            tok,
+            n_samples=500,
+            device=device,
         )
         print(f"\n  Single-doc accuracy: {overall_acc:.1%}")
         if args.pack:
             packed_acc = evaluate_packed(
-                model, make_train_batch, tok, n_samples=500, device=device,
+                model,
+                make_train_batch,
+                tok,
+                n_samples=500,
+                device=device,
             )
             print(f"  Packed accuracy:     {packed_acc:.1%}")
 

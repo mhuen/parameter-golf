@@ -41,6 +41,7 @@ from multi_stream_attention import CausalArithmeticMultiStreamAttention
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
+    MultiStreamGPTTestModel,
     count_params,
     train_model,
     evaluate_autoregressive,
@@ -419,7 +420,19 @@ if __name__ == "__main__":
     )
     models.append(("MS + ArithAttn", ms_arith))
 
-    # 5. Oracle — directly decodes DigitComputeComponent output
+    # 5. MultiStreamGPT (full model)
+    msgpt_model = MultiStreamGPTTestModel(
+        tok=tok,
+        vocab_size=tok.vocab_size,
+        num_heads=2,
+        num_kv_heads=2,
+        num_layers=1,
+        multi_head_dim=32,
+        mlp_hidden_dim=16,
+    )
+    models.append(("MultiStreamGPT (2H, 1L)", msgpt_model))
+
+    # 6. Oracle — directly decodes DigitComputeComponent output
     oracle = OracleDigitComputeModel(
         tok,
         ops={PairwiseOp.ADD, PairwiseOp.SUB, PairwiseOp.MUL, PairwiseOp.DIV},
@@ -437,10 +450,10 @@ if __name__ == "__main__":
     # --- Training ---
     train_kwargs = dict(
         tok=tok,
-        steps=2000,
+        steps=1000,
         batch_size=64,
         lr=3e-2,
-        eval_every=500,
+        eval_every=200,
         device=device,
         pack_documents=args.pack,
     )
