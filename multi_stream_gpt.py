@@ -325,6 +325,7 @@ class MultiStreamGPT(nn.Module):
         k_shift: bool = True,
         # Output
         logit_softcap: float = 30.0,
+        logit_stream_normalization_factor: float = 10.0,
         # Priors
         include_bigram_prior: bool = True,
         include_utf8_prior: bool = True,
@@ -343,6 +344,7 @@ class MultiStreamGPT(nn.Module):
         self.builder = components.builder
         self.utf8_prior = components.utf8_prior if include_utf8_prior else None
         self.logit_softcap = logit_softcap
+        self.logit_stream_normalization_factor = logit_stream_normalization_factor
         self.num_layers = num_layers
 
         stream_config = components.stream_config
@@ -385,7 +387,6 @@ class MultiStreamGPT(nn.Module):
                 input_stream_ids=conv_input_streams,
                 output_stream_ids=conv_output_streams,
                 conv_channel_shuffle=preconv_channel_shuffle,
-                logit_normalization_factor=logit_softcap,
             )
 
         # -- Arithmetic attention instances --
@@ -430,7 +431,6 @@ class MultiStreamGPT(nn.Module):
                     conv_groups=bconv_g[j],
                     logit_hierarchy=components.logit_hierarchy,
                     input_stream_ids=conv_input_streams,
-                    logit_normalization_factor=logit_softcap,
                 )
             )
 
@@ -464,7 +464,6 @@ class MultiStreamGPT(nn.Module):
                     conv=conv_i,
                     arith_attn=arith_i,
                     logit_hierarchy=components.logit_hierarchy,
-                    logit_normalization_factor=logit_softcap,
                     mlp_output_stream_ids=[_LOGIT_SID] if is_last_block else None,
                 )
             )
@@ -520,20 +519,27 @@ class MultiStreamGPT(nn.Module):
         if self.bigram_prior is not None:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] + self.bigram_prior(input_ids)
 
-        # 3. Pre-processing conv layers.
+        # 3b. Scale LOGIT stream down so all streams are at ~unit scale.
+        #     Reversed in step 6 before softcap.
+        if self.logit_stream_normalization_factor > 0:
+            streams[_LOGIT_SID] = streams[_LOGIT_SID] * (
+                1.0 / self.logit_stream_normalization_factor
+            )
+
+        # 4. Pre-processing conv layers.
         if self.preconv_layers is not None:
             streams = self.preconv_layers(streams)
 
-        # 4. Attention blocks.
+        # 5. Attention blocks.
         for block in self.blocks:
             streams = block(streams, compressed=compressed, views=views)
 
-        # 5. Extract logits, apply softcap, then UTF-8 prior.
-        logits = streams[_LOGIT_SID]
+        # 6. Extract logits, scale back up, apply softcap.
+        logits = streams[_LOGIT_SID] * self.logit_stream_normalization_factor
         if self.logit_softcap > 0:
             logits = softcap_linear(x=logits, cap=self.logit_softcap)
 
-        # 6. UTF-8 prior: hard -inf mask (reuses token_mask from step 2).
+        # 7. UTF-8 prior: hard -inf mask (reuses token_mask from step 2).
         if token_mask is not None:
             logits = logits + token_mask
 

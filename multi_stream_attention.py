@@ -600,7 +600,6 @@ class MultiStreamMLP(nn.Module):
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
-        logit_normalization_factor: float = 0.0,
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
     ):
@@ -625,19 +624,6 @@ class MultiStreamMLP(nn.Module):
             self._output_streams = [s for s in all_writable if s.name in out_set]
         else:
             self._output_streams = all_writable
-
-        # LOGIT stream scaling: divide by normalization factor before concat.
-        # Only for LOGIT streams that are NOT already RMSNorm'd (normalize=False).
-        self._logit_scale: float | None = None
-        self._logit_ids: set[StreamID] = set()
-        if logit_normalization_factor > 0:
-            self._logit_ids = {
-                s.name
-                for s in self._input_streams
-                if s.name.type == StreamType.LOGIT and not s.normalize
-            }
-            if self._logit_ids:
-                self._logit_scale = 1.0 / logit_normalization_factor
 
         # Identify the logit stream ID (if hierarchy is active)
         self._logit_sid: StreamID | None = None
@@ -690,18 +676,7 @@ class MultiStreamMLP(nn.Module):
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for output streams only."""
-        if self._logit_scale is not None:
-            parts = []
-            for s in self._input_streams:
-                t = input_streams[s.name]
-                if s.name in self._logit_ids:
-                    t = t * self._logit_scale
-                parts.append(t)
-            x = torch.cat(parts, dim=-1)
-        else:
-            x = torch.cat(
-                [input_streams[s.name] for s in self._input_streams], dim=-1
-            )
+        x = torch.cat([input_streams[s.name] for s in self._input_streams], dim=-1)
         h = F.leaky_relu(self.fc_up(x), negative_slope=self.leaky_relu_slope)
         h = h.square()
 
@@ -747,7 +722,6 @@ class MultiStreamCausalConv(nn.Module):
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
         channel_shift: int = 0,
-        logit_normalization_factor: float = 0.0,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -759,19 +733,6 @@ class MultiStreamCausalConv(nn.Module):
             self._input_streams = [s for s in stream_config.streams if s.name in id_set]
         else:
             self._input_streams = list(stream_config.streams)
-
-        # LOGIT stream scaling: divide by normalization factor before conv input.
-        # Only for LOGIT streams that are NOT already RMSNorm'd (normalize=False).
-        self._logit_scale: float | None = None
-        self._logit_ids: set[StreamID] = set()
-        if logit_normalization_factor > 0:
-            self._logit_ids = {
-                s.name
-                for s in self._input_streams
-                if s.name.type == StreamType.LOGIT and not s.normalize
-            }
-            if self._logit_ids:
-                self._logit_scale = 1.0 / logit_normalization_factor
 
         # Identify the logit stream ID (if hierarchy is active)
         self._logit_sid: StreamID | None = None
@@ -819,16 +780,7 @@ class MultiStreamCausalConv(nn.Module):
 
     def forward(self, input_streams: dict[StreamID, Tensor]) -> dict[StreamID, Tensor]:
         """Returns update deltas for writable streams only."""
-        if self._logit_scale is not None:
-            parts = []
-            for s in self._input_streams:
-                t = input_streams[s.name]
-                if s.name in self._logit_ids:
-                    t = t * self._logit_scale
-                parts.append(t)
-            x = torch.cat(parts, dim=-1)
-        else:
-            x = torch.cat([input_streams[s.name] for s in self._input_streams], dim=-1)
+        x = torch.cat([input_streams[s.name] for s in self._input_streams], dim=-1)
         h = self.conv(x)
 
         # Discard padding channels, then slice into per-stream deltas
@@ -865,7 +817,6 @@ class MultiStreamCausalConvLayers(nn.Module):
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
         conv_channel_shuffle: bool = True,
-        logit_normalization_factor: float = 0.0,
         alpha_init: float = -3.0,
         beta_init: float = 5.0,
     ):
@@ -926,7 +877,6 @@ class MultiStreamCausalConvLayers(nn.Module):
                     input_stream_ids=input_stream_ids,
                     output_stream_ids=output_stream_ids,
                     channel_shift=i * shift_step,
-                    logit_normalization_factor=logit_normalization_factor,
                 )
                 for i, ks in enumerate(kernel_sizes)
             ]
@@ -1338,7 +1288,6 @@ class MultiStreamBlock(nn.Module):
         conv: MultiStreamCausalConv | None = None,
         arith_attn: CausalArithmeticMultiStreamAttention | None = None,
         logit_hierarchy: ByteLogitHierarchy | None = None,
-        logit_normalization_factor: float = 0.0,
         mlp_input_stream_ids: list[StreamID] | None = None,
         mlp_output_stream_ids: list[StreamID] | None = None,
         attn_alpha_init: float = -1.0,
@@ -1392,7 +1341,6 @@ class MultiStreamBlock(nn.Module):
             linear_mode=linear_mode,
             linear_kwargs=linear_kwargs,
             logit_hierarchy=logit_hierarchy,
-            logit_normalization_factor=logit_normalization_factor,
             input_stream_ids=mlp_input_stream_ids,
             output_stream_ids=mlp_output_stream_ids,
         )
@@ -1600,9 +1548,7 @@ if __name__ == "__main__":
             kernel_size=4,
             gated_conv=gated_conv,
         )
-        inp = {
-            s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams
-        }
+        inp = {s.name: torch.randn(bsz, seqlen, s.dim) for s in stream_config.streams}
         out = conv(inp)
         assert set(out.keys()) == {
             s.name for s in stream_config.streams if not s.read_only
