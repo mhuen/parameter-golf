@@ -209,6 +209,99 @@ def build_byte_bpb_lut(tok: EfficientByteTokenizer, device: torch.device):
     return torch.tensor(base_bytes, dtype=torch.int16, device=device)
 
 
+def eval_prior_bpb(
+    args,
+    base_model,
+    rank,
+    world_size,
+    device,
+    grad_accum_steps,
+    val_tokens,
+    base_bytes_lut,
+):
+    """Compute standalone BPB of the bigram + UTF8 prior on validation data.
+
+    Reuses the model's own builder, utf8_prior, and bigram_prior layers
+    (same code path as the first steps of MultiStreamGPT.forward), skipping
+    blocks and softcap.  Reports uniform, UTF8-only, and bigram+UTF8 BPB
+    so off-by-one index errors are easy to spot.
+    """
+    from multi_streams import StreamID, StreamType
+
+    _LOGIT_SID = StreamID(StreamType.LOGIT)
+
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    utf8_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    bigram_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model.eval()
+    with torch.inference_mode():
+        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+            raw_start = batch_seq_start * args.train_seq_len
+            raw_end = batch_seq_end * args.train_seq_len + 1
+            local = val_tokens[raw_start:raw_end].to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
+            x = local[:-1].reshape(-1, args.train_seq_len)
+            y = local[1:].reshape(-1, args.train_seq_len)
+
+            # Same path as MultiStreamGPT.forward steps 1-3, no blocks/softcap.
+            streams, _compressed, _views = base_model.builder(x, dtype=torch.bfloat16)
+            logits = streams[_LOGIT_SID]  # zeros (B, S, V)
+
+            # UTF8 prior hard mask (skip the capped early version — we only
+            # care about the final prediction, not block stability).
+            token_mask = None
+            if base_model.utf8_prior is not None:
+                _cat_mask, token_mask = base_model.utf8_prior(x)
+                token_mask = token_mask.to(dtype=logits.dtype)
+
+            # UTF8-only loss
+            utf8_logits = logits + token_mask if token_mask is not None else logits
+            utf8_loss = F.cross_entropy(
+                utf8_logits.float().reshape(-1, utf8_logits.size(-1)),
+                y.reshape(-1),
+                reduction="mean",
+            )
+
+            # Bigram + UTF8 loss
+            bigram_logits = utf8_logits
+            if base_model.bigram_prior is not None:
+                bigram_logits = bigram_logits + base_model.bigram_prior(x)
+            bigram_loss = F.cross_entropy(
+                bigram_logits.float().reshape(-1, bigram_logits.size(-1)),
+                y.reshape(-1),
+                reduction="mean",
+            )
+
+            n = float(y.numel())
+            utf8_loss_sum += utf8_loss.to(torch.float64) * n
+            bigram_loss_sum += bigram_loss.to(torch.float64) * n
+            token_count += n
+            byte_count += base_bytes_lut[y.reshape(-1)].to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        for t in (utf8_loss_sum, bigram_loss_sum, token_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+    tpb = token_count.item() / byte_count.item()
+    vocab_size = base_model.builder.vocab_size
+    uniform_bpb = math.log2(vocab_size) * tpb
+    utf8_bpb = utf8_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+    bigram_bpb = bigram_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+
+    base_model.train()
+    return uniform_bpb, utf8_bpb, bigram_bpb
+
+
 def eval_val(
     args,
     model,
@@ -712,6 +805,16 @@ def main():
         )
         with torch.no_grad():
             base_model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
+
+    # --- Sanity-check: prior-only BPB ---
+    uniform_bpb, utf8_bpb, bigram_bpb = eval_prior_bpb(
+        args, base_model, rank, world_size, device,
+        grad_accum_steps, val_tokens, base_bytes_lut,
+    )
+    log0(
+        f"prior_bpb: uniform={uniform_bpb:.4f} utf8_only={utf8_bpb:.4f} "
+        f"bigram+utf8={bigram_bpb:.4f}"
+    )
 
     # --- Wrap for training ---
     train_wrapper = MultiStreamGPTForTraining(base_model)
