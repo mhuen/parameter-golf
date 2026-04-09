@@ -14,6 +14,9 @@ Usage:
     # Customize sequence length or number of repeats:
     python tests/stream_components/test_component_benchmark.py --seq-len 2048 --repeats 5
 
+    # Run on GPU with torch.compile:
+    python tests/stream_components/test_component_benchmark.py --device cuda --compile
+
     # As pytest (regression checks only, skips if no saved refs):
     pytest tests/stream_components/test_component_benchmark.py -v
 """
@@ -193,27 +196,58 @@ def run_benchmark(
     repeats: int = _DEFAULT_REPEATS,
     save: bool = False,
     data_dir: Path | None = None,
+    device: str = "cpu",
+    compile: bool = False,
+    compile_warmup: int = 10,
 ) -> list[dict]:
     """Run all components and return timing + regression results."""
     input_ids = _load_input_ids(seq_len, batch_size=batch_size, data_dir=data_dir)
+    input_ids = input_ids.to(device)
     tok = EfficientByteTokenizer()
     registry = _build_component_registry(tok)
     dtype = torch.float32
+    use_cuda_sync = device != "cpu" and torch.cuda.is_available()
 
     results: list[dict] = []
 
     for label, component in registry:
-        # -- warm-up --
-        with torch.no_grad():
-            component(input_ids, dtype=dtype)
+        component = component.to(device)
+        if compile:
+            component = torch.compile(component, fullgraph=True)
+
+        # -- warm-up: run until compiled execution stabilises --
+        # torch.compile traces lazily and may retrace on early calls.
+        # We run iterations until the last two are within 2× of each other
+        # (or until max_warmup is hit) so timed runs never include compilation.
+        max_warmup = compile_warmup if compile else 1
+        prev_t = None
+        for wi in range(max_warmup):
+            if use_cuda_sync:
+                torch.cuda.synchronize()
+            w0 = time.perf_counter()
+            with torch.no_grad():
+                component(input_ids, dtype=dtype)
+            if use_cuda_sync:
+                torch.cuda.synchronize()
+            cur_t = time.perf_counter() - w0
+            # After at least 2 iters, check if times have converged
+            if compile and wi >= 1 and prev_t is not None:
+                ratio = max(cur_t, prev_t) / max(min(cur_t, prev_t), 1e-9)
+                if ratio < 2.0:
+                    break
+            prev_t = cur_t
 
         # -- timed runs --
         times = []
         output = None
         for _ in range(repeats):
+            if use_cuda_sync:
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
             with torch.no_grad():
                 output = component(input_ids, dtype=dtype)
+            if use_cuda_sync:
+                torch.cuda.synchronize()
             times.append(time.perf_counter() - t0)
 
         assert output is not None
@@ -258,11 +292,16 @@ def run_benchmark(
 
 
 def print_results(
-    results: list[dict], save: bool = False, batch_size: int = 1, seq_len: int = 0,
+    results: list[dict],
+    save: bool = False,
+    batch_size: int = 1,
+    seq_len: int = 0,
+    device: str = "cpu",
+    compile: bool = False,
 ) -> None:
     """Pretty-print benchmark results."""
     print()
-    print(f"Input shape: ({batch_size}, {seq_len})")
+    print(f"Input shape: ({batch_size}, {seq_len})  device: {device}  compile: {compile}")
     print()
     print(f"{'Component':<25} {'Dim':>5} {'Mean(ms)':>10} {'Min(ms)':>10} ", end="")
     if save:
@@ -384,6 +423,19 @@ def main() -> None:
         "--data-dir", type=str, default=None,
         help="Path to byte260 data directory (default: auto-detect).",
     )
+    parser.add_argument(
+        "--device", type=str, default="cpu",
+        help="Device to run on, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu).",
+    )
+    parser.add_argument(
+        "--compile", action="store_true",
+        help="Wrap each component with torch.compile(fullgraph=True).",
+    )
+    parser.add_argument(
+        "--compile-warmup", type=int, default=10,
+        help="Max warm-up iterations when --compile is set (default: 10). "
+        "Exits early once consecutive times converge.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None
@@ -393,8 +445,14 @@ def main() -> None:
         repeats=args.repeats,
         save=args.save,
         data_dir=data_dir,
+        device=args.device,
+        compile=args.compile,
+        compile_warmup=args.compile_warmup,
     )
-    print_results(results, save=args.save, batch_size=args.batch_size, seq_len=args.seq_len)
+    print_results(
+        results, save=args.save, batch_size=args.batch_size, seq_len=args.seq_len,
+        device=args.device, compile=args.compile,
+    )
 
     # Exit with error if any regressions
     if not args.save:
