@@ -64,6 +64,7 @@ from modules import (
 )
 import optim as _optim_mod
 from optim import Muon, _GRAM_NS_LIB
+from debug_nan import NaNWatchdog
 from data import (
     load_raw_shard,
     load_validation_tokens_byte260,
@@ -533,6 +534,7 @@ def _build_tokenizer(args: Hyperparameters) -> EfficientByteTokenizer:
 def main():
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    nan_watchdog = NaNWatchdog.from_env(log_fn=None)  # uses stderr by default
     _optim_mod._zeropower_standard_ns5 = torch.compile(
         _optim_mod._zeropower_standard_ns5
     )
@@ -713,11 +715,15 @@ def main():
 
     # --- Wrap for training ---
     train_wrapper = MultiStreamGPTForTraining(base_model)
-    compiled_model = torch.compile(train_wrapper, dynamic=False, fullgraph=True)
+    if nan_watchdog.should_disable_compile():
+        log0("DEBUG_NAN: torch.compile DISABLED for full diagnostic mode")
+        run_model = train_wrapper
+    else:
+        run_model = torch.compile(train_wrapper, dynamic=False, fullgraph=True)
     model = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        DDP(run_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
-        else compiled_model
+        else run_model
     )
 
     # --- Optimizer setup ---
@@ -898,6 +904,12 @@ def main():
     )
     log0(f"seed:{args.seed}")
 
+    # --- NaN watchdog hooks (level 2 only) ---
+    if nan_watchdog.should_disable_compile():
+        nan_watchdog.attach_hooks(base_model)
+        torch.autograd.set_detect_anomaly(True)
+        log0("DEBUG_NAN: anomaly detection ON, forward hooks attached")
+
     train_loader = DistributedTokenLoader(
         args.train_files, tok, rank, world_size, device
     )
@@ -1024,6 +1036,7 @@ def main():
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        nan_watchdog.check_loss(train_loss, step)
 
         frac = (
             min(step / args.muon_momentum_warmup_steps, 1.0)
@@ -1039,6 +1052,7 @@ def main():
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
+        nan_watchdog.check_params_and_grads(base_model, step)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
@@ -1061,6 +1075,8 @@ def main():
                 f"train_time:{approx_training_time_ms:.0f}ms "
                 f"step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            nan_watchdog.log_step_summary(step, tl)
+            nan_watchdog.log_alpha_beta_gates(base_model, step)
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         )
