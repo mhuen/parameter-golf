@@ -237,6 +237,7 @@ def eval_prior_bpb(
     seq_end = (total_seqs * (rank + 1)) // world_size
 
     utf8_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    bigram_only_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     bigram_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -272,34 +273,46 @@ def eval_prior_bpb(
                 reduction="mean",
             )
 
-            # Bigram + UTF8 loss
-            bigram_logits = utf8_logits
+            # Bigram-only loss (no UTF8 mask)
+            bigram_only_logits = logits
             if base_model.bigram_prior is not None:
-                bigram_logits = bigram_logits + base_model.bigram_prior(x)
+                bigram_only_logits = bigram_only_logits + base_model.bigram_prior(x)
+            bigram_only_loss = F.cross_entropy(
+                bigram_only_logits.float().reshape(-1, bigram_only_logits.size(-1)),
+                y.reshape(-1),
+                reduction="mean",
+            )
+
+            # Bigram + UTF8 loss
+            bigram_utf8_logits = utf8_logits
+            if base_model.bigram_prior is not None:
+                bigram_utf8_logits = bigram_utf8_logits + base_model.bigram_prior(x)
             bigram_loss = F.cross_entropy(
-                bigram_logits.float().reshape(-1, bigram_logits.size(-1)),
+                bigram_utf8_logits.float().reshape(-1, bigram_utf8_logits.size(-1)),
                 y.reshape(-1),
                 reduction="mean",
             )
 
             n = float(y.numel())
             utf8_loss_sum += utf8_loss.to(torch.float64) * n
+            bigram_only_loss_sum += bigram_only_loss.to(torch.float64) * n
             bigram_loss_sum += bigram_loss.to(torch.float64) * n
             token_count += n
             byte_count += base_bytes_lut[y.reshape(-1)].to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
-        for t in (utf8_loss_sum, bigram_loss_sum, token_count, byte_count):
+        for t in (utf8_loss_sum, bigram_only_loss_sum, bigram_loss_sum, token_count, byte_count):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     tpb = token_count.item() / byte_count.item()
     vocab_size = base_model.builder.vocab_size
     uniform_bpb = math.log2(vocab_size) * tpb
     utf8_bpb = utf8_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
-    bigram_bpb = bigram_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+    bigram_only_bpb = bigram_only_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+    bigram_utf8_bpb = bigram_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
 
     base_model.train()
-    return uniform_bpb, utf8_bpb, bigram_bpb
+    return uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb
 
 
 def eval_val(
@@ -807,13 +820,13 @@ def main():
             base_model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
 
     # --- Sanity-check: prior-only BPB ---
-    uniform_bpb, utf8_bpb, bigram_bpb = eval_prior_bpb(
+    uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb = eval_prior_bpb(
         args, base_model, rank, world_size, device,
         grad_accum_steps, val_tokens, base_bytes_lut,
     )
     log0(
         f"prior_bpb: uniform={uniform_bpb:.4f} utf8_only={utf8_bpb:.4f} "
-        f"bigram+utf8={bigram_bpb:.4f}"
+        f"bigram_only={bigram_only_bpb:.4f} bigram+utf8={bigram_utf8_bpb:.4f}"
     )
 
     # --- Wrap for training ---
