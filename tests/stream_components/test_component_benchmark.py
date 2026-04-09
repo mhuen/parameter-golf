@@ -223,12 +223,27 @@ def run_benchmark(
     device: str = "cpu",
     compile: bool = False,
     compile_warmup: int = 10,
+    components: list[str] | None = None,
 ) -> list[dict]:
     """Run all components and return timing + regression results."""
     input_ids = _load_input_ids(seq_len, batch_size=batch_size, data_dir=data_dir)
     input_ids = input_ids.to(device)
     tok = EfficientByteTokenizer()
     registry = _build_component_registry(tok)
+
+    if components:
+        # Case-insensitive substring match for convenience
+        lc_filters = [f.lower() for f in components]
+        registry = [
+            (label, comp)
+            for label, comp in registry
+            if any(f in label.lower() for f in lc_filters)
+        ]
+        if not registry:
+            raise ValueError(
+                f"No components matched filters: {components}. "
+                f"Available: {[l for l, _ in _build_component_registry(tok)]}"
+            )
     dtype = torch.float32
     use_cuda_sync = device != "cpu" and torch.cuda.is_available()
 
@@ -475,6 +490,16 @@ def main() -> None:
         help="Max warm-up iterations when --compile is set (default: 10). "
         "Exits early once consecutive times converge.",
     )
+    parser.add_argument(
+        "-c",
+        "--component",
+        type=str,
+        nargs="+",
+        default=None,
+        dest="components",
+        help="Only run components whose name contains one of the given strings "
+        "(case-insensitive substring match). E.g. -c boundary hash",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None
@@ -487,6 +512,7 @@ def main() -> None:
         device=args.device,
         compile=args.compile,
         compile_warmup=args.compile_warmup,
+        components=args.components,
     )
     print_results(
         results,
