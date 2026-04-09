@@ -437,7 +437,7 @@ def compute_bigram_log_probs(
     tok: EfficientByteTokenizer,
     vocab_size: int,
     smoothing: float = 0.0,
-    max_data_bytes: int = 500_000_000,
+    max_data_bytes: int = 1_000_000,
 ) -> Tensor:
     """Compute bigram log-probabilities from training data.
 
