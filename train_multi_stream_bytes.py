@@ -139,8 +139,7 @@ class Hyperparameters:
     # Bigram prior
     include_bigram_prior = bool(int(os.environ.get("INCLUDE_BIGRAM_PRIOR", "1")))
     bigram_prior_lr = float(os.environ.get("BIGRAM_PRIOR_LR", 0.01))
-    bigram_init_sequences = int(os.environ.get("BIGRAM_INIT_SEQUENCES", 1000000))
-    bigram_init_smoothing = float(os.environ.get("BIGRAM_INIT_SMOOTHING", 1.0))
+    bigram_init_smoothing = float(os.environ.get("BIGRAM_INIT_SMOOTHING", 0.0))
 
     # Optimizer
     builder_lr = float(os.environ.get("BUILDER_LR", 0.01))
@@ -433,70 +432,58 @@ DistributedTokenLoader = DistributedTokenLoaderByte260
 # ---------------------------------------------------------------------------
 
 
-def initialize_bigram_prior(
-    model: MultiStreamGPT,
+def compute_bigram_log_probs(
     train_pattern: str,
     tok: EfficientByteTokenizer,
-    seq_len: int,
-    num_sequences: int,
-    smoothing: float,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    master_process: bool,
-) -> None:
-    """Compute bigram statistics from training data and initialize the prior.
+    vocab_size: int,
+    smoothing: float = 0.0,
+    max_data_bytes: int = 500_000_000,
+) -> Tensor:
+    """Compute bigram log-probabilities from training data.
 
-    Creates a temporary data loader, collects ``num_sequences`` batches of
-    ``(x, y)`` pairs, builds a ``(V, V)`` count matrix, smooths, normalizes,
-    and sets the bigram_logits parameter to the resulting log-probabilities.
+    Reads shard files directly with numpy, counts consecutive-token bigrams,
+    smooths, normalizes, and returns ``(V, V)`` float32 log-probabilities.
     """
-    if model.bigram_prior is None:
-        return
+    files = sorted(glob.glob(train_pattern))
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
 
-    vocab_size = model.bigram_prior.bigram_logits.shape[0]
-    if master_process:
-        print(
-            f"bigram_init: collecting {num_sequences} sequences (seq_len={seq_len})..."
-        )
+    print(f"bigram_init: loading tokens (max={max_data_bytes:,})...")
 
-    # Use a temporary loader so the main training loader starts fresh.
-    tmp_loader = DistributedTokenLoaderByte260(
-        train_pattern, tok, rank, world_size, device
-    )
+    token_chunks: list[np.ndarray] = []
+    total = 0
+    for f in files:
+        shard = load_data_shard(f)
+        toks = remap_shard_tokens(shard, tok).numpy().astype(np.int64)
+        token_chunks.append(toks)
+        total += len(toks)
+        if max_data_bytes > 0 and total >= max_data_bytes:
+            break
+    all_tokens = np.concatenate(token_chunks)
+    if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
+        all_tokens = all_tokens[:max_data_bytes]
+    del token_chunks
 
-    counts = torch.zeros(vocab_size, vocab_size, dtype=torch.float64, device=device)
-    # Compute per-rank batch size: 1 sequence per micro-step is fine for init.
-    global_tokens = seq_len * world_size
-    for _ in range(num_sequences):
-        x, y = tmp_loader.next_batch(global_tokens, seq_len, grad_accum_steps=1)
-        # x, y are (B, S) — count all (x[b,t], y[b,t]) bigrams.
-        x_flat = x.reshape(-1).long()
-        y_flat = y.reshape(-1).long()
-        counts.index_put_(
-            (x_flat, y_flat),
-            torch.ones_like(x_flat, dtype=torch.float64),
-            accumulate=True,
-        )
-    del tmp_loader
+    print(f"bigram_init: counting bigrams over {len(all_tokens):,} tokens...")
 
-    # Combine across ranks.
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+    # Count bigrams: (all_tokens[i], all_tokens[i+1]) for all consecutive pairs.
+    prev_tokens = all_tokens[:-1]
+    next_tokens = all_tokens[1:]
+    counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    np.add.at(counts, (prev_tokens, next_tokens), 1)
+    del all_tokens, prev_tokens, next_tokens
 
     # Smooth, normalize, log-transform.
     counts += smoothing
-    probs = counts / counts.sum(dim=1, keepdim=True)
-    log_probs = torch.log(probs).float()
+    counts /= counts.sum(axis=1, keepdims=True)
+    log_probs = np.log(counts).astype(np.float32)
 
-    with torch.no_grad():
-        model.bigram_prior.bigram_logits.data.copy_(log_probs)
+    print(
+        f"bigram_init: done (min={log_probs.min():.3f} "
+        f"max={log_probs.max():.3f} mean={log_probs.mean():.3f})"
+    )
 
-    if master_process:
-        print(
-            f"bigram_init: done (min={log_probs.min().item():.3f} "
-            f"max={log_probs.max().item():.3f} mean={log_probs.mean().item():.3f})"
-        )
+    return torch.from_numpy(log_probs)
 
 
 # ---------------------------------------------------------------------------
@@ -714,19 +701,15 @@ def main():
     )
 
     # --- Initialize bigram prior from training data ---
-    if args.include_bigram_prior and args.bigram_init_sequences > 0:
-        initialize_bigram_prior(
-            model=base_model,
+    if args.include_bigram_prior and base_model.bigram_prior is not None:
+        bigram_log_probs = compute_bigram_log_probs(
             train_pattern=args.train_files,
             tok=tok,
-            seq_len=args.train_seq_len,
-            num_sequences=args.bigram_init_sequences,
+            vocab_size=base_model.bigram_prior.bigram_logits.shape[0],
             smoothing=args.bigram_init_smoothing,
-            rank=rank,
-            world_size=world_size,
-            device=device,
-            master_process=master_process,
         )
+        with torch.no_grad():
+            base_model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
 
     # --- Wrap for training ---
     train_wrapper = MultiStreamGPTForTraining(base_model)
@@ -901,7 +884,7 @@ def main():
         f"groups={args.preconv_groups} shuffle={args.preconv_channel_shuffle}"
     )
     log0(
-        f"bigram_prior:{args.include_bigram_prior} init_seqs={args.bigram_init_sequences} "
+        f"bigram_prior:{args.include_bigram_prior} "
         f"smoothing={args.bigram_init_smoothing} lr={args.bigram_prior_lr}"
     )
     log0(
