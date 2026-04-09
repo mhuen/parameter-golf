@@ -235,6 +235,9 @@ class MultiStreamBuilder(nn.Module):
         self.vocab_size = vocab_size
         self._defs = list(stream_defs)
         self._compressions = compressions or {}
+        for k, v in self._compressions.items():
+            if isinstance(v, nn.Module):
+                self.register_module(f"_comp_{k}", v)
         self._compress_stream_ids = compress_streams or []
 
         # Build CompositeStreams for component-based defs
