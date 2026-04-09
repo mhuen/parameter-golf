@@ -110,6 +110,10 @@ class Hyperparameters:
     k_shift = bool(int(os.environ.get("K_SHIFT", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 0.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    structured_output_logits = bool(
+        int(os.environ.get("STRUCTURED_OUTPUT_LOGITS", "1"))
+    )
+    utf8_prior = bool(int(os.environ.get("UTF8_PRIOR", "1")))
     init_noise_std = float(os.environ.get("INIT_NOISE_STD", 0.01))
 
     # Pre-processing conv
@@ -660,6 +664,7 @@ def main():
         context_dim=args.context_dim,
         n_max=args.n_max,
         logit_softcap=args.logit_softcap,
+        structured_output_logits=args.structured_output_logits,
     )
 
     # --- Build model ---
@@ -686,6 +691,7 @@ def main():
             k_shift=args.k_shift,
             logit_softcap=args.logit_softcap,
             include_bigram_prior=args.include_bigram_prior,
+            include_utf8_prior=args.utf8_prior,
             linear_mode=args.linear_mode,
             linear_kwargs={
                 "kronecker_terms": args.kronecker_terms,
@@ -886,7 +892,9 @@ def main():
     )
     log0(
         f"arch: layers={args.num_layers} heads={args.num_heads} kv_heads={args.num_kv_heads} "
-        f"multi_head_dim={args.multi_head_dim} context_dim={args.context_dim}"
+        f"multi_head_dim={args.multi_head_dim} context_dim={args.context_dim} "
+        f"structured_output_logits={args.structured_output_logits} "
+        f"utf8_prior={args.utf8_prior}"
     )
     log0(
         f"preconv: layers={args.num_preconv_layers} kernel={args.preconv_kernel_size} "

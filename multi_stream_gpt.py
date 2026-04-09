@@ -63,7 +63,7 @@ class MultiStreamComponents:
     """All pre-built components needed to construct a MultiStreamGPT."""
 
     builder: MultiStreamBuilder
-    logit_hierarchy: ByteLogitHierarchy
+    logit_hierarchy: ByteLogitHierarchy | None
     utf8_prior: UTF8Prior
     tok: EfficientByteTokenizer
 
@@ -87,6 +87,7 @@ def build_multi_stream_components(
     context_dim: int = 64,
     n_max: int = 32,
     logit_softcap: float = 30.0,
+    structured_output_logits: bool = True,
 ) -> MultiStreamComponents:
     """Build the default multi-stream setup with all byte-stream components.
 
@@ -182,7 +183,11 @@ def build_multi_stream_components(
         compress_streams=compress_streams,
     )
 
-    logit_hierarchy = ByteLogitHierarchy(vocab_size, tok, logit_softcap)
+    logit_hierarchy = (
+        ByteLogitHierarchy(vocab_size, tok, logit_softcap)
+        if structured_output_logits
+        else None
+    )
     utf8_prior = UTF8Prior(tok)
 
     return MultiStreamComponents(
@@ -322,6 +327,7 @@ class MultiStreamGPT(nn.Module):
         logit_softcap: float = 30.0,
         # Priors
         include_bigram_prior: bool = True,
+        include_utf8_prior: bool = True,
         # Linear mode
         linear_mode: str = "dense",
         linear_kwargs: dict | None = None,
@@ -335,7 +341,7 @@ class MultiStreamGPT(nn.Module):
         super().__init__()
 
         self.builder = components.builder
-        self.utf8_prior = components.utf8_prior
+        self.utf8_prior = components.utf8_prior if include_utf8_prior else None
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
 
@@ -496,13 +502,15 @@ class MultiStreamGPT(nn.Module):
         streams, compressed, views = self.builder(input_ids, dtype=dtype)
 
         # 2. UTF-8 prior: compute once, use twice (capped early + hard at end).
-        _cat_mask, token_mask = self.utf8_prior(input_ids)
-        token_mask = token_mask.to(dtype=streams[_LOGIT_SID].dtype)
+        token_mask = None
+        if self.utf8_prior is not None:
+            _cat_mask, token_mask = self.utf8_prior(input_ids)
+            token_mask = token_mask.to(dtype=streams[_LOGIT_SID].dtype)
 
-        # Early: capped finite bias so RMSNorm in blocks stays stable.
-        streams[_LOGIT_SID] = streams[_LOGIT_SID] + token_mask.clamp(
-            min=-self.logit_softcap
-        )
+            # Early: capped finite bias so RMSNorm in blocks stays stable.
+            streams[_LOGIT_SID] = streams[_LOGIT_SID] + token_mask.clamp(
+                min=-self.logit_softcap
+            )
 
         # 3. Bigram prior: trainable logit adjustments.
         #    Applied before blocks so the LOGIT stream starts with a
@@ -524,7 +532,8 @@ class MultiStreamGPT(nn.Module):
             logits = softcap_linear(x=logits, cap=self.logit_softcap)
 
         # 6. UTF-8 prior: hard -inf mask (reuses token_mask from step 2).
-        logits = logits + token_mask
+        if token_mask is not None:
+            logits = logits + token_mask
 
         return logits, streams
 
