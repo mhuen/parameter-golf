@@ -236,9 +236,15 @@ def run_benchmark(
         else:
             ref = _load_reference(label)
             if ref is not None:
-                match = torch.equal(ref_output, ref)
+                # Compare overlapping prefix so seq_len needn't match saved refs
+                T = min(ref_output.shape[1], ref.shape[1])
+                ref_output_cmp = ref_output[:, :T]
+                ref_cmp = ref[:, :T]
+                entry["ref_tokens"] = T
+                entry["total_tokens"] = ref_output.shape[1]
+                match = torch.equal(ref_output_cmp, ref_cmp)
                 if not match:
-                    max_diff = (ref_output - ref).abs().max().item()
+                    max_diff = (ref_output_cmp - ref_cmp).abs().max().item()
                     entry["regression"] = True
                     entry["max_diff"] = max_diff
                 else:
@@ -280,6 +286,21 @@ def print_results(
                 print(f"FAIL (max_diff={r['max_diff']:.6e})")
             else:
                 print("ok")
+
+    # Warn if regression checked fewer tokens than the full sequence
+    if not save:
+        partial = [
+            r for r in results
+            if r.get("ref_tokens") is not None
+            and r["ref_tokens"] < r["total_tokens"]
+        ]
+        if partial:
+            ref_t = partial[0]["ref_tokens"]
+            total_t = partial[0]["total_tokens"]
+            print(
+                f"  Note: references cover {ref_t} of {total_t} tokens. "
+                f"Re-run with --save --seq-len {total_t} to verify the full sequence."
+            )
 
     print()
 
