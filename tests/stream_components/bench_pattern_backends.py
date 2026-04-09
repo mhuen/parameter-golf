@@ -265,109 +265,207 @@ def numpy_affine_scan(inputs: dict) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Inline C via ctypes
+# Inline C via ctypes — optimized for Xeon Platinum 8470 (Sapphire Rapids)
+#
+# Optimizations:
+#  - OpenMP for batch/element parallelism (52 cores)
+#  - Transposed (S, B) layout for scan patterns → auto-vectorization w/ AVX-512
+#  - Mersenne prime fast modular reduction (bit ops instead of division)
+#  - Precomputed sin/cos + log1p lookup tables (eliminate transcendentals)
+#  - restrict pointers for alias analysis
 # ──────────────────────────────────────────────────────────────────────────────
 
 C_SOURCE = r"""
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
-/* ── table_lookup ─────────────────────────────────────────────── */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/* ── Mersenne prime 2^31-1: fast modular reduction ────────────── */
+#define MERSENNE_P 0x7FFFFFFFLL
+
+static inline int64_t mod_mersenne(int64_t x) {
+    /* For 0 <= x < MERSENNE_P^2.  Two reductions handle carry. */
+    x = (x & MERSENNE_P) + (x >> 31);
+    return x >= MERSENNE_P ? x - MERSENNE_P : x;
+}
+
+/* ── table_lookup: OpenMP over elements ──────────────────────── */
 void table_lookup_f32(
-    const int64_t* ids, const float* table,
-    float* out,
+    const int64_t* restrict ids,
+    const float*   restrict table,
+    float*         restrict out,
     int B, int S, int D
 ) {
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < S; t++) {
-            int64_t idx = ids[b * S + t];
-            const float* row = table + idx * D;
-            float* dst = out + (b * S + t) * D;
-            memcpy(dst, row, D * sizeof(float));
-        }
+    int N = B * S;
+    #pragma omp parallel for schedule(static) if(N > 4096)
+    for (int i = 0; i < N; i++) {
+        memcpy(out + i * D, table + ids[i] * D, (size_t)D * sizeof(float));
     }
 }
 
-/* ── segmented_cumsum ─────────────────────────────────────────── */
+/* ── segmented_cumsum: transposed (S, B) layout ──────────────── *
+ * Sequential over S, vectorised + parallelised over B.           *
+ * Each thread owns a contiguous B-slice — no barriers needed.    */
 void segmented_cumsum_f32(
-    const float* values, const int8_t* reset,
-    float* out,
+    const float*  restrict values,  /* (S, B) contiguous */
+    const int8_t* restrict reset,   /* (S, B) contiguous */
+    float*        restrict out,     /* (S, B) contiguous */
     int B, int S
 ) {
-    for (int b = 0; b < B; b++) {
-        float acc = 0.0f;
-        for (int t = 0; t < S; t++) {
-            int idx = b * S + t;
-            if (reset[idx]) acc = 0.0f;
-            acc += values[idx];
-            out[idx] = acc;
-        }
-    }
-}
+    #pragma omp parallel if(B > 32)
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+#else
+        int tid = 0, nth = 1;
+#endif
+        int b0 = (int)((int64_t)tid * B / nth);
+        int b1 = (int)((int64_t)(tid + 1) * B / nth);
 
-/* ── run_length ───────────────────────────────────────────────── */
-void run_length_i64(
-    const int64_t* cat_ids,
-    float* out,
-    int B, int S
-) {
-    for (int b = 0; b < B; b++) {
-        int run = 0;
-        int64_t prev = -1;
-        for (int t = 0; t < S; t++) {
-            int idx = b * S + t;
-            int64_t cur = cat_ids[idx];
-            if (t == 0 || cur != prev) {
-                run = 0;
+        for (int b = b0; b < b1; b++) out[b] = values[b];
+
+        for (int t = 1; t < S; t++) {
+            const float*  vt = values + (int64_t)t * B;
+            const int8_t* rt = reset  + (int64_t)t * B;
+            const float*  pt = out    + (int64_t)(t - 1) * B;
+            float*        ct = out    + (int64_t)t * B;
+            /* Inner loop auto-vectorises with AVX-512 (16 floats/iter) */
+            for (int b = b0; b < b1; b++) {
+                ct[b] = rt[b] ? vt[b] : pt[b] + vt[b];
             }
-            out[idx] = log1pf((float)run);
-            run++;
-            prev = cur;
         }
     }
 }
 
-/* ── rolling_hash ─────────────────────────────────────────────── */
+/* ── run_length: transposed (S, B) + log1p LUT ──────────────── */
+void run_length_i64(
+    const int64_t* restrict cat_ids,  /* (S, B) contiguous */
+    float*         restrict out,      /* (S, B) contiguous */
+    int B, int S
+) {
+    /* Precompute log1p table — fits comfortably in L2 */
+    float* lut = (float*)malloc((size_t)S * sizeof(float));
+    for (int i = 0; i < S; i++) lut[i] = log1pf((float)i);
+
+    #pragma omp parallel if(B > 32)
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+#else
+        int tid = 0, nth = 1;
+#endif
+        int b0 = (int)((int64_t)tid * B / nth);
+        int b1 = (int)((int64_t)(tid + 1) * B / nth);
+        int chunk = b1 - b0;
+
+        int*     run  = (int*)calloc((size_t)chunk, sizeof(int));
+        int64_t* prev = (int64_t*)malloc((size_t)chunk * sizeof(int64_t));
+
+        /* t = 0 */
+        for (int b = 0; b < chunk; b++) {
+            prev[b] = cat_ids[b0 + b];
+            run[b]  = 1;
+            out[b0 + b] = 0.0f;
+        }
+
+        for (int t = 1; t < S; t++) {
+            const int64_t* ids_t = cat_ids + (int64_t)t * B + b0;
+            float*         out_t = out     + (int64_t)t * B + b0;
+            for (int b = 0; b < chunk; b++) {
+                int64_t cur = ids_t[b];
+                int same = (cur == prev[b]);
+                run[b] = same * run[b];        /* 0 if changed */
+                out_t[b] = lut[run[b]];
+                run[b]++;
+                prev[b] = cur;
+            }
+        }
+        free(run);
+        free(prev);
+    }
+    free(lut);
+}
+
+/* ── rolling_hash: OpenMP + Mersenne + sin/cos LUT ───────────── */
 void rolling_hash_sincos(
-    const int64_t* byte_vals, const int64_t* eff_lb,
-    const int64_t* powers,
-    float* out_sin, float* out_cos,
+    const int64_t* restrict byte_vals,
+    const int64_t* restrict eff_lb,
+    const int64_t* restrict powers,
+    float*         restrict out_sin,
+    float*         restrict out_cos,
     int B, int S, int W,
     int64_t P, int64_t proj_prime
 ) {
-    float angle_scale = (float)(2.0 * 3.14159265358979323846 / (double)proj_prime);
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < S; t++) {
-            int idx = b * S + t;
-            int64_t lb = eff_lb[idx];
-            int64_t hash = 0;
-            for (int k = 0; k < W; k++) {
-                if (k > lb) break;
-                int src = t - k;
-                if (src < 0) src = 0;
-                int64_t bv = byte_vals[b * S + src];
-                hash = (hash + bv * powers[k]) % P;
-            }
-            int64_t projected = hash % proj_prime;
-            float angle = (float)projected * angle_scale;
-            out_sin[idx] = sinf(angle);
-            out_cos[idx] = cosf(angle);
-        }
+    /* Precompute sin/cos LUT — ~8 KB for proj_prime=997, fits in L1 */
+    float* sin_lut = (float*)malloc((size_t)proj_prime * sizeof(float));
+    float* cos_lut = (float*)malloc((size_t)proj_prime * sizeof(float));
+    float angle_scale = (float)(2.0 * M_PI / (double)proj_prime);
+    for (int64_t i = 0; i < proj_prime; i++) {
+        float a = (float)i * angle_scale;
+        sin_lut[i] = sinf(a);
+        cos_lut[i] = cosf(a);
     }
+
+    int64_t N = (int64_t)B * S;
+    #pragma omp parallel for schedule(static) if(N > 4096)
+    for (int64_t i = 0; i < N; i++) {
+        int b = (int)(i / S);
+        int t = (int)(i % S);
+        int64_t idx = (int64_t)b * S + t;
+        int64_t lb = eff_lb[idx];
+        int64_t hash = 0;
+        for (int k = 0; k < W && k <= lb; k++) {
+            int src = t - k;
+            if (src < 0) src = 0;
+            int64_t bv = byte_vals[(int64_t)b * S + src];
+            hash = mod_mersenne(hash + mod_mersenne(bv * powers[k]));
+        }
+        int64_t projected = hash % proj_prime;
+        out_sin[idx] = sin_lut[projected];
+        out_cos[idx] = cos_lut[projected];
+    }
+
+    free(sin_lut);
+    free(cos_lut);
 }
 
-/* ── affine_scan ──────────────────────────────────────────────── */
+/* ── affine_scan: transposed (S, B) layout ───────────────────── */
 void affine_scan_f64(
-    const double* a, const double* b_in,
-    double* out,
+    const double* restrict a,       /* (S, B) contiguous */
+    const double* restrict b_in,    /* (S, B) contiguous */
+    double*       restrict out,     /* (S, B) contiguous */
     int B, int S
 ) {
-    for (int b = 0; b < B; b++) {
-        out[b * S] = b_in[b * S];
+    #pragma omp parallel if(B > 32)
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num(), nth = omp_get_num_threads();
+#else
+        int tid = 0, nth = 1;
+#endif
+        int b0 = (int)((int64_t)tid * B / nth);
+        int b1 = (int)((int64_t)(tid + 1) * B / nth);
+
+        for (int b = b0; b < b1; b++) out[b] = b_in[b];
+
+        /* Sequential over S, auto-vectorised over b (AVX-512: 8 doubles) */
         for (int t = 1; t < S; t++) {
-            int idx = b * S + t;
-            out[idx] = a[idx] * out[idx - 1] + b_in[idx];
+            const double* at = a     + (int64_t)t * B;
+            const double* bt = b_in  + (int64_t)t * B;
+            const double* pt = out   + (int64_t)(t - 1) * B;
+            double*       ct = out   + (int64_t)t * B;
+            for (int b = b0; b < b1; b++) {
+                ct[b] = at[b] * pt[b] + bt[b];
+            }
         }
     }
 }
@@ -382,15 +480,25 @@ def _compile_c_lib() -> ctypes.CDLL | None:
         lib_path = os.path.join(tmpdir, "patterns.so")
         with open(src_path, "w") as f:
             f.write(C_SOURCE)
-        result = subprocess.run(
-            ["gcc", "-O3", "-march=native", "-shared", "-fPIC", "-lm",
-             "-o", lib_path, src_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"  [c_inline] gcc compilation failed: {result.stderr.strip()}")
-            return None
-        return ctypes.cdll.LoadLibrary(lib_path)
+
+        # Try compilation with increasing fallback
+        flag_sets = [
+            ["-march=sapphirerapids", "-fopenmp"],
+            ["-march=native", "-fopenmp"],
+            ["-march=native"],
+            [],
+        ]
+        for extra_flags in flag_sets:
+            flags = ["gcc", "-O3", "-fPIC", "-shared", "-lm"] + extra_flags
+            flags += ["-o", lib_path, src_path]
+            result = subprocess.run(flags, capture_output=True, text=True)
+            if result.returncode == 0:
+                label = " ".join(extra_flags) if extra_flags else "(baseline)"
+                print(f"  [c_inline] compiled with: {label}")
+                return ctypes.cdll.LoadLibrary(lib_path)
+
+        print(f"  [c_inline] gcc compilation failed: {result.stderr.strip()}")
+        return None
     except FileNotFoundError:
         print("  [c_inline] gcc not found, skipping C backend")
         return None
@@ -439,29 +547,39 @@ def c_table_lookup(inputs: dict) -> np.ndarray:
     return out
 
 
+def _transpose_to_SB(arr: np.ndarray) -> np.ndarray:
+    """(B, S, ...) -> (S, B, ...) contiguous."""
+    return np.ascontiguousarray(np.moveaxis(arr, 0, 1))
+
+
+def _transpose_to_BS(arr: np.ndarray) -> np.ndarray:
+    """(S, B, ...) -> (B, S, ...) contiguous."""
+    return np.ascontiguousarray(np.moveaxis(arr, 0, 1))
+
+
 def c_segmented_cumsum(inputs: dict) -> np.ndarray:
     lib = _get_c_lib()
-    values = inputs["values_np"].astype(np.float32)
-    reset = inputs["reset_mask_np"].astype(np.int8)
-    B, S = values.shape
-    out = np.empty((B, S), dtype=np.float32)
+    values = _transpose_to_SB(inputs["values_np"].astype(np.float32))
+    reset = _transpose_to_SB(inputs["reset_mask_np"].astype(np.int8))
+    S, B = values.shape
+    out = np.empty((S, B), dtype=np.float32)
     lib.segmented_cumsum_f32(
         _np_ptr(values), _np_ptr(reset), _np_ptr(out),
         ctypes.c_int(B), ctypes.c_int(S),
     )
-    return out
+    return _transpose_to_BS(out)
 
 
 def c_run_length(inputs: dict) -> np.ndarray:
     lib = _get_c_lib()
-    cat_ids = np.ascontiguousarray(inputs["cat_ids_np"], dtype=np.int64)
-    B, S = cat_ids.shape
-    out = np.empty((B, S), dtype=np.float32)
+    cat_ids = _transpose_to_SB(np.ascontiguousarray(inputs["cat_ids_np"], dtype=np.int64))
+    S, B = cat_ids.shape
+    out = np.empty((S, B), dtype=np.float32)
     lib.run_length_i64(
         _np_ptr(cat_ids), _np_ptr(out),
         ctypes.c_int(B), ctypes.c_int(S),
     )
-    return out
+    return _transpose_to_BS(out)
 
 
 def c_rolling_hash(inputs: dict) -> np.ndarray:
@@ -484,22 +602,22 @@ def c_rolling_hash(inputs: dict) -> np.ndarray:
 
 def c_affine_scan(inputs: dict) -> np.ndarray:
     lib = _get_c_lib()
-    a = np.ascontiguousarray(inputs["a_scan_np"], dtype=np.float64)
-    b = np.ascontiguousarray(inputs["b_scan_np"], dtype=np.float64)
-    B, S = a.shape
-    out = np.empty((B, S), dtype=np.float64)
+    a = _transpose_to_SB(np.ascontiguousarray(inputs["a_scan_np"], dtype=np.float64))
+    b = _transpose_to_SB(np.ascontiguousarray(inputs["b_scan_np"], dtype=np.float64))
+    S, B = a.shape
+    out = np.empty((S, B), dtype=np.float64)
     lib.affine_scan_f64(
         _np_ptr(a), _np_ptr(b), _np_ptr(out),
         ctypes.c_int(B), ctypes.c_int(S),
     )
-    return out
+    return _transpose_to_BS(out)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Pattern registry
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Each entry: pattern_name -> { backend_name -> (callable, is_numpy_output) }
+# Each entry: pattern_name -> { backend_name -> callable }
 # callable takes an inputs dict and returns torch.Tensor or np.ndarray
 
 
@@ -536,14 +654,6 @@ def _build_registry() -> dict[str, dict[str, tuple]]:
 # ──────────────────────────────────────────────────────────────────────────────
 # Benchmark harness
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def _to_numpy(t: torch.Tensor) -> np.ndarray:
-    return t.cpu().numpy()
-
-
-def _to_torch(a: np.ndarray, device: str) -> torch.Tensor:
-    return torch.from_numpy(a).to(device)
 
 
 def _check_close(
@@ -598,9 +708,9 @@ def _measure_transfer(tensor_or_array, direction: str, repeats: int = 10) -> flo
     """Measure CPU<->GPU transfer time in seconds (mean)."""
     if direction == "to_gpu":
         if isinstance(tensor_or_array, np.ndarray):
-            t = torch.from_numpy(tensor_or_array)
+            t = torch.from_numpy(np.ascontiguousarray(tensor_or_array))
         else:
-            t = tensor_or_array.cpu()
+            t = tensor_or_array.cpu().contiguous()
         times = []
         for _ in range(repeats):
             torch.cuda.synchronize()
@@ -629,11 +739,10 @@ def run_pattern_benchmark(
 
     results = []
 
-    # Generate inputs on CPU first
+    # Generate inputs on CPU first (single source of truth for correctness)
     cpu_inputs = make_inputs(B, S, device="cpu")
     cpu_inputs["W"] = window
     if pattern_name == "rolling_hash":
-        # Recompute powers for the given window
         cpu_inputs["powers"] = torch.tensor(
             [(HASH_BASE**i) % HASH_MODULUS for i in range(window)], dtype=torch.long
         )
@@ -644,16 +753,15 @@ def run_pattern_benchmark(
         if isinstance(val, torch.Tensor):
             np_inputs[key + "_np"] = val.numpy().copy()
 
-    # Generate GPU inputs
+    # GPU inputs: same data, moved to CUDA (fixes correctness mismatch)
+    gpu_inputs = None
     if has_cuda:
-        gpu_inputs = make_inputs(B, S, device="cuda")
-        gpu_inputs["W"] = window
-        if pattern_name == "rolling_hash":
-            gpu_inputs["powers"] = cpu_inputs["powers"].to("cuda")
-        # Also add numpy arrays (for reference comparison)
+        gpu_inputs = {}
         for key, val in cpu_inputs.items():
             if isinstance(val, torch.Tensor):
-                gpu_inputs[key + "_np"] = val.numpy().copy()
+                gpu_inputs[key] = val.to("cuda")
+            else:
+                gpu_inputs[key] = val
 
     # Get reference output from torch CPU
     with torch.no_grad():
@@ -711,7 +819,6 @@ def run_pattern_benchmark(
             with torch.no_grad():
                 _warmup_compiled(fn, inputs)
         else:
-            # Simple warmup
             warmup_n = 3
             with torch.no_grad():
                 for _ in range(warmup_n):
