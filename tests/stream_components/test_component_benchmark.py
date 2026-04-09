@@ -194,12 +194,11 @@ def _load_input_ids(
         collected += t.numel()
         if collected >= total_needed:
             break
-    tokens = torch.cat(chunks).long()[:total_needed]
+    tokens = torch.cat(chunks).long()
     if tokens.numel() < total_needed:
-        raise RuntimeError(
-            f"Not enough tokens: need {total_needed} but only found {tokens.numel()} "
-            f"across {len(shards)} shard(s)"
-        )
+        repeats = (total_needed + tokens.numel() - 1) // tokens.numel()
+        tokens = tokens.repeat(repeats)
+    tokens = tokens[:total_needed]
     return tokens.reshape(batch_size, seq_len)
 
 
