@@ -257,18 +257,6 @@ class MultiStreamBuilder(nn.Module):
         self.composites = nn.ModuleDict(composites)
         self._config = MultiStreamConfig(streams=stream_configs)
 
-        # Pre-compile components individually so they run compiled on GPU
-        # even though the builder's forward is excluded from the main model
-        # graph (via @torch.compiler.disable) to keep the Inductor graph
-        # size manageable.
-        for key in list(self.composites.keys()):
-            self.composites[key] = torch.compile(
-                self.composites[key], dynamic=False
-            )
-        for k, v in self._compressions.items():
-            if isinstance(v, nn.Module):
-                self._compressions[k] = torch.compile(v, dynamic=False)
-
     def _resolve_dim(self, sd: StreamDef) -> int:
         """Compute and validate the dimension for a StreamDef."""
         if sd.auto_onehot:
@@ -298,7 +286,6 @@ class MultiStreamBuilder(nn.Module):
     def config(self) -> MultiStreamConfig:
         return self._config
 
-    @torch.compiler.disable
     def forward(
         self,
         input_ids: Tensor,
