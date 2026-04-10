@@ -25,11 +25,13 @@ from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import NumberExtractor, ByteLogitHierarchy
 from byte_stream_components import (
     ByteHashComponent,
+    DigitEncoding,
     HashBoundary,
     DigitComputeComponent,
     PairwiseOp,
     DigitSequenceComponent,
 )
+from modules import RotationCodebook
 from number_detection import DIGIT_IDX_DOT, DIGIT_IDX_END, NEXT_DIGIT_VOCAB
 from multi_streams import (
     StreamType,
@@ -131,21 +133,22 @@ class OracleDigitComputeModel(torch.nn.Module):
     """Zero-param model that decodes DigitComputeComponent output as logits.
 
     Runs the component on input_ids, detects the operator in the prompt,
-    reads the next-digit one-hot encoding at each answer position, and
-    emits hard logits for the corresponding byte tokens.
+    reads the next-digit encoding at each answer position, and emits hard
+    logits for the corresponding byte tokens.
+
+    Supports both one-hot and rotation encodings via ``digit_encoding``.
 
     The component's next-digit encoding uses the active digit run length
     to index into the result string. At the '=' sign (active_len=0), it
     outputs the first digit; at the first answer digit (active_len=1),
     it outputs the second; etc. The sign is handled separately.
-
-    This oracle reads those one-hot outputs directly — no learning needed.
     """
 
     def __init__(
         self,
         tok: EfficientByteTokenizer,
         ops: set[PairwiseOp] | None = None,
+        digit_encoding: DigitEncoding = DigitEncoding.ONEHOT,
     ):
         super().__init__()
         if ops is None:
@@ -157,8 +160,16 @@ class OracleDigitComputeModel(torch.nn.Module):
             }
         self.tok = tok
         self.vocab_size = tok.vocab_size
-        self.comp = DigitComputeComponent(tok, k=2, ops=ops)
+        self._digit_encoding = DigitEncoding(digit_encoding)
+        self.comp = DigitComputeComponent(
+            tok, k=2, ops=ops, digit_encoding=digit_encoding
+        )
         self._arith_dim = self.comp._arith_dim
+        self._digit_dim = self.comp._digit_dim
+
+        self._rotation_codebook: RotationCodebook | None = None
+        if self._digit_encoding == DigitEncoding.ROTATION:
+            self._rotation_codebook = RotationCodebook(NEXT_DIGIT_VOCAB)
 
         # Map task operator → component op index
         _char_to_pw = {
@@ -187,7 +198,7 @@ class OracleDigitComputeModel(torch.nn.Module):
                 self._byte_to_tid[info.byte_value] = tid
         self.register_buffer("token_byte", token_byte)
 
-        # Map one-hot digit index → byte value
+        # Map digit index → byte value
         # Indices 0-9 → ASCII '0'-'9', 10 → '.', 11 → END (no token)
         self._digit_idx_to_byte: dict[int, int] = {}
         for d in range(10):
@@ -204,11 +215,14 @@ class OracleDigitComputeModel(torch.nn.Module):
         Returns (sign_val, digit_idx) where digit_idx is 0-9, DOT, or END.
         """
         ad = self._arith_dim
+        dd = self._digit_dim
         off = op_idx * ad
         sign_val = feats[off].item()
-        # One-hot: find argmax in [off+1 .. off+1+NEXT_DIGIT_VOCAB)
-        onehot = feats[off + 1 : off + 1 + NEXT_DIGIT_VOCAB]
-        digit_idx = onehot.argmax().item()
+        encoded = feats[off + 1 : off + 1 + dd]
+        if self._digit_encoding == DigitEncoding.ONEHOT:
+            digit_idx = encoded.argmax().item()
+        else:
+            digit_idx = self._rotation_codebook.decode(encoded.unsqueeze(0)).item()
         return sign_val, digit_idx
 
     def forward(self, input_ids: Tensor) -> Tensor:
@@ -433,12 +447,20 @@ if __name__ == "__main__":
     )
     models.append(("MultiStreamGPT (2H, 1L)", msgpt_model))
 
-    # 6. Oracle — directly decodes DigitComputeComponent output
+    # 6. Oracle — directly decodes DigitComputeComponent output (one-hot)
     oracle = OracleDigitComputeModel(
         tok,
         ops={PairwiseOp.ADD, PairwiseOp.SUB, PairwiseOp.MUL, PairwiseOp.DIV},
     )
-    models.append(("Oracle (DigitCompute)", oracle))
+    models.append(("Oracle (onehot)", oracle))
+
+    # 7. Oracle — rotation encoding
+    oracle_rot = OracleDigitComputeModel(
+        tok,
+        ops={PairwiseOp.ADD, PairwiseOp.SUB, PairwiseOp.MUL, PairwiseOp.DIV},
+        digit_encoding=DigitEncoding.ROTATION,
+    )
+    models.append(("Oracle (rotation)", oracle_rot))
 
     # --- Print param counts ---
     print("=" * 60)

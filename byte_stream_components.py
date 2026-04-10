@@ -9,7 +9,7 @@ from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
-from modules import binary_embedding, sincos_encode
+from modules import binary_embedding, RotationCodebook, sincos_encode
 from byte_modules import (
     BYTE_CATEGORY_DEFS,
     NUM_BYTE_CATEGORIES,
@@ -21,6 +21,13 @@ from number_detection import (
     NEXT_DIGIT_VOCAB,
     MAX_RESULT_DIGITS,
 )
+
+
+class DigitEncoding(StrEnum):
+    """Encoding scheme for next-digit features in DigitComputeComponent."""
+
+    ONEHOT = "onehot"  # 12-dim one-hot over {0-9, '.', END}
+    ROTATION = "rotation"  # 2-dim unit vector on circle (360°/12 spacing)
 
 
 class HashBoundary(StrEnum):
@@ -164,21 +171,17 @@ class BoundaryComponent(nn.Module):
             .cummax(dim=1)
             .values
         )
-        pos_within = (pos_flat - last_b_pos).reshape(B, N, S).permute(
-            0, 2, 1
+        pos_within = (
+            (pos_flat - last_b_pos).reshape(B, N, S).permute(0, 2, 1)
         )  # (B, S, N)
 
         # Encode each boundary type with its own freq counts
         parts: list[Tensor] = []
         for i, (id_freqs, pos_freqs) in enumerate(freq_configs):
             if id_freqs > 0:
-                parts.append(
-                    sincos_encode(boundary_ids[:, :, i], id_freqs, self.base)
-                )
+                parts.append(sincos_encode(boundary_ids[:, :, i], id_freqs, self.base))
             if pos_freqs > 0:
-                parts.append(
-                    sincos_encode(pos_within[:, :, i], pos_freqs, self.base)
-                )
+                parts.append(sincos_encode(pos_within[:, :, i], pos_freqs, self.base))
 
         return torch.cat(parts, dim=-1).to(dtype=dtype)
 
@@ -943,6 +946,9 @@ class DigitComputeComponent(nn.Module):
         number_words: dict mapping lowercase words to their numeric value.
             Defaults to zero..twenty.
         ops: set of ``PairwiseOp`` values to include. Defaults to all.
+        digit_encoding: how to encode the next-digit class index.
+            ``ONEHOT`` (default): 12-dim one-hot over {0-9, '.', END}.
+            ``ROTATION``: 2-dim unit vector on a circle (30° spacing).
     """
 
     def __init__(
@@ -951,11 +957,13 @@ class DigitComputeComponent(nn.Module):
         k: int = 2,
         number_words: dict[str, int] | None = None,
         ops: set[PairwiseOp] | None = None,
+        digit_encoding: DigitEncoding = DigitEncoding.ROTATION,
     ):
         super().__init__()
         self.bos_id = tok.bos_id
         self.k = k
         self._num_pairs = k * (k - 1) // 2
+        self._digit_encoding = DigitEncoding(digit_encoding)
 
         # Resolve and store selected ops (preserving canonical order)
         selected = frozenset(ops) if ops is not None else frozenset(PairwiseOp)
@@ -969,8 +977,15 @@ class DigitComputeComponent(nn.Module):
             op for op in PairwiseOp if op in selected and op in _PAIRWISE_CMP_OPS
         )
 
-        # Per arithmetic op: 1 (sign) + 12 (next-digit one-hot)
-        self._arith_dim = 1 + NEXT_DIGIT_VOCAB
+        # Per arithmetic op: 1 (sign) + digit encoding dims
+        if self._digit_encoding == DigitEncoding.ONEHOT:
+            self._digit_dim = NEXT_DIGIT_VOCAB  # 12
+        else:
+            self._digit_dim = 2
+        self._rotation_codebook: RotationCodebook | None = None
+        if self._digit_encoding == DigitEncoding.ROTATION:
+            self._rotation_codebook = RotationCodebook(NEXT_DIGIT_VOCAB)
+        self._arith_dim = 1 + self._digit_dim
         # Per pair: n_arith arith ops + n_cmp comparisons
         self._pair_dim = len(self._arith_ops) * self._arith_dim + len(self._cmp_ops)
         self._dim = self._num_pairs * self._pair_dim
@@ -1111,13 +1126,20 @@ class DigitComputeComponent(nn.Module):
                 sign = torch.sign(result)
                 al_clamped = active_len.clamp(max=MAX_RESULT_DIGITS - 1)
                 next_char = extract_digit_at(result, al_clamped)
-                next_oh = F.one_hot(next_char, num_classes=NEXT_DIGIT_VOCAB).to(
-                    dtype=dtype
-                )
 
+                if self._digit_encoding == DigitEncoding.ONEHOT:
+                    encoded = F.one_hot(
+                        next_char, num_classes=NEXT_DIGIT_VOCAB
+                    ).to(dtype=dtype)
+                else:
+                    encoded = self._rotation_codebook.encode(next_char).to(
+                        dtype=dtype
+                    )
+
+                dd = self._digit_dim
                 off = base + op_i * ad
                 out[:, :, off] = sign.to(dtype) * valid.squeeze(-1)
-                out[:, :, off + 1 : off + 1 + NEXT_DIGIT_VOCAB] = next_oh * valid
+                out[:, :, off + 1 : off + 1 + dd] = encoded * valid
 
             cmp_off = base + len(self._arith_ops) * ad
             for cmp_i, op in enumerate(self._cmp_ops):

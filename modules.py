@@ -298,6 +298,59 @@ def sincos_encode(ids: Tensor, num_freqs: int, base: float = 10000.0) -> Tensor:
     return torch.cat([angles.sin(), angles.cos()], dim=-1)
 
 
+class RotationCodebook(nn.Module):
+    """2D unit-circle codebook for *n_states* discrete classes.
+
+    Each class is evenly spaced around the unit circle at angle
+    ``index * 2π / n_states``, giving a ``(cos θ, sin θ)`` vector.
+
+    Dot-product geometry:
+    - Same class  → dot = 1
+    - Adjacent    → dot = cos(2π / n_states)
+    - Opposite    → dot ≈ -1  (for even n_states, exactly -1)
+
+    The codebook is stored as a registered buffer so it moves with
+    ``.to(device)`` / ``.to(dtype)`` automatically.
+
+    Args:
+        n_states: number of discrete states (determines angular spacing).
+    """
+
+    def __init__(self, n_states: int):
+        super().__init__()
+        self.n_states = n_states
+        angles = torch.arange(n_states, dtype=torch.float32) * (
+            2.0 * torch.pi / n_states
+        )
+        # (n_states, 2) codebook of unit vectors
+        codebook = torch.stack([angles.cos(), angles.sin()], dim=-1)
+        self.register_buffer("codebook", codebook)
+
+    def encode(self, indices: Tensor) -> Tensor:
+        """Map integer indices to 2D unit vectors.
+
+        Args:
+            indices: ``(...,)`` integer tensor with values in ``[0, n_states)``.
+
+        Returns:
+            ``(..., 2)`` float tensor with unit-norm rows.
+        """
+        return self.codebook[indices]
+
+    def decode(self, vectors: Tensor) -> Tensor:
+        """Map 2D vectors back to the nearest class index (argmax dot product).
+
+        Args:
+            vectors: ``(..., 2)`` float tensor.
+
+        Returns:
+            ``(...,)`` long tensor of class indices.
+        """
+        # (..., 2) @ (2, n_states) → (..., n_states)
+        dots = vectors @ self.codebook.t()
+        return dots.argmax(dim=-1)
+
+
 def binary_embedding(num_classes: int, dim: int) -> Tensor:
     """Deterministic binary embedding for a small number of classes.
 
@@ -316,8 +369,7 @@ def binary_embedding(num_classes: int, dim: int) -> Tensor:
             f"got num_classes={num_classes}"
         )
     rows = [
-        [float((i >> b) & 1) * 2 - 1 for b in range(dim)]
-        for i in range(num_classes)
+        [float((i >> b) & 1) * 2 - 1 for b in range(dim)] for i in range(num_classes)
     ]
     return torch.tensor(rows)
 
@@ -493,9 +545,7 @@ class GatedCausalConv(nn.Module):
             )
             self.conv_value._zero_init = True
         else:
-            self.conv = nn.Conv1d(
-                dim, out_dim, kernel_size, groups=groups, bias=False
-            )
+            self.conv = nn.Conv1d(dim, out_dim, kernel_size, groups=groups, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         h = x.transpose(1, 2)
