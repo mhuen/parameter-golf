@@ -1219,7 +1219,11 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
         attn_mask = causal_ok & pair_valid.unsqueeze(1)  # (B, S, P)
 
         scores = scores.masked_fill(~attn_mask, float("-inf"))
-        w_pair = F.softmax(scores, dim=-1).nan_to_num(0.0)  # (B, S, P)
+        w_pair = F.softmax(scores, dim=-1)
+        # When all pairs are masked for a position, softmax(-inf,...) = NaN.
+        # Use masked_fill (not nan_to_num) so backward gets clean zero gradients.
+        all_masked = ~attn_mask.any(dim=-1, keepdim=True)  # (B, S, 1)
+        w_pair = w_pair.masked_fill(all_masked, 0.0)  # (B, S, P)
 
         # --- 5. Op selector ---
         op_weights = F.softmax(self.W_op(x_full), dim=-1)  # (B, S, n_ops)
