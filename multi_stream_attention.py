@@ -1040,18 +1040,16 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
         self._logit_dim = logit_cfg.dim
         self._logit_key = logit_cfg.key
 
-    @staticmethod
-    def _result_to_string(value: float) -> str:
-        av = abs(value)
-        if av == int(av) and av < 1e15:
-            return str(int(av))
-        s = f"{av}"
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        return s
-
     def _build_digit_bank(self, values: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         """Pre-compute digit sequences and signs for all pairs × ops.
+
+        Pure tensor implementation — no Python loops, ``.item()``, or string
+        ops — compatible with ``torch.compile(fullgraph=True)``.
+
+        Digit extraction uses fixed-point arithmetic in float64:
+        integer digits via ``floor(val / 10^k) % 10``, fractional digits via
+        ``floor(val * 10^k) % 10``, with trailing-zero stripping limited to
+        float64 significant precision (~15 digits).
 
         Args:
             values: (B, N) number values.
@@ -1061,60 +1059,93 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
             digit_seqs: (B, P, n_ops, max_len) int tensor of digit class indices.
             signs: (B, P, n_ops) float tensor (+1, -1, or 0).
         """
-        B = values.shape[0]
         P = self._n_pairs
         n_ops = self.n_ops
-        max_len = self._MAX_RESULT_LEN
+        L = self._MAX_RESULT_LEN
+        DOT = self.DIGIT_IDX_DOT
+        END = self.DIGIT_IDX_END
         eps = self.eps
+        device = values.device
 
-        digit_seqs = torch.full(
-            (B, P, n_ops, max_len),
-            self.DIGIT_IDX_END,
-            dtype=torch.long,
-            device=values.device,
+        # -- 1. Pair values and validity --
+        a = values[:, self.pair_i].double()  # (B, P)
+        bv = values[:, self.pair_j].double()  # (B, P)
+        pair_valid = mask[:, self.pair_i] & mask[:, self.pair_j]  # (B, P)
+        b_abs = bv.abs() + eps
+
+        # -- 2. All 5 arithmetic operations --
+        results = torch.stack(
+            [a + bv, a - bv, a * bv, a / b_abs, torch.fmod(a, b_abs)],
+            dim=-1,
+        )  # (B, P, n_ops)
+
+        # -- 3. Signs (invalid pairs → 0) --
+        signs = torch.sign(results) * pair_valid.unsqueeze(-1).double()
+
+        # -- 4. Digit extraction (float64 throughout) --
+        abs_v = results.abs().clamp(max=1e15)  # (B, P, n_ops)
+        flat = abs_v.reshape(-1)  # (M,)
+        M = flat.shape[0]
+
+        int_part = flat.floor()  # (M,)
+        frac_part = flat - int_part  # (M,)
+
+        # Number of integer digits (min 1 for the leading "0" when val < 1)
+        n_int = (int_part.clamp(min=1).log10().floor().long() + 1).clamp(
+            min=1, max=L
+        )  # (M,)
+
+        # Integer digits: digit[p] = floor(int_part / 10^(n_int-1-p)) % 10
+        pos = torch.arange(L, device=device)  # (L,)
+        power = n_int.unsqueeze(1) - 1 - pos.unsqueeze(0)  # (M, L)
+        is_int_pos = power >= 0  # (M, L)
+        divisor = 10.0 ** power.clamp(min=0).double()  # (M, L)
+        int_digits = (int_part.unsqueeze(1) / divisor).floor().long() % 10
+
+        # Fractional digits: digit[k] = floor(frac * 10^(k+1)) % 10
+        F = min(L - 2, 18)  # cap at 18 to avoid int64 overflow from 10^19
+        frac_pows = 10.0 ** torch.arange(
+            1, F + 1, device=device, dtype=torch.float64
+        )  # (F,)
+        frac_digits = (
+            (frac_part.unsqueeze(1) * frac_pows.unsqueeze(0)).floor().long() % 10
+        )  # (M, F)
+
+        # Limit to float64 significant precision (~15 digits total) and
+        # strip trailing zeros by finding the last nonzero within that range.
+        max_sig = (15 - n_int).clamp(min=0, max=F)  # (M,)
+        fi = torch.arange(F, device=device).unsqueeze(0)  # (1, F)
+        sig_frac = torch.where(
+            fi < max_sig.unsqueeze(1), frac_digits, torch.zeros_like(frac_digits)
         )
-        signs = torch.zeros(B, P, n_ops, device=values.device)
+        nonzero = sig_frac != 0
+        n_frac = nonzero.flip(1).cummax(1).values.flip(1).sum(1)  # (M,)
+        has_frac = n_frac > 0  # (M,)
 
-        vals_cpu = values.detach().cpu()
-        mask_cpu = mask.detach().cpu()
-        pi = self.pair_i.cpu()
-        pj = self.pair_j.cpu()
+        # -- 5. Assemble: [int_d0 .. int_dN, DOT?, frac_d0 .. frac_dK, END ..] --
+        seq = torch.full((M, L), END, dtype=torch.long, device=device)
+        seq = torch.where(is_int_pos, int_digits, seq)
 
-        for b in range(B):
-            for p in range(P):
-                i, j = pi[p].item(), pj[p].item()
-                if not mask_cpu[b, i] or not mask_cpu[b, j]:
-                    continue
-                a = vals_cpu[b, i].item()
-                bv = vals_cpu[b, j].item()
-                b_abs = abs(bv) + eps
-                a_abs = abs(a) + eps
+        # DOT at position n_int (only when fractional part exists)
+        is_dot = (pos.unsqueeze(0) == n_int.unsqueeze(1)) & has_frac.unsqueeze(1)
+        seq = torch.where(is_dot, DOT, seq)
 
-                op_results = [
-                    a + bv,
-                    a - bv,
-                    a * bv,
-                    a / b_abs,
-                    math.fmod(a, b_abs),
-                ]
-                for o in range(n_ops):
-                    val = op_results[o]
-                    # Sign
-                    if val > 0:
-                        signs[b, p, o] = 1.0
-                    elif val < 0:
-                        signs[b, p, o] = -1.0
+        # Fractional digits at positions (n_int + 1) .. (n_int + n_frac)
+        frac_start = (n_int + 1).unsqueeze(1)  # (M, 1)
+        frac_idx = pos.unsqueeze(0) - frac_start  # (M, L)
+        is_frac = (
+            (frac_idx >= 0)
+            & (frac_idx < n_frac.unsqueeze(1))
+            & has_frac.unsqueeze(1)
+        )
+        frac_at_pos = frac_digits.gather(1, frac_idx.clamp(0, F - 1))
+        seq = torch.where(is_frac, frac_at_pos, seq)
 
-                    s = self._result_to_string(val)
-                    for c in range(min(len(s), max_len)):
-                        ch = s[c]
-                        if ch == ".":
-                            digit_seqs[b, p, o, c] = self.DIGIT_IDX_DOT
-                        elif ch.isdigit():
-                            digit_seqs[b, p, o, c] = int(ch)
-                        # else stays END
+        # Invalid pairs → all END
+        valid_flat = pair_valid.unsqueeze(-1).expand(-1, P, n_ops).reshape(M)
+        seq = torch.where(valid_flat.unsqueeze(1), seq, END)
 
-        return digit_seqs, signs
+        return seq.reshape(-1, P, n_ops, L), signs.float()
 
     def forward(
         self,

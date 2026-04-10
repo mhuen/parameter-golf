@@ -269,12 +269,8 @@ def test_rdiv():
 
 @torch.no_grad()
 def test_mod():
-    eps = 1e-8
-    # ring=[10,3], MOD = fmod(10, |3| + eps), sign=+1
-    val = math.fmod(10, 3 + eps)
-    s = _result_to_string(val)
-    expected_digit = int(s[0]) if s[0].isdigit() else 10
-    _assert_op_at("10 3 ", PairwiseOp.MOD, 1.0, expected_digit)
+    # ring=[10,3], MOD = fmod(10, |3|) = 1.0, sign=+1, first digit='1'
+    _assert_op_at("10 3 ", PairwiseOp.MOD, 1.0, 1)
 
 
 @torch.no_grad()

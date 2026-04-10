@@ -1086,8 +1086,8 @@ class DigitComputeComponent(nn.Module):
             # Need k - ii numbers for the ii-th oldest
             valid = (num_count >= k - ii).unsqueeze(-1).to(dtype=dtype)
 
-            a_abs = a_val.abs() + eps
-            b_abs = b_val.abs() + eps
+            a_abs = a_val.abs().clamp(min=eps)
+            b_abs = b_val.abs().clamp(min=eps)
             base = pi * pd
 
             for op_i, op in enumerate(self._arith_ops):
