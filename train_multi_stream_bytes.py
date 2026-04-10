@@ -132,7 +132,8 @@ class Hyperparameters:
     block_arith_map = os.environ.get("BLOCK_ARITH_MAP", "")
     block_arith_n_max = int(os.environ.get("BLOCK_ARITH_N_MAX", 16))
 
-    # Stream mixing
+    # Stream mixing (USE_STREAM_MIXING=0 uses concat-based CausalMultiStreamAttention)
+    use_stream_mixing = bool(int(os.environ.get("USE_STREAM_MIXING", "0")))
     mixing_mode = os.environ.get("MIXING_MODE", "glu")
     mixing_source = os.environ.get("MIXING_SOURCE", "dynamic_bottleneck")
     mixing_bottleneck_dim = int(os.environ.get("MIXING_BOTTLENECK_DIM", 32))
@@ -754,11 +755,13 @@ def main():
     block_conv_groups = _parse_int_or_list(args.block_conv_groups)
 
     # --- Build mixing config ---
-    mixing_config = StreamMixingConfig(
-        qk_mode=MixingMode(args.mixing_mode),
-        source=MixingSource(args.mixing_source),
-        bottleneck_dim=args.mixing_bottleneck_dim,
-    )
+    mixing_config: StreamMixingConfig | None = None
+    if args.use_stream_mixing:
+        mixing_config = StreamMixingConfig(
+            qk_mode=MixingMode(args.mixing_mode),
+            source=MixingSource(args.mixing_source),
+            bottleneck_dim=args.mixing_bottleneck_dim,
+        )
 
     # --- Build multi-stream components ---
     components = build_multi_stream_components(
