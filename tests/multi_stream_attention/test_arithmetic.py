@@ -30,6 +30,7 @@ from byte_stream_components import (
     PairwiseOp,
     DigitSequenceComponent,
 )
+from number_detection import DIGIT_IDX_DOT, DIGIT_IDX_END, NEXT_DIGIT_VOCAB
 from multi_streams import (
     StreamType,
     StreamID,
@@ -191,7 +192,7 @@ class OracleDigitComputeModel(torch.nn.Module):
         self._digit_idx_to_byte: dict[int, int] = {}
         for d in range(10):
             self._digit_idx_to_byte[d] = ord("0") + d
-        self._digit_idx_to_byte[DigitComputeComponent.DIGIT_IDX_DOT] = ord(".")
+        self._digit_idx_to_byte[DIGIT_IDX_DOT] = ord(".")
         # DIGIT_IDX_END has no byte mapping (signals end of number)
 
         # Dummy parameter so optimizers don't choke on empty param list
@@ -206,7 +207,7 @@ class OracleDigitComputeModel(torch.nn.Module):
         off = op_idx * ad
         sign_val = feats[off].item()
         # One-hot: find argmax in [off+1 .. off+1+NEXT_DIGIT_VOCAB)
-        onehot = feats[off + 1 : off + 1 + DigitComputeComponent.NEXT_DIGIT_VOCAB]
+        onehot = feats[off + 1 : off + 1 + NEXT_DIGIT_VOCAB]
         digit_idx = onehot.argmax().item()
         return sign_val, digit_idx
 
@@ -251,7 +252,7 @@ class OracleDigitComputeModel(torch.nn.Module):
             # position already contain the correct next-digit for that index.
             while pos < S:
                 _, digit_idx = self._read_next_digit(feats[b, pos], op_idx)
-                if digit_idx == DigitComputeComponent.DIGIT_IDX_END:
+                if digit_idx == DIGIT_IDX_END:
                     break
                 byte_val = self._digit_idx_to_byte.get(digit_idx)
                 if byte_val is None:

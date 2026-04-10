@@ -481,8 +481,8 @@ def extract_digit_at(
     power = (n_int - 1 - position).clamp(min=0)
     int_digit = (int_part // (10**power)) % 10
 
-    # Fractional digit at this position
-    frac_pos = (position - n_int).clamp(min=0)
+    # Fractional digit at this position (subtract 1 extra for the dot at n_int)
+    frac_pos = (position - n_int - 1).clamp(min=0)
     frac_scaled = (frac_part * (10.0 ** (frac_pos + 1).double())).long()
     frac_digit = frac_scaled % 10
 
@@ -557,7 +557,7 @@ def extract_digit_sequences(
         int_digit = (int_part // (10**power)) % 10  # (...) long
 
         # Fractional digit
-        frac_pos = (pos_t - n_int).clamp(min=0)  # 0-indexed position after the dot
+        frac_pos = (pos_t - n_int - 1).clamp(min=0)  # 0-indexed position after the dot
         # Multiply frac by 10^(frac_pos+1), take last digit
         frac_scaled = (frac_part * (10.0 ** (frac_pos + 1).double())).long()
         frac_digit = frac_scaled % 10

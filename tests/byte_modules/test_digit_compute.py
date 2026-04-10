@@ -479,6 +479,57 @@ def test_div_float_result_digits():
     assert _get_next_digit_idx(last[1:13]) == expected_idx
 
 
+@torch.no_grad()
+def test_div_float_multi_digit_sequence():
+    """Walk through all digits of a fractional division result during a digit run.
+
+    Regression test: an off-by-one in frac_pos (not accounting for the dot
+    character) caused every fractional digit to be shifted by one position,
+    e.g. 0.490277 was emitted as 0.902777.
+    """
+    comp = _make(ops={PairwiseOp.DIV})
+    eps = comp._eps
+    ad = comp._arith_dim  # 13 (1 sign + 12 one-hot)
+
+    # "7 3 " → ring=[7,3], DIV = 7/(3+eps) ≈ 2.333...
+    # result string: "2.333..."
+    val = 7 / (3 + eps)
+    expected = _result_to_string(val)
+
+    # Build input that triggers the result, then continues typing result digits
+    # "7 3 " produces the result at the trailing space (active_len=0 → first char)
+    # "7 3 2.333" types out the result — each typed digit bumps active_len
+    text = "7 3 " + expected
+    ids = _encode(text)
+    out = comp(ids, torch.float32)
+
+    prefix_len = len("7 3 ")
+    # Check first 7 chars (int + dot + 5 frac digits); beyond that float
+    # precision drift can cause mismatches unrelated to the encoding logic.
+    check_len = min(len(expected), 7)
+    for i, ch in enumerate(expected[:check_len]):
+        pos = prefix_len + i  # token position in the sequence
+        if ch == ".":
+            exp_idx = 10  # DIGIT_IDX_DOT
+        elif ch.isdigit():
+            exp_idx = int(ch)
+        else:
+            continue
+        # At the position *before* this char is typed, active_len = i
+        # so the component predicts expected[i] as the next digit.
+        # That prediction is at position (prefix_len + i - 1) for i>0,
+        # and at position (prefix_len - 1) for i==0 (the trailing space).
+        if i == 0:
+            t = prefix_len - 1
+        else:
+            t = prefix_len + i - 1
+        actual_idx = _get_next_digit_idx(out[0, t, 1:13])
+        assert actual_idx == exp_idx, (
+            f"digit {i} of '{expected}': expected idx {exp_idx} ('{ch}'), "
+            f"got {actual_idx} at seq pos {t}"
+        )
+
+
 # ===== Long integration test =====
 
 
