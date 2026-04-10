@@ -1143,7 +1143,9 @@ def main():
         last_step = step == args.iterations or (
             stop_after_step is not None and step >= stop_after_step
         )
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        if last_step or (
+            args.val_loss_every > 0 and step % args.val_loss_every == 0 and step > 0
+        ):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -1207,7 +1209,7 @@ def main():
             break
         if args.depth_lr_decay > 0:
             for p in base_model.parameters():
-                if p.grad is not None and hasattr(p, '_depth_lr_scale'):
+                if p.grad is not None and hasattr(p, "_depth_lr_scale"):
                     p.grad.mul_(p._depth_lr_scale)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)

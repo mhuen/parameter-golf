@@ -573,7 +573,9 @@ class GatedCausalConv(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def softcap_linear(x: Tensor, cap: float, knee: float | None = None) -> Tensor:
+def softcap_linear(
+    x: Tensor, cap: float, linear_regime_fraction: float = 0.8
+) -> Tensor:
     """Soft-cap with an exactly linear core and smooth rational tails.
 
     Exactly identity in ``[-knee, knee]`` (gradient = 1).  Outside, a rational
@@ -588,8 +590,7 @@ def softcap_linear(x: Tensor, cap: float, knee: float | None = None) -> Tensor:
         cap: asymptotic bound (output ∈ (-cap, cap)).
         knee: boundary of the linear region.  Default ``0.8 * cap``.
     """
-    if knee is None:
-        knee = 0.8 * cap
+    knee = linear_regime_fraction * cap
     r = cap - knee  # remaining headroom above knee
     excess = (x.abs() - knee).clamp(min=0)
     compression = excess.square() / (r + excess)

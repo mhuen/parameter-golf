@@ -8,7 +8,14 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from byte_modules import ByteLogitHierarchy
-from modules import RMSNorm, CastedLinear, GatedCausalConv, LearnableShift, make_linear, softcap_linear
+from modules import (
+    RMSNorm,
+    CastedLinear,
+    GatedCausalConv,
+    LearnableShift,
+    make_linear,
+    softcap_linear,
+)
 from multi_streams import (
     StreamType,
     StreamID,
@@ -26,9 +33,9 @@ from multi_streams import (
 
 def _build_stream_norms(streams: list[StreamConfig]) -> nn.ModuleDict:
     """Create per-stream norm instances for streams that have a norm_type."""
-    return nn.ModuleDict({
-        s.key: s.norm_type() for s in streams if s.norm_type is not None
-    })
+    return nn.ModuleDict(
+        {s.key: s.norm_type() for s in streams if s.norm_type is not None}
+    )
 
 
 def _apply_stream_norms(
@@ -1124,8 +1131,8 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
             1, F + 1, device=device, dtype=torch.float64
         )  # (F,)
         frac_digits = (
-            (frac_part.unsqueeze(1) * frac_pows.unsqueeze(0)).floor().long() % 10
-        )  # (M, F)
+            frac_part.unsqueeze(1) * frac_pows.unsqueeze(0)
+        ).floor().long() % 10  # (M, F)
 
         # Limit to float64 significant precision (~15 digits total) and
         # strip trailing zeros by finding the last nonzero within that range.
@@ -1150,9 +1157,7 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
         frac_start = (n_int + 1).unsqueeze(1)  # (M, 1)
         frac_idx = pos.unsqueeze(0) - frac_start  # (M, L)
         is_frac = (
-            (frac_idx >= 0)
-            & (frac_idx < n_frac.unsqueeze(1))
-            & has_frac.unsqueeze(1)
+            (frac_idx >= 0) & (frac_idx < n_frac.unsqueeze(1)) & has_frac.unsqueeze(1)
         )
         frac_at_pos = frac_digits.gather(1, frac_idx.clamp(0, F - 1))
         seq = torch.where(is_frac, frac_at_pos, seq)
@@ -1378,7 +1383,8 @@ class MultiStreamBlock(nn.Module):
         # MLP
         writable_dim = sum(s.dim for s in stream_config.streams if not s.read_only)
         if mlp_hidden_dim is None:
-            mlp_hidden_dim = 4 * writable_dim
+            # TODO: define mlp_hidden_multipler instead of mlp_hidden_dim to avoid hardcoding this 2x factor
+            mlp_hidden_dim = 2 * writable_dim
         self.mlp = MultiStreamMLP(
             stream_config=stream_config,
             hidden_dim=mlp_hidden_dim,
@@ -1481,8 +1487,7 @@ class MultiStreamBlock(nn.Module):
                 beta = torch.sigmoid(self.attn_beta[s.key])
                 mixed = beta * normed[s.name] + alpha * attn_out[s.name]
                 x[s.name] = (
-                    self.attn_norms[s.key](mixed) if s.key in self.attn_norms
-                    else mixed
+                    self.attn_norms[s.key](mixed) if s.key in self.attn_norms else mixed
                 )
 
         # --- Optional causal conv: pre-norm → conv → mix → re-norm ---
@@ -1495,7 +1500,8 @@ class MultiStreamBlock(nn.Module):
                     beta = torch.sigmoid(self.conv_beta[s.key])
                     mixed = beta * normed[s.name] + alpha * conv_out[s.name]
                     x[s.name] = (
-                        self.conv_norms[s.key](mixed) if s.key in self.conv_norms
+                        self.conv_norms[s.key](mixed)
+                        if s.key in self.conv_norms
                         else mixed
                     )
 
@@ -1511,7 +1517,8 @@ class MultiStreamBlock(nn.Module):
                     beta = torch.sigmoid(self.arith_beta[s.key])
                     mixed = beta * normed[s.name] + alpha * arith_out[s.name]
                     x[s.name] = (
-                        self.arith_norms[s.key](mixed) if s.key in self.arith_norms
+                        self.arith_norms[s.key](mixed)
+                        if s.key in self.arith_norms
                         else mixed
                     )
 
@@ -1528,8 +1535,7 @@ class MultiStreamBlock(nn.Module):
                 beta = torch.sigmoid(self.mlp_beta[s.key])
                 mixed = beta * normed[s.name] + alpha * mlp_out[s.name]
                 output[s.name] = (
-                    self.mlp_norms[s.key](mixed) if s.key in self.mlp_norms
-                    else mixed
+                    self.mlp_norms[s.key](mixed) if s.key in self.mlp_norms else mixed
                 )
             else:
                 output[s.name] = x[s.name]
