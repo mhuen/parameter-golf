@@ -524,7 +524,7 @@ class MultiStreamGPT(nn.Module):
 
         # 2b. Scale LOGIT stream down so all streams are at ~unit scale.
         #     Reversed in step 5 before softcap.
-        if self.logit_stream_normalization_factor > 0:
+        if self.logit_stream_normalization_factor != 1:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] * (
                 1.0 / self.logit_stream_normalization_factor
             )
@@ -542,10 +542,13 @@ class MultiStreamGPT(nn.Module):
         for block in self.blocks:
             streams = block(streams, compressed=compressed, views=views)
 
-        # 5. Extract logits, scale back up, apply softcap.
-        logits = streams[_LOGIT_SID] * self.logit_stream_normalization_factor
+        # 5. Scale logits back up, apply softcap.
+        if self.logit_stream_normalization_factor != 1:
+            streams[_LOGIT_SID] *= self.logit_stream_normalization_factor
         if self.logit_softcap > 0:
-            logits = softcap_linear(x=logits, cap=self.logit_softcap)
+            streams[_LOGIT_SID] = softcap_linear(
+                x=streams[_LOGIT_SID], cap=self.logit_softcap
+            )
 
         # 6. UTF-8 prior: hard -inf mask, inference only.
         #    Skipped during training to avoid injecting a bimodal
@@ -553,9 +556,11 @@ class MultiStreamGPT(nn.Module):
         #    scale-up (see NaN analysis).
         if self.utf8_prior is not None and not self.training:
             _cat_mask, token_mask = self.utf8_prior(input_ids)
-            logits = logits + token_mask.to(dtype=logits.dtype)
+            streams[_LOGIT_SID] = streams[_LOGIT_SID] + token_mask.to(
+                dtype=streams[_LOGIT_SID].dtype
+            )
 
-        return logits, streams
+        return streams[_LOGIT_SID], streams
 
     def compute_loss(
         self,
