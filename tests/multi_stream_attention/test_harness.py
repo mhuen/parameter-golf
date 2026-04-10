@@ -320,6 +320,7 @@ def parse_test_args() -> argparse.Namespace:
 def maybe_compile(model: nn.Module, compile: bool) -> nn.Module:
     """Optionally wrap *model* with torch.compile(fullgraph=True, dynamic=False)."""
     if compile:
+        torch.set_float32_matmul_precision("high")
         print(f"  Compiling {type(model).__name__} …")
         model = torch.compile(model, fullgraph=True, dynamic=False)
     return model
