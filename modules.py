@@ -593,7 +593,7 @@ def softcap_linear(x: Tensor, cap: float, knee: float | None = None) -> Tensor:
     r = cap - knee  # remaining headroom above knee
     excess = (x.abs() - knee).clamp(min=0)
     compression = excess.square() / (r + excess)
-    return torch.where(x >= 0, x - compression, x + compression)
+    return x - x.sign() * compression
 
 
 # ---------------------------------------------------------------------------
