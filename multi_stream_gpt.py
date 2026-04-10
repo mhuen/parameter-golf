@@ -329,7 +329,7 @@ class MultiStreamGPT(nn.Module):
         # Output
         logit_softcap: float = 30.0,
         value_softcap: float | None = 30.0,
-        logit_stream_normalization_factor: float = 1.0,
+        logit_stream_normalization_factor: float = 10.0,
         # Priors
         include_bigram_prior: bool = True,
         include_utf8_prior: bool = True,
