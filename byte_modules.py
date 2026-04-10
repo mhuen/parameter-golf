@@ -13,7 +13,7 @@ from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 from multi_streams import CompressedView
 from number_detection import detect_numbers
 
-from modules import CastedLinear, softcap_linear
+from modules import CastedLinear, SoftcapLinear
 
 
 NUM_BYTE_CATEGORIES = 8
@@ -402,6 +402,7 @@ class ByteLogitHierarchy(nn.Module):
     def __init__(self, vocab_size: int, tok, logit_softcap: float):
         super().__init__()
         self.logit_softcap = logit_softcap
+        self._softcap = SoftcapLinear(logit_softcap)
         self.vocab_size = vocab_size
 
         # ---- Gather token-ID sets from the tokenizer ----
@@ -608,7 +609,7 @@ class ByteLogitHierarchy(nn.Module):
             if i == 0 and cat_prior is not None:
                 logits = logits + cat_prior
             if self._is_leaf[i]:
-                logits = softcap_linear(x=logits, cap=self.logit_softcap)
+                logits = self._softcap(logits)
             if ngram_probs is not None:
                 margin = getattr(self, f"margin_{i}")  # (V, H_i)
                 level_probs = ngram_probs @ margin  # (B, S, H_i)
@@ -646,7 +647,7 @@ class ByteLogitHierarchy(nn.Module):
             if i == 0 and cat_prior is not None:
                 logits = logits + cat_prior
             if self._is_leaf[i]:
-                logits = softcap_linear(x=logits, cap=self.logit_softcap)
+                logits = self._softcap(logits)
             flat = flat + logits[..., self.level_indices[i]] * self.level_masks[i]
         return flat
 

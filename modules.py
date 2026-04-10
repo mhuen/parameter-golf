@@ -530,7 +530,7 @@ class GatedCausalConv(nn.Module):
 
         self.pad = kernel_size - 1
         self.gated = gated
-        self.value_softcap = value_softcap
+        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
         # Shifting only matters when groups partition channels into 2+ groups
         self.channel_shift = channel_shift if groups not in (1, dim) else 0
 
@@ -558,7 +558,7 @@ class GatedCausalConv(nn.Module):
             gate = torch.sigmoid(self.conv_gate(h) * self._conv_std_repair)
             value = F.silu(self.conv_value(h) * self._conv_std_repair)
             if self.value_softcap is not None:
-                value = softcap_linear(value, self.value_softcap)
+                value = self.value_softcap(value)
             out = gate * value
         else:
             out = F.leaky_relu(
@@ -573,9 +573,7 @@ class GatedCausalConv(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def softcap_linear(
-    x: Tensor, cap: float, linear_regime_fraction: float = 0.8
-) -> Tensor:
+class SoftcapLinear(nn.Module):
     """Soft-cap with an exactly linear core and smooth rational tails.
 
     Exactly identity in ``[-knee, knee]`` (gradient = 1).  Outside, a rational
@@ -585,16 +583,20 @@ def softcap_linear(
     this preserves perfect unit gradients for normal-magnitude values and only
     compresses outliers.
 
-    Args:
-        x: input tensor.
-        cap: asymptotic bound (output ∈ (-cap, cap)).
-        knee: boundary of the linear region.  Default ``0.8 * cap``.
+    No learnable parameters.
     """
-    knee = linear_regime_fraction * cap
-    r = cap - knee  # remaining headroom above knee
-    excess = (x.abs() - knee).clamp(min=0)
-    compression = excess.square() / (r + excess)
-    return x - x.sign() * compression
+
+    def __init__(self, cap: float, linear_regime_fraction: float = 0.8):
+        super().__init__()
+        self.cap = cap
+        self.knee = linear_regime_fraction * cap
+        self.r = cap - self.knee  # remaining headroom above knee
+
+    def forward(self, x: Tensor) -> Tensor:
+        excess = (x.abs() - self.knee).clamp(min=0)
+        compression = excess.square() / (self.r + excess)
+        return x - x.sign() * compression
+
 
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ from multi_stream_attention import (
     MultiStreamCausalConvLayers,
     StreamMixingConfig,
 )
-from modules import softcap_linear, RMSNorm, CenterLastDim
+from modules import SoftcapLinear, RMSNorm, CenterLastDim
 from multi_streams import (
     CompressionType,
     DocBoundaryComponent,
@@ -347,7 +347,7 @@ class MultiStreamGPT(nn.Module):
 
         self.builder = components.builder
         self.utf8_prior = components.utf8_prior if include_utf8_prior else None
-        self.logit_softcap = logit_softcap
+        self.logit_softcap = SoftcapLinear(logit_softcap) if logit_softcap > 0 else None
         self.logit_stream_normalization_factor = logit_stream_normalization_factor
         self.num_layers = num_layers
 
@@ -549,10 +549,8 @@ class MultiStreamGPT(nn.Module):
         # 5. Scale logits back up, apply softcap.
         if self.logit_stream_normalization_factor != 1:
             streams[_LOGIT_SID] *= self.logit_stream_normalization_factor
-        if self.logit_softcap > 0:
-            streams[_LOGIT_SID] = softcap_linear(
-                x=streams[_LOGIT_SID], cap=self.logit_softcap
-            )
+        if self.logit_softcap is not None:
+            streams[_LOGIT_SID] = self.logit_softcap(streams[_LOGIT_SID])
 
         # 6. UTF-8 prior: hard -inf mask, inference only.
         #    Skipped during training to avoid injecting a bimodal

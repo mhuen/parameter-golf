@@ -13,8 +13,8 @@ from modules import (
     CastedLinear,
     GatedCausalConv,
     LearnableShift,
+    SoftcapLinear,
     make_linear,
-    softcap_linear,
 )
 from multi_streams import (
     StreamType,
@@ -114,7 +114,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
-        self.value_softcap = value_softcap
+        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
 
         self.stream_config = stream_config
         self.mixing_config = mixing_config
@@ -404,7 +404,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
 
             value = self.W_o_value[stream.key](attn_flat)
             if self.value_softcap is not None:
-                value = softcap_linear(value, self.value_softcap)
+                value = self.value_softcap(value)
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
@@ -452,7 +452,7 @@ class CausalMultiStreamAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
-        self.value_softcap = value_softcap
+        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
         self.stream_config = stream_config
         self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
@@ -582,7 +582,7 @@ class CausalMultiStreamAttention(nn.Module):
 
             value = self.W_o_value[stream.key](attn_flat)
             if self.value_softcap is not None:
-                value = softcap_linear(value, self.value_softcap)
+                value = self.value_softcap(value)
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
@@ -622,7 +622,7 @@ class MultiStreamMLP(nn.Module):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
-        self.value_softcap = value_softcap
+        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
         self.leaky_relu_slope = leaky_relu_slope
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
@@ -702,7 +702,7 @@ class MultiStreamMLP(nn.Module):
             if self.gated_output:
                 value = self.proj_value[s.key](h)
                 if self.value_softcap is not None:
-                    value = softcap_linear(value, self.value_softcap)
+                    value = self.value_softcap(value)
                 gate = torch.sigmoid(self.proj_gate[s.key](h))
                 value = value * gate
             else:
