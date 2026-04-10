@@ -311,7 +311,7 @@ class MultiStreamGPT(nn.Module):
         # Pre-processing conv (MultiStreamCausalConvLayers)
         num_preconv_layers: int = 2,
         preconv_kernel_size: int | list[int] = 4,
-        preconv_groups: int = 12,
+        preconv_groups: int = 1,
         preconv_channel_shuffle: bool = True,
         # Per-block conv mapping: list[int|None], length=num_layers
         block_conv_map: list[int | None] | None = None,
