@@ -111,6 +111,8 @@ class Hyperparameters:
     k_shift = bool(int(os.environ.get("K_SHIFT", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 0.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    _vs = os.environ.get("VALUE_SOFTCAP", "30.0")
+    value_softcap: float | None = None if _vs.lower() in ("none", "0") else float(_vs)
     structured_output_logits = bool(
         int(os.environ.get("STRUCTURED_OUTPUT_LOGITS", "1"))
     )
@@ -159,6 +161,7 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    depth_lr_decay = float(os.environ.get("DEPTH_LR_DECAY", 0.0))
     muon_optimize_conv = bool(int(os.environ.get("MUON_OPTIMIZE_CONV", "0")))
     muon_optimize_factors = bool(int(os.environ.get("MUON_OPTIMIZE_FACTORS", "0")))
 
@@ -796,6 +799,7 @@ def main():
             qk_gain_init=args.qk_gain_init,
             k_shift=args.k_shift,
             logit_softcap=args.logit_softcap,
+            value_softcap=args.value_softcap,
             include_bigram_prior=args.include_bigram_prior,
             include_utf8_prior=args.utf8_prior,
             linear_mode=args.linear_mode,
@@ -818,6 +822,13 @@ def main():
     restore_low_dim_params_to_fp32(
         base_model, control_patterns=CONTROL_TENSOR_NAME_PATTERNS
     )
+
+    # --- Depth-based gradient scaling ---
+    if args.depth_lr_decay > 0:
+        for block_idx, block in enumerate(base_model.blocks):
+            scale = 1.0 / (1.0 + block_idx * args.depth_lr_decay)
+            for p in block.parameters():
+                p._depth_lr_scale = scale
 
     # --- Initialize bigram prior from training data ---
     if args.include_bigram_prior and base_model.bigram_prior is not None:
@@ -1194,6 +1205,10 @@ def main():
         if nan_watchdog.triggered:
             log0(f"DEBUG_NAN: terminating at step {step}")
             break
+        if args.depth_lr_decay > 0:
+            for p in base_model.parameters():
+                if p.grad is not None and hasattr(p, '_depth_lr_scale'):
+                    p.grad.mul_(p._depth_lr_scale)
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:

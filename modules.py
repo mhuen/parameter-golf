@@ -515,6 +515,7 @@ class GatedCausalConv(nn.Module):
         gated: bool = True,
         channel_shift: int = 0,
         out_dim: int | None = None,
+        value_softcap: float | None = None,
     ):
         super().__init__()
         out_dim = dim if out_dim is None else out_dim
@@ -529,6 +530,7 @@ class GatedCausalConv(nn.Module):
 
         self.pad = kernel_size - 1
         self.gated = gated
+        self.value_softcap = value_softcap
         # Shifting only matters when groups partition channels into 2+ groups
         self.channel_shift = channel_shift if groups not in (1, dim) else 0
 
@@ -555,6 +557,8 @@ class GatedCausalConv(nn.Module):
         if self.gated:
             gate = torch.sigmoid(self.conv_gate(h) * self._conv_std_repair)
             value = F.silu(self.conv_value(h) * self._conv_std_repair)
+            if self.value_softcap is not None:
+                value = softcap_linear(value, self.value_softcap)
             out = gate * value
         else:
             out = F.leaky_relu(

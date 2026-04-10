@@ -8,7 +8,7 @@ from enum import StrEnum
 from dataclasses import dataclass
 
 from byte_modules import ByteLogitHierarchy
-from modules import RMSNorm, CastedLinear, GatedCausalConv, LearnableShift, make_linear
+from modules import RMSNorm, CastedLinear, GatedCausalConv, LearnableShift, make_linear, softcap_linear
 from multi_streams import (
     StreamType,
     StreamID,
@@ -94,6 +94,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         linear_kwargs: dict | None = None,
         skip_residual: bool = True,
         alpha_pre_sigmoid_init: float = -2.0,
+        value_softcap: float | None = None,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -106,6 +107,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
+        self.value_softcap = value_softcap
 
         self.stream_config = stream_config
         self.mixing_config = mixing_config
@@ -394,6 +396,8 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
                 continue
 
             value = self.W_o_value[stream.key](attn_flat)
+            if self.value_softcap is not None:
+                value = softcap_linear(value, self.value_softcap)
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
@@ -428,6 +432,7 @@ class CausalMultiStreamAttention(nn.Module):
         linear_kwargs: dict | None = None,
         skip_residual: bool = True,
         alpha_pre_sigmoid_init: float = -2.0,
+        value_softcap: float | None = None,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -440,6 +445,7 @@ class CausalMultiStreamAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
+        self.value_softcap = value_softcap
         self.stream_config = stream_config
         self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
@@ -568,6 +574,8 @@ class CausalMultiStreamAttention(nn.Module):
                 continue
 
             value = self.W_o_value[stream.key](attn_flat)
+            if self.value_softcap is not None:
+                value = softcap_linear(value, self.value_softcap)
             gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
             update = value * gate
 
@@ -602,10 +610,12 @@ class MultiStreamMLP(nn.Module):
         logit_hierarchy: ByteLogitHierarchy | None = None,
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
+        value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
+        self.value_softcap = value_softcap
         self.leaky_relu_slope = leaky_relu_slope
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
@@ -684,6 +694,8 @@ class MultiStreamMLP(nn.Module):
         for s in self._output_streams:
             if self.gated_output:
                 value = self.proj_value[s.key](h)
+                if self.value_softcap is not None:
+                    value = softcap_linear(value, self.value_softcap)
                 gate = torch.sigmoid(self.proj_gate[s.key](h))
                 value = value * gate
             else:
@@ -722,6 +734,7 @@ class MultiStreamCausalConv(nn.Module):
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
         channel_shift: int = 0,
+        value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -765,6 +778,7 @@ class MultiStreamCausalConv(nn.Module):
             channel_shift=channel_shift,
             gated=gated_conv,
             out_dim=padded_out_dim if padded_out_dim != input_dim else None,
+            value_softcap=value_softcap,
         )
 
     @property
@@ -819,6 +833,7 @@ class MultiStreamCausalConvLayers(nn.Module):
         conv_channel_shuffle: bool = True,
         alpha_init: float = -3.0,
         beta_init: float = 5.0,
+        value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -875,6 +890,7 @@ class MultiStreamCausalConvLayers(nn.Module):
                     input_stream_ids=input_stream_ids,
                     output_stream_ids=output_stream_ids,
                     channel_shift=i * shift_step,
+                    value_softcap=value_softcap,
                 )
                 for i, ks in enumerate(kernel_sizes)
             ]
@@ -1329,6 +1345,7 @@ class MultiStreamBlock(nn.Module):
         conv_beta_init: float = 5.0,
         arith_alpha_init: float = -3.0,
         arith_beta_init: float = 5.0,
+        value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
@@ -1349,6 +1366,7 @@ class MultiStreamBlock(nn.Module):
             linear_kwargs=linear_kwargs,
             k_shift=k_shift,
             skip_residual=True,
+            value_softcap=value_softcap,
         )
         if mixing_config is not None:
             self.attn = CausalMultiStreamAttentionViaMixing(
@@ -1371,6 +1389,7 @@ class MultiStreamBlock(nn.Module):
             logit_hierarchy=logit_hierarchy,
             input_stream_ids=mlp_input_stream_ids,
             output_stream_ids=mlp_output_stream_ids,
+            value_softcap=value_softcap,
         )
         mlp_out_streams = self.mlp.output_streams
 

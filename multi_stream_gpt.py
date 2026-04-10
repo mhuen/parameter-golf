@@ -328,6 +328,7 @@ class MultiStreamGPT(nn.Module):
         k_shift: bool = True,
         # Output
         logit_softcap: float = 30.0,
+        value_softcap: float | None = 30.0,
         logit_stream_normalization_factor: float = 1.0,
         # Priors
         include_bigram_prior: bool = True,
@@ -401,6 +402,7 @@ class MultiStreamGPT(nn.Module):
                 input_stream_ids=conv_input_streams,
                 output_stream_ids=conv_output_streams,
                 conv_channel_shuffle=preconv_channel_shuffle,
+                value_softcap=value_softcap,
             )
 
         # -- Arithmetic attention instances --
@@ -445,6 +447,7 @@ class MultiStreamGPT(nn.Module):
                     conv_groups=bconv_g[j],
                     logit_hierarchy=components.logit_hierarchy,
                     input_stream_ids=conv_input_streams,
+                    value_softcap=value_softcap,
                 )
             )
 
@@ -479,6 +482,7 @@ class MultiStreamGPT(nn.Module):
                     arith_attn=arith_i,
                     logit_hierarchy=components.logit_hierarchy,
                     mlp_output_stream_ids=[_LOGIT_SID] if is_last_block else None,
+                    value_softcap=value_softcap,
                 )
             )
 
