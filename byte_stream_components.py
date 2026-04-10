@@ -854,6 +854,8 @@ class ByteHashComponent(nn.Module):
             Q = self.hit_bucket_size
             bucket = hit_bucket % Q  # (B, S), values in [0, Q)
             one_hot = F.one_hot(bucket, Q).float()  # (B, S, Q)
+            # Zero out inactive positions so they don't pollute bucket counts
+            one_hot = one_hot * (eff_lb >= 0).unsqueeze(-1)
             cumcount = _segmented_cumsum_2d(one_hot, reset_mask)
             hits = (
                 cumcount.gather(2, bucket.unsqueeze(-1)).squeeze(-1) - 1
