@@ -134,6 +134,8 @@ class Muon(torch.optim.Optimizer):
             reshape_3d = group["reshape_3d"]
 
             total_params = sum(int(p.numel()) for p in params)
+            # TODO: bf16 buffer loses precision during multi-GPU all_reduce;
+            #       consider fp32 for the reduction, then cast to bf16 after.
             updates_flat = torch.zeros(
                 total_params, device=params[0].device, dtype=torch.bfloat16
             )
