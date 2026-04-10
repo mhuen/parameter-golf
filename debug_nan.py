@@ -78,6 +78,11 @@ class NaNWatchdog:
         """Return ``True`` when compile must be skipped (level >= 2)."""
         return self.level >= 2
 
+    @property
+    def triggered(self) -> bool:
+        """Return ``True`` after the first NaN/Inf has been detected."""
+        return self._first_nan_step is not None
+
     # ------------------------------------------------------------------
     # Loss check (called right after forward)
     # ------------------------------------------------------------------

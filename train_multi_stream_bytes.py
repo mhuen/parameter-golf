@@ -1188,6 +1188,9 @@ def main():
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
         nan_watchdog.check_params_and_grads(base_model, step)
+        if nan_watchdog.triggered:
+            log0(f"DEBUG_NAN: terminating at step {step}")
+            break
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
