@@ -27,13 +27,22 @@ import torch.nn as nn
 
 
 def _tensor_stats(t: torch.Tensor) -> dict:
-    """Quick NaN/Inf/norm/max summary for a single tensor."""
+    """Quick NaN/Inf/norm/mean/std/min/max summary for a single tensor."""
     with torch.no_grad():
         has_nan = torch.isnan(t).any().item()
         has_inf = torch.isinf(t).any().item()
-        norm = t.float().norm().item()
-        abs_max = t.float().abs().max().item() if t.numel() > 0 else 0.0
-    return dict(has_nan=has_nan, has_inf=has_inf, norm=norm, abs_max=abs_max)
+        f = t.float()
+        norm = f.norm().item()
+        n = t.numel()
+        abs_max = f.abs().max().item() if n > 0 else 0.0
+        mean = f.mean().item() if n > 0 else 0.0
+        std = f.std().item() if n > 1 else 0.0
+        vmin = f.min().item() if n > 0 else 0.0
+        vmax = f.max().item() if n > 0 else 0.0
+    return dict(
+        has_nan=has_nan, has_inf=has_inf, norm=norm, abs_max=abs_max,
+        mean=mean, std=std, min=vmin, max=vmax,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +234,11 @@ class NaNWatchdog:
             for entry in self._hook_data:
                 self._log(
                     f"    {entry['name']}: "
-                    f"out_max={entry.get('abs_max', 0):.4f} "
-                    f"out_norm={entry.get('norm', 0):.4f}"
+                    f"mean={entry.get('mean', 0):.4f} "
+                    f"std={entry.get('std', 0):.4f} "
+                    f"min={entry.get('min', 0):.4f} "
+                    f"max={entry.get('max', 0):.4f} "
+                    f"norm={entry.get('norm', 0):.4f}"
                     + (" **NaN**" if entry.get("has_nan") else "")
                     + (" **Inf**" if entry.get("has_inf") else "")
                 )
@@ -367,7 +379,11 @@ class NaNWatchdog:
                 if entry.get("has_inf"):
                     flags += " **Inf**"
                 self._log(
-                    f"  {entry['name']}: max={entry.get('abs_max', 0):.4f} "
+                    f"  {entry['name']}: "
+                    f"mean={entry.get('mean', 0):.4f} "
+                    f"std={entry.get('std', 0):.4f} "
+                    f"min={entry.get('min', 0):.4f} "
+                    f"max={entry.get('max', 0):.4f} "
                     f"norm={entry.get('norm', 0):.4f}{flags}"
                 )
 
