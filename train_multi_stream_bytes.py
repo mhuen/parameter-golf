@@ -826,6 +826,11 @@ def main():
         )
         with torch.no_grad():
             base_model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
+        bl = base_model.bigram_prior.bigram_logits.data
+        log0(
+            f"bigram_prior: mean={bl.mean():.3f} std={bl.std():.3f} "
+            f"min={bl.min():.3f} max={bl.max():.3f}"
+        )
 
     # --- Sanity-check: prior-only BPB ---
     uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb = eval_prior_bpb(
