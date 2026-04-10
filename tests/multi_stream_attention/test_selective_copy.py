@@ -31,6 +31,8 @@ from test_harness import (
     MultiStreamTestModel,
     MultiStreamGPTTestModel,
     count_params,
+    parse_test_args,
+    maybe_compile,
     train_model,
     evaluate_autoregressive,
     evaluate_packed,
@@ -157,15 +159,7 @@ def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--pack",
-        action="store_true",
-        help="Pack 2 documents per sequence (each prefixed with BOS)",
-    )
-    args = parser.parse_args()
+    args = parse_test_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
@@ -255,18 +249,21 @@ if __name__ == "__main__":
     print("=" * 60)
     print("Training Multi-stream")
     print("=" * 60)
+    ms_model = maybe_compile(ms_model, args.compile)
     ms_model = train_model(ms_model, eval_fn=ms_eval_fn, **train_kwargs)
 
     print()
     print("=" * 60)
     print("Training TinyGPT")
     print("=" * 60)
+    gpt_model = maybe_compile(gpt_model, args.compile)
     gpt_model = train_model(gpt_model, eval_fn=gpt_eval_fn, **train_kwargs)
 
     print()
     print("=" * 60)
     print("Training MultiStreamGPT")
     print("=" * 60)
+    msgpt_model = maybe_compile(msgpt_model, args.compile)
     msgpt_model = train_model(msgpt_model, eval_fn=ms_eval_fn, **train_kwargs)
 
     # --- Per-category evaluation ---

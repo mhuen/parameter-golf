@@ -6,6 +6,7 @@ Provides:
 - Training and evaluation utilities for synthetic copy/recall tasks
 """
 
+import argparse
 import sys
 import os
 import math
@@ -293,6 +294,35 @@ class MultiStreamGPTTestModel(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         logits, _streams = self.gpt(input_ids, dtype=self.dtype)
         return logits
+
+
+# ---------------------------------------------------------------------------
+# CLI and compilation helpers
+# ---------------------------------------------------------------------------
+
+
+def parse_test_args() -> argparse.Namespace:
+    """Shared argument parser for all multi-stream attention test scripts."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pack",
+        action="store_true",
+        help="Pack 2 documents per sequence (each prefixed with BOS)",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile models with fullgraph=True, dynamic=False",
+    )
+    return parser.parse_args()
+
+
+def maybe_compile(model: nn.Module, compile: bool) -> nn.Module:
+    """Optionally wrap *model* with torch.compile(fullgraph=True, dynamic=False)."""
+    if compile:
+        print(f"  Compiling {type(model).__name__} …")
+        model = torch.compile(model, fullgraph=True, dynamic=False)
+    return model
 
 
 # ---------------------------------------------------------------------------

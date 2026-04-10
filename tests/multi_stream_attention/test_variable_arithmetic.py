@@ -60,6 +60,8 @@ from test_harness import (
     MultiStreamTestModel,
     MultiStreamGPTTestModel,
     count_params,
+    parse_test_args,
+    maybe_compile,
     train_model,
     evaluate_autoregressive,
     evaluate_packed,
@@ -308,15 +310,7 @@ def build_arith_model(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--pack",
-        action="store_true",
-        help="Pack 2 documents per sequence (each prefixed with BOS)",
-    )
-    args = parser.parse_args()
+    args = parse_test_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tok = EfficientByteTokenizer()
@@ -420,6 +414,7 @@ if __name__ == "__main__":
         print("=" * 70)
         print(name)
         print("=" * 70)
+        model = maybe_compile(model, args.compile)
 
         if args.pack:
 
