@@ -7,7 +7,7 @@ import math
 import torch
 import pytest
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_stream_components import DigitComputeComponent, PairwiseOp
+from byte_stream_components import DigitComputeComponent, DigitEncoding, PairwiseOp
 
 tok = EfficientByteTokenizer()
 
@@ -17,7 +17,7 @@ def _encode(text: str) -> torch.Tensor:
 
 
 def _make(k=2, ops=None):
-    return DigitComputeComponent(tok, k=k, ops=ops)
+    return DigitComputeComponent(tok, k=k, ops=ops, digit_encoding=DigitEncoding.ONEHOT)
 
 
 # Mirrors _result_to_string from the component
@@ -761,3 +761,290 @@ def test_active_len_resets_between_runs():
     # At the '2' position (last), should show END
     last = out[0, -1]
     assert _get_next_digit_idx(last[1:13]) == 11  # END
+
+
+# =============================================================================
+# Rotation encoding tests
+# =============================================================================
+
+from modules import RotationCodebook
+
+_NEXT_DIGIT_VOCAB = 12  # {0-9, '.', END}
+
+
+def _make_rot(k=2, ops=None):
+    return DigitComputeComponent(
+        tok, k=k, ops=ops, digit_encoding=DigitEncoding.ROTATION
+    )
+
+
+def _decode_rot_digit(rot_vec: torch.Tensor, codebook: RotationCodebook) -> int:
+    """Decode a 2-dim rotation vector back to a digit index."""
+    return codebook.decode(rot_vec.unsqueeze(0)).item()
+
+
+# ===== Shape / dim (rotation) =====
+
+
+@torch.no_grad()
+def test_rot_dim_default():
+    comp = _make_rot()
+    n_arith = 8
+    n_cmp = 3
+    # 1 pair, each arith op = 3 dims (1 sign + 2 rotation)
+    expected = 1 * (n_arith * 3 + n_cmp)
+    assert comp.dim == expected
+
+
+@torch.no_grad()
+def test_rot_dim_k3():
+    comp = _make_rot(k=3)
+    n_arith = 8
+    n_cmp = 3
+    n_pairs = 3
+    expected = n_pairs * (n_arith * 3 + n_cmp)
+    assert comp.dim == expected
+
+
+@torch.no_grad()
+def test_rot_dim_subset_ops():
+    comp = _make_rot(ops={PairwiseOp.ADD, PairwiseOp.GT})
+    # 1 arith (ADD) * 3 + 1 cmp (GT) = 4
+    assert comp.dim == 4
+
+
+@torch.no_grad()
+def test_rot_output_shape():
+    comp = _make_rot()
+    ids = _encode("12 + 34")
+    out = comp(ids, torch.float32)
+    assert out.shape == (1, ids.shape[1], comp.dim)
+
+
+# ===== Next-digit encoding (rotation) =====
+
+
+@torch.no_grad()
+def test_rot_next_digit_first_digit():
+    """First digit of result via rotation decoding."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    cb = comp._rotation_codebook
+    # "12 34 " → ring=[12,34], ADD=46, first char '4' → idx=4
+    ids = _encode("12 34 ")
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    assert last[0].item() == 1.0  # sign
+    assert _decode_rot_digit(last[1:3], cb) == 4
+
+
+@torch.no_grad()
+def test_rot_next_digit_second_digit():
+    """Second digit of result via rotation decoding."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    cb = comp._rotation_codebook
+    # "12 34 4" → active_len=1, result "46", char[1]='6' → idx=6
+    ids = _encode("12 34 4")
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    assert _decode_rot_digit(last[1:3], cb) == 6
+
+
+@torch.no_grad()
+def test_rot_next_digit_end():
+    """END token via rotation when active_len >= result length."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    cb = comp._rotation_codebook
+    # "1 1 11" → ring=[1,1], ADD=2, result "2" (len=1)
+    # At second '1' of "11", active_len=2 >= 1 → END (idx=11)
+    ids = _encode("1 1 11")
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    assert _decode_rot_digit(last[1:3], cb) == 11
+
+
+@torch.no_grad()
+def test_rot_next_digit_dot():
+    """Decimal point encoded as rotation for DOT (idx=10)."""
+    comp = _make_rot(ops={PairwiseOp.DIV})
+    cb = comp._rotation_codebook
+    eps = comp._eps
+    val = 7 / (2 + eps)
+    s = _result_to_string(val)
+    if "." in s:
+        dot_pos = s.index(".")
+        text = "7 2 " + "0" * dot_pos
+        ids = _encode(text)
+        out = comp(ids, torch.float32)
+        last = out[0, -1]
+        assert _decode_rot_digit(last[1:3], cb) == 10
+
+
+# ===== Arithmetic ops (rotation) =====
+
+
+def _assert_rot_op_at(
+    text: str,
+    op: PairwiseOp,
+    expected_sign: float,
+    expected_first_digit: int | None = None,
+):
+    """Check sign and optional first digit for rotation-encoded output."""
+    comp = _make_rot(ops={op})
+    cb = comp._rotation_codebook
+    ids = _encode(text)
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    sign = last[0].item()
+    assert sign == expected_sign, f"Expected sign {expected_sign}, got {sign}"
+    if expected_first_digit is not None:
+        idx = _decode_rot_digit(last[1:3], cb)
+        assert idx == expected_first_digit, (
+            f"Expected digit idx {expected_first_digit}, got {idx}"
+        )
+
+
+@torch.no_grad()
+def test_rot_add():
+    _assert_rot_op_at("10 25 ", PairwiseOp.ADD, 1.0, 3)
+
+
+@torch.no_grad()
+def test_rot_sub():
+    _assert_rot_op_at("10 25 ", PairwiseOp.SUB, -1.0, 1)
+
+
+@torch.no_grad()
+def test_rot_mul():
+    _assert_rot_op_at("3 7 ", PairwiseOp.MUL, 1.0, 2)
+
+
+@torch.no_grad()
+def test_rot_div():
+    _assert_rot_op_at("10 4 ", PairwiseOp.DIV, 1.0, 2)
+
+
+@torch.no_grad()
+def test_rot_negative_result():
+    """Negative results should have sign=-1 and correct digit."""
+    _assert_rot_op_at("3 10 ", PairwiseOp.SUB, -1.0, 7)
+
+
+# ===== Rotation encoding properties =====
+
+
+@torch.no_grad()
+def test_rot_vectors_are_unit():
+    """All rotation-encoded digit vectors should be unit vectors."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    # "12 34 " → at trailing space, output has rotation vectors
+    ids = _encode("12 34 ")
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    rot = last[1:3]
+    norm = rot.norm().item()
+    assert abs(norm - 1.0) < 1e-5, f"Rotation vector norm {norm}, expected 1.0"
+
+
+@torch.no_grad()
+def test_rot_zero_before_two_numbers():
+    """Before two numbers are seen, rotation output should be all zeros."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    ids = _encode("42")
+    out = comp(ids, torch.float32)
+    assert (out == 0).all()
+
+
+@torch.no_grad()
+def test_rot_adjacent_digits_similar():
+    """Adjacent digit encodings should have higher dot product than distant ones."""
+    cb = RotationCodebook(_NEXT_DIGIT_VOCAB)
+    # digit 3 and digit 4 should be more similar than digit 3 and digit 9
+    v3 = cb.encode(torch.tensor(3))
+    v4 = cb.encode(torch.tensor(4))
+    v9 = cb.encode(torch.tensor(9))
+    dot_34 = (v3 * v4).sum()
+    dot_39 = (v3 * v9).sum()
+    assert dot_34 > dot_39
+
+
+@torch.no_grad()
+def test_rot_roundtrip_all_digits():
+    """Every digit index should survive encode → decode."""
+    cb = RotationCodebook(_NEXT_DIGIT_VOCAB)
+    indices = torch.arange(_NEXT_DIGIT_VOCAB)
+    encoded = cb.encode(indices)
+    decoded = cb.decode(encoded)
+    assert torch.equal(decoded, indices)
+
+
+@torch.no_grad()
+def test_rot_k3_three_pairs():
+    """With k=3, verify all 3 pairs produce correct rotation-encoded results."""
+    comp = _make_rot(k=3, ops={PairwiseOp.ADD})
+    cb = comp._rotation_codebook
+    ad = comp._arith_dim  # 3 (1 sign + 2 rotation)
+    # "2 3 5 " → nums=[2,3,5], pairs: (2,3)=5, (2,5)=7, (3,5)=8
+    ids = _encode("2 3 5 ")
+    out = comp(ids, torch.float32)
+    last = out[0, -1]
+    # Pair 0: ADD=5, sign=+1, first digit='5'
+    assert last[0].item() == 1.0
+    assert _decode_rot_digit(last[1:3], cb) == 5
+    # Pair 1: ADD=7, sign=+1, first digit='7'
+    assert last[ad].item() == 1.0
+    assert _decode_rot_digit(last[ad + 1 : ad + 3], cb) == 7
+    # Pair 2: ADD=8, sign=+1, first digit='8'
+    assert last[2 * ad].item() == 1.0
+    assert _decode_rot_digit(last[2 * ad + 1 : 2 * ad + 3], cb) == 8
+
+
+@torch.no_grad()
+def test_rot_causality():
+    """Output at position t should not change when tokens after t change."""
+    comp = _make_rot(ops={PairwiseOp.ADD})
+    ids1 = _encode("5 3 hello")
+    ids2 = _encode("5 3 world")
+    out1 = comp(ids1, torch.float32)
+    out2 = comp(ids2, torch.float32)
+    assert torch.allclose(out1[0, :4], out2[0, :4])
+
+
+@torch.no_grad()
+def test_rot_matches_onehot_sign():
+    """Rotation and one-hot modes should produce identical sign values."""
+    comp_oh = _make(ops={PairwiseOp.ADD, PairwiseOp.SUB})
+    comp_rot = _make_rot(ops={PairwiseOp.ADD, PairwiseOp.SUB})
+    ids = _encode("12 34 5 100 7 three 42 ")
+    out_oh = comp_oh(ids, torch.float32)
+    out_rot = comp_rot(ids, torch.float32)
+    ad_oh = comp_oh._arith_dim  # 13
+    ad_rot = comp_rot._arith_dim  # 3
+    # Compare sign dims for both ops at every position
+    for t in range(ids.shape[1]):
+        # ADD sign
+        assert out_oh[0, t, 0].item() == out_rot[0, t, 0].item(), f"ADD sign mismatch at t={t}"
+        # SUB sign
+        assert out_oh[0, t, ad_oh].item() == out_rot[0, t, ad_rot].item(), f"SUB sign mismatch at t={t}"
+
+
+@torch.no_grad()
+def test_rot_matches_onehot_digits():
+    """Rotation and one-hot should decode to the same digit index everywhere."""
+    comp_oh = _make(ops={PairwiseOp.ADD})
+    comp_rot = _make_rot(ops={PairwiseOp.ADD})
+    cb = comp_rot._rotation_codebook
+    ids = _encode("12 34 5 100 7 three 42 ")
+    out_oh = comp_oh(ids, torch.float32)
+    out_rot = comp_rot(ids, torch.float32)
+    for t in range(ids.shape[1]):
+        oh_vec = out_oh[0, t, 1:13]
+        rot_vec = out_rot[0, t, 1:3]
+        # Skip positions where output is all zeros (before two numbers)
+        if oh_vec.abs().sum() == 0:
+            assert rot_vec.abs().sum() == 0, f"t={t}: onehot is zero but rotation is not"
+            continue
+        oh_idx = _get_next_digit_idx(oh_vec)
+        rot_idx = _decode_rot_digit(rot_vec, cb)
+        assert oh_idx == rot_idx, (
+            f"t={t}: onehot decoded {oh_idx}, rotation decoded {rot_idx}"
+        )

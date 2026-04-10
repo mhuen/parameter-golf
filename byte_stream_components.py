@@ -468,8 +468,9 @@ class DigitSequenceComponent(nn.Module):
     """Digit run state + number ID. 0 params.
 
     Dim 0 (in_digit): +1=digit, -1=non-digit.
-    Dim 1 (pos_in_number): log1p-compressed position within digit run, -1 for non-digits.
-    Dims 2+ (number_id): sin/cos encoded cumsum over digit-run starts.
+    Dims 1-2 (pos_in_number): rotation-encoded position within digit run
+      (0..MAX_RESULT_DIGITS on a unit circle), (0,0) for non-digits.
+    Dims 3+ (number_id): sin/cos encoded cumsum over digit-run starts.
       Non-digit positions inherit the last number's ID (like codepoint_id).
 
     Causal: rising-edge detection + cumsum + cummax.
@@ -489,10 +490,11 @@ class DigitSequenceComponent(nn.Module):
             if digit_mask[tid]:
                 is_digit[tid] = 1
         self.register_buffer("is_digit", is_digit)
+        self._pos_codebook = RotationCodebook(MAX_RESULT_DIGITS + 1)
 
     @property
     def dim(self) -> int:
-        return 2 + self.id_freqs * 2
+        return 3 + self.id_freqs * 2
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
@@ -501,12 +503,22 @@ class DigitSequenceComponent(nn.Module):
         # In-digit state
         in_digit = torch.where(is_dig, 1.0, -1.0)
 
-        # Position within digit run: use _run_length on binary digit/non-digit
+        # Position within digit run: rotation-encoded on 0..MAX_RESULT_DIGITS
         digit_cat = is_dig.long()
-        run_len = _run_length(digit_cat)  # log1p-compressed
-        pos_in_num = torch.where(is_dig, run_len, -1.0)
+        positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
+        changed = torch.ones(B, S, device=input_ids.device, dtype=torch.bool)
+        changed[:, 1:] = digit_cat[:, 1:] != digit_cat[:, :-1]
+        last_change = (
+            torch.where(changed, positions, torch.zeros_like(positions))
+            .cummax(dim=1)
+            .values
+        )
+        raw_pos = (positions - last_change).clamp(max=MAX_RESULT_DIGITS)
+        pos_rot = self._pos_codebook.encode(raw_pos)  # (B, S, 2)
+        # Zero out non-digit positions
+        pos_rot = pos_rot * is_dig.unsqueeze(-1)
 
-        parts = [torch.stack([in_digit, pos_in_num], dim=-1)]
+        parts = [in_digit.unsqueeze(-1), pos_rot]
 
         # Number ID: cumsum over digit-run starts (rising edge)
         if self.id_freqs > 0:
@@ -1128,13 +1140,11 @@ class DigitComputeComponent(nn.Module):
                 next_char = extract_digit_at(result, al_clamped)
 
                 if self._digit_encoding == DigitEncoding.ONEHOT:
-                    encoded = F.one_hot(
-                        next_char, num_classes=NEXT_DIGIT_VOCAB
-                    ).to(dtype=dtype)
-                else:
-                    encoded = self._rotation_codebook.encode(next_char).to(
+                    encoded = F.one_hot(next_char, num_classes=NEXT_DIGIT_VOCAB).to(
                         dtype=dtype
                     )
+                else:
+                    encoded = self._rotation_codebook.encode(next_char).to(dtype=dtype)
 
                 dd = self._digit_dim
                 off = base + op_i * ad

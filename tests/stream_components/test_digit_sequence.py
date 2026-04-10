@@ -27,12 +27,12 @@ class TestDigitSequenceComponent:
         comp = DigitSequenceComponent(tok, id_freqs=1)
         ids = _encode("a1b")
         out = comp(ids, dtype=torch.float32)
-        assert out.shape == (1, ids.shape[1], 4)
+        assert out.shape == (1, ids.shape[1], 5)
 
     @torch.no_grad()
     def test_dim(self):
         comp = DigitSequenceComponent(tok, id_freqs=1)
-        assert comp.dim == 4
+        assert comp.dim == 5
 
     @torch.no_grad()
     def test_digit_state(self):
@@ -45,14 +45,14 @@ class TestDigitSequenceComponent:
         assert out[0, 3, 0].item() == pytest.approx(-1.0)  # 'b' is not
 
     @torch.no_grad()
-    def test_non_digit_pos_minus_one(self):
+    def test_non_digit_pos_zero(self):
         comp = DigitSequenceComponent(tok, id_freqs=1)
         ids = _encode("a1b")
         out = comp(ids, dtype=torch.float32)
-        # dim 1 = -1 for non-digit positions
-        assert out[0, 0, 1].item() == pytest.approx(-1.0)  # BOS
-        assert out[0, 1, 1].item() == pytest.approx(-1.0)  # 'a'
-        assert out[0, 3, 1].item() == pytest.approx(-1.0)  # 'b'
+        # dims 1-2 = (0, 0) for non-digit positions (rotation zeroed out)
+        for pos in [0, 1, 3]:  # BOS, 'a', 'b'
+            assert out[0, pos, 1].item() == pytest.approx(0.0)
+            assert out[0, pos, 2].item() == pytest.approx(0.0)
 
     @torch.no_grad()
     def test_number_id_increments(self):
@@ -60,9 +60,9 @@ class TestDigitSequenceComponent:
         # "1a2" → BOS(0), 1(1), a(2), 2(3) — two separate digit runs
         ids = _encode("1a2")
         out = comp(ids, dtype=torch.float32)
-        # number_id sin/cos (dims 2-3) should differ between the two runs
-        id_first = out[0, 1, 2:]  # digit '1', run 1
-        id_second = out[0, 3, 2:]  # digit '2', run 2
+        # number_id sin/cos (dims 3-4) should differ between the two runs
+        id_first = out[0, 1, 3:]  # digit '1', run 1
+        id_second = out[0, 3, 3:]  # digit '2', run 2
         assert not torch.allclose(id_first, id_second)
 
     @torch.no_grad()
@@ -74,9 +74,25 @@ class TestDigitSequenceComponent:
         # All three digits should be in-digit
         for pos in [1, 2, 3]:
             assert out[0, pos, 0].item() == pytest.approx(1.0)
-        # Same run → same number_id
-        torch.testing.assert_close(out[0, 1, 2:], out[0, 2, 2:])
-        torch.testing.assert_close(out[0, 1, 2:], out[0, 3, 2:])
+        # Same run → same number_id (dims 3+)
+        torch.testing.assert_close(out[0, 1, 3:], out[0, 2, 3:])
+        torch.testing.assert_close(out[0, 1, 3:], out[0, 3, 3:])
+
+    @torch.no_grad()
+    def test_digit_pos_rotation_distinct(self):
+        """Each digit position gets a distinct rotation vector."""
+        comp = DigitSequenceComponent(tok, id_freqs=1)
+        ids = _encode("12345")
+        out = comp(ids, dtype=torch.float32)
+        # Positions 1..5 are digits at run positions 0..4
+        rot_vecs = out[0, 1:6, 1:3]  # (5, 2)
+        # Each position should be a unit vector
+        norms = rot_vecs.norm(dim=-1)
+        torch.testing.assert_close(norms, torch.ones(5), atol=1e-5, rtol=1e-5)
+        # Adjacent positions should be more similar than distant ones
+        dot_01 = (rot_vecs[0] * rot_vecs[1]).sum()
+        dot_04 = (rot_vecs[0] * rot_vecs[4]).sum()
+        assert dot_01 > dot_04
 
     @torch.no_grad()
     def test_bos_reset(self):
