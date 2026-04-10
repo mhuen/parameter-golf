@@ -320,18 +320,6 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
     ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
 
-        # Validate input streams
-        for stream_name, x in input_streams.items():
-            assert x.shape[0] == bsz and x.shape[1] == seqlen, (
-                f"Stream {stream_name} shape {x.shape} doesn't match batch/seq dims"
-            )
-            assert stream_name in self._stream_lookup, (
-                f"Input stream {stream_name} not in stream configuration"
-            )
-            assert x.shape[2] == self._stream_lookup[stream_name].dim, (
-                f"Stream {stream_name} dim {x.shape[2]}, expected {self._stream_lookup[stream_name].dim}"
-            )
-
         # Step 1: Compute per-stream Q/K/V and stack
         q_list, k_list, v_list = [], [], []
         for stream in self.stream_config.streams:
@@ -533,18 +521,6 @@ class CausalMultiStreamAttention(nn.Module):
         input_streams: dict[StreamID, Tensor],
     ) -> dict[StreamID, Tensor]:
         bsz, seqlen, _ = next(iter(input_streams.values())).shape
-
-        # Validate input streams
-        for stream_name, x in input_streams.items():
-            assert x.shape[0] == bsz and x.shape[1] == seqlen, (
-                f"Stream {stream_name} shape {x.shape} doesn't match batch/seq dims"
-            )
-            assert stream_name in self._stream_lookup, (
-                f"Input stream {stream_name} not in stream configuration"
-            )
-            assert x.shape[2] == self._stream_lookup[stream_name].dim, (
-                f"Stream {stream_name} dim {x.shape[2]}, expected {self._stream_lookup[stream_name].dim}"
-            )
 
         # Concat all streams
         x = torch.cat(
