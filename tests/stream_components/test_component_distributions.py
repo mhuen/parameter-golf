@@ -72,7 +72,7 @@ def _build_component_registry(
     return [
         ("DocBoundary", DocBoundaryComponent(bos_id=tok.bos_id, num_freqs=2)),
         ("SinCosPosition", SinCosPositionComponent(num_freqs=10)),
-        ("ByteCategory", ByteCategoryComponent(tok=tok, embed_dim=4)),
+        ("ByteCategory", ByteCategoryComponent(tok=tok)),
         ("MultiByteState", MultiByteStateComponent(tok=tok, id_freqs=3)),
         ("Case", CaseComponent(tok=tok)),
         ("VowelConsonant", VowelConsonantComponent(tok=tok)),

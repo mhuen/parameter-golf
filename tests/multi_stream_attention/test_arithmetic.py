@@ -25,7 +25,7 @@ from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_modules import NumberExtractor, ByteLogitHierarchy
 from byte_stream_components import (
     ByteHashComponent,
-    DigitEncoding,
+    DiscreteEncoding,
     HashBoundary,
     DigitComputeComponent,
     PairwiseOp,
@@ -148,7 +148,7 @@ class OracleDigitComputeModel(torch.nn.Module):
         self,
         tok: EfficientByteTokenizer,
         ops: set[PairwiseOp] | None = None,
-        digit_encoding: DigitEncoding = DigitEncoding.ONEHOT,
+        digit_encoding: DiscreteEncoding = DiscreteEncoding.ONEHOT,
     ):
         super().__init__()
         if ops is None:
@@ -160,7 +160,7 @@ class OracleDigitComputeModel(torch.nn.Module):
             }
         self.tok = tok
         self.vocab_size = tok.vocab_size
-        self._digit_encoding = DigitEncoding(digit_encoding)
+        self._digit_encoding = DiscreteEncoding(digit_encoding)
         self.comp = DigitComputeComponent(
             tok, k=2, ops=ops, digit_encoding=digit_encoding
         )
@@ -168,7 +168,7 @@ class OracleDigitComputeModel(torch.nn.Module):
         self._digit_dim = self.comp._digit_dim
 
         self._rotation_codebook: RotationCodebook | None = None
-        if self._digit_encoding == DigitEncoding.ROTATION:
+        if self._digit_encoding == DiscreteEncoding.ROTATION:
             self._rotation_codebook = RotationCodebook(NEXT_DIGIT_VOCAB)
 
         # Map task operator → component op index
@@ -219,7 +219,7 @@ class OracleDigitComputeModel(torch.nn.Module):
         off = op_idx * ad
         sign_val = feats[off].item()
         encoded = feats[off + 1 : off + 1 + dd]
-        if self._digit_encoding == DigitEncoding.ONEHOT:
+        if self._digit_encoding == DiscreteEncoding.ONEHOT:
             digit_idx = encoded.argmax().item()
         else:
             digit_idx = self._rotation_codebook.decode(encoded.unsqueeze(0)).item()
@@ -458,7 +458,7 @@ if __name__ == "__main__":
     oracle_rot = OracleDigitComputeModel(
         tok,
         ops={PairwiseOp.ADD, PairwiseOp.SUB, PairwiseOp.MUL, PairwiseOp.DIV},
-        digit_encoding=DigitEncoding.ROTATION,
+        digit_encoding=DiscreteEncoding.ROTATION,
     )
     models.append(("Oracle (rotation)", oracle_rot))
 

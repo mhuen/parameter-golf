@@ -7,7 +7,7 @@ import math
 import torch
 import pytest
 from efficient_byte_tokenizer import EfficientByteTokenizer
-from byte_stream_components import DigitComputeComponent, DigitEncoding, PairwiseOp
+from byte_stream_components import DigitComputeComponent, DiscreteEncoding, PairwiseOp
 
 tok = EfficientByteTokenizer()
 
@@ -17,7 +17,7 @@ def _encode(text: str) -> torch.Tensor:
 
 
 def _make(k=2, ops=None):
-    return DigitComputeComponent(tok, k=k, ops=ops, digit_encoding=DigitEncoding.ONEHOT)
+    return DigitComputeComponent(tok, k=k, ops=ops, digit_encoding=DiscreteEncoding.ONEHOT)
 
 
 # Mirrors _result_to_string from the component
@@ -774,7 +774,7 @@ _NEXT_DIGIT_VOCAB = 12  # {0-9, '.', END}
 
 def _make_rot(k=2, ops=None):
     return DigitComputeComponent(
-        tok, k=k, ops=ops, digit_encoding=DigitEncoding.ROTATION
+        tok, k=k, ops=ops, digit_encoding=DiscreteEncoding.ROTATION
     )
 
 

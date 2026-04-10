@@ -103,11 +103,11 @@ def build_multi_stream_components(
         A :class:`MultiStreamComponents` dataclass with builder, hierarchy,
         and UTF-8 prior ready to be passed to :class:`MultiStreamGPT`.
     """
-    # -- STRUCTURAL stream components (~239 dims total) --
+    # -- STRUCTURAL stream components (~180 dims total) --
     structural_components: list[nn.Module] = [
         DocBoundaryComponent(bos_id=tok.bos_id, num_freqs=2),  # 4
         SinCosPositionComponent(num_freqs=10),  # 20
-        ByteCategoryComponent(tok=tok, embed_dim=4),  # 4
+        ByteCategoryComponent(tok=tok),  # 2
         MultiByteStateComponent(tok=tok, id_freqs=3),  # 8
         CaseComponent(tok=tok),  # 2
         VowelConsonantComponent(tok=tok),  # 2
@@ -355,11 +355,13 @@ class MultiStreamGPT(nn.Module):
 
         # Initial norms to establish the "always normalized" invariant
         # before streams enter the first block.
-        self.init_norms = nn.ModuleDict({
-            s.key: s.norm_type()
-            for s in stream_config.streams
-            if s.norm_type is not None and not s.read_only
-        })
+        self.init_norms = nn.ModuleDict(
+            {
+                s.key: s.norm_type()
+                for s in stream_config.streams
+                if s.norm_type is not None and not s.read_only
+            }
+        )
         vocab_size = components.vocab_size
 
         # -- Broadcast per-layer params --

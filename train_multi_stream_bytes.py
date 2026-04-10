@@ -120,7 +120,7 @@ class Hyperparameters:
     # Pre-processing conv
     num_preconv_layers = int(os.environ.get("NUM_PRECONV_LAYERS", 2))
     preconv_kernel_size = os.environ.get("PRECONV_KERNEL_SIZE", "4")
-    preconv_groups = int(os.environ.get("PRECONV_GROUPS", 12))
+    preconv_groups = int(os.environ.get("PRECONV_GROUPS", 6))
     preconv_channel_shuffle = bool(int(os.environ.get("PRECONV_CHANNEL_SHUFFLE", "1")))
 
     # Per-block conv
@@ -301,14 +301,22 @@ def eval_prior_bpb(
             byte_count += base_bytes_lut[y.reshape(-1)].to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
-        for t in (utf8_loss_sum, bigram_only_loss_sum, bigram_loss_sum, token_count, byte_count):
+        for t in (
+            utf8_loss_sum,
+            bigram_only_loss_sum,
+            bigram_loss_sum,
+            token_count,
+            byte_count,
+        ):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
     tpb = token_count.item() / byte_count.item()
     vocab_size = base_model.builder.vocab_size
     uniform_bpb = math.log2(vocab_size) * tpb
     utf8_bpb = utf8_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
-    bigram_only_bpb = bigram_only_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+    bigram_only_bpb = (
+        bigram_only_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
+    )
     bigram_utf8_bpb = bigram_loss_sum.item() / token_count.item() / math.log(2.0) * tpb
 
     base_model.train()
@@ -821,8 +829,14 @@ def main():
 
     # --- Sanity-check: prior-only BPB ---
     uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb = eval_prior_bpb(
-        args, base_model, rank, world_size, device,
-        grad_accum_steps, val_tokens, base_bytes_lut,
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
     )
     log0(
         f"prior_bpb: uniform={uniform_bpb:.4f} utf8_only={utf8_bpb:.4f} "

@@ -23,11 +23,12 @@ from number_detection import (
 )
 
 
-class DigitEncoding(StrEnum):
-    """Encoding scheme for next-digit features in DigitComputeComponent."""
+class DiscreteEncoding(StrEnum):
+    """Encoding scheme for small sets of discrete states."""
 
-    ONEHOT = "onehot"  # 12-dim one-hot over {0-9, '.', END}
-    ROTATION = "rotation"  # 2-dim unit vector on circle (360°/12 spacing)
+    ONEHOT = "onehot"  # N-dim, sparse, orthogonal
+    BINARY = "binary"  # ceil(log2(N))-dim {-1,+1} vectors (max separation)
+    ROTATION = "rotation"  # 2-dim unit vector on circle (graded similarity)
 
 
 class HashBoundary(StrEnum):
@@ -44,16 +45,27 @@ class HashBoundary(StrEnum):
 
 
 class ByteCategoryComponent(nn.Module):
-    """Byte category (8 classes) as fixed sin/cos embedding stream component.
+    """Byte category (8 classes) as fixed embedding stream component.
 
     Categories: BOS, PAD, DIGIT, LETTER, SEPARATOR, PUNCTUATION, SYMBOL, MULTIBYTE.
 
-    Uses a deterministic sin/cos encoding so category embeddings are distinct
-    and reproducible without any learnable parameters.
+    Encoding options:
+        ``ROTATION`` (default): 2-dim unit vectors on a circle — compact.
+        ``BINARY``: 3-dim {-1,+1} vectors — maximally separated,
+            no implied ordering.
+
+    Args:
+        tok: byte tokenizer for byte value lookup.
+        encoding: discrete encoding scheme (default ``BINARY``).
     """
 
-    def __init__(self, tok: EfficientByteTokenizer, embed_dim: int = 4):
+    def __init__(
+        self,
+        tok: EfficientByteTokenizer,
+        encoding: DiscreteEncoding = DiscreteEncoding.ROTATION,
+    ):
         super().__init__()
+        self._encoding = DiscreteEncoding(encoding)
         V = tok.vocab_size
         token_to_cat = torch.zeros(V, dtype=torch.long)
         for ci, cat in enumerate(BYTE_CATEGORY_DEFS):
@@ -62,8 +74,20 @@ class ByteCategoryComponent(nn.Module):
                 if mask[tid]:
                     token_to_cat[tid] = ci
         self.register_buffer("token_to_cat", token_to_cat)
-        self.register_buffer("embed", binary_embedding(NUM_BYTE_CATEGORIES, embed_dim))
-        self._dim = embed_dim
+
+        if self._encoding == DiscreteEncoding.BINARY:
+            self._dim = 3
+            self.register_buffer(
+                "embed",
+                binary_embedding(NUM_BYTE_CATEGORIES, self._dim),
+            )
+        elif self._encoding == DiscreteEncoding.ROTATION:
+            self._rotation_codebook = RotationCodebook(NUM_BYTE_CATEGORIES)
+            self._dim = 2
+        else:
+            raise ValueError(
+                f"ByteCategoryComponent does not support encoding={encoding!r}"
+            )
 
     @property
     def dim(self) -> int:
@@ -71,6 +95,8 @@ class ByteCategoryComponent(nn.Module):
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         cat_ids = self.token_to_cat[input_ids]  # (B, S), per-token lookup
+        if self._encoding == DiscreteEncoding.ROTATION:
+            return self._rotation_codebook.encode(cat_ids).to(dtype=dtype)
         return self.embed[cat_ids].to(dtype=dtype)
 
 
@@ -971,13 +997,13 @@ class DigitComputeComponent(nn.Module):
         k: int = 2,
         number_words: dict[str, int] | None = None,
         ops: set[PairwiseOp] | None = None,
-        digit_encoding: DigitEncoding = DigitEncoding.ROTATION,
+        digit_encoding: DiscreteEncoding = DiscreteEncoding.ROTATION,
     ):
         super().__init__()
         self.bos_id = tok.bos_id
         self.k = k
         self._num_pairs = k * (k - 1) // 2
-        self._digit_encoding = DigitEncoding(digit_encoding)
+        self._digit_encoding = DiscreteEncoding(digit_encoding)
 
         # Resolve and store selected ops (preserving canonical order)
         selected = frozenset(ops) if ops is not None else frozenset(PairwiseOp)
@@ -992,12 +1018,12 @@ class DigitComputeComponent(nn.Module):
         )
 
         # Per arithmetic op: 1 (sign) + digit encoding dims
-        if self._digit_encoding == DigitEncoding.ONEHOT:
+        if self._digit_encoding == DiscreteEncoding.ONEHOT:
             self._digit_dim = NEXT_DIGIT_VOCAB  # 12
         else:
             self._digit_dim = 2
         self._rotation_codebook: RotationCodebook | None = None
-        if self._digit_encoding == DigitEncoding.ROTATION:
+        if self._digit_encoding == DiscreteEncoding.ROTATION:
             self._rotation_codebook = RotationCodebook(NEXT_DIGIT_VOCAB)
         self._arith_dim = 1 + self._digit_dim
         # Per pair: n_arith arith ops + n_cmp comparisons
@@ -1141,7 +1167,7 @@ class DigitComputeComponent(nn.Module):
                 al_clamped = active_len.clamp(max=MAX_RESULT_DIGITS - 1)
                 next_char = extract_digit_at(result, al_clamped)
 
-                if self._digit_encoding == DigitEncoding.ONEHOT:
+                if self._digit_encoding == DiscreteEncoding.ONEHOT:
                     encoded = F.one_hot(next_char, num_classes=NEXT_DIGIT_VOCAB).to(
                         dtype=dtype
                     )
