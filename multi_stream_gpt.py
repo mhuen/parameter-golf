@@ -516,51 +516,44 @@ class MultiStreamGPT(nn.Module):
         #    STRUCTURAL=components.  compressed/views from NumberExtractor.
         streams, compressed, views = self.builder(input_ids, dtype=dtype)
 
-        # 2. UTF-8 prior: compute once, use twice (capped early + hard at end).
-        token_mask = None
-        if self.utf8_prior is not None:
-            _cat_mask, token_mask = self.utf8_prior(input_ids)
-            token_mask = token_mask.to(dtype=streams[_LOGIT_SID].dtype)
-
-            # Early: capped finite bias so RMSNorm in blocks stays stable.
-            streams[_LOGIT_SID] = streams[_LOGIT_SID] + token_mask.clamp(
-                min=-self.logit_softcap
-            )
-
-        # 3. Bigram prior: trainable logit adjustments.
+        # 2. Bigram prior: trainable logit adjustments.
         #    Applied before blocks so the LOGIT stream starts with a
         #    data-driven prior rather than flat zeros.
         if self.bigram_prior is not None:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] + self.bigram_prior(input_ids)
 
-        # 3b. Scale LOGIT stream down so all streams are at ~unit scale.
-        #     Reversed in step 6 before softcap.
+        # 2b. Scale LOGIT stream down so all streams are at ~unit scale.
+        #     Reversed in step 5 before softcap.
         if self.logit_stream_normalization_factor > 0:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] * (
                 1.0 / self.logit_stream_normalization_factor
             )
 
-        # 3c. Initial normalization to establish the "always normalized" invariant.
+        # 2c. Initial normalization to establish the "always normalized" invariant.
         for s in self._stream_config.streams:
             if s.key in self.init_norms:
                 streams[s.name] = self.init_norms[s.key](streams[s.name])
 
-        # 4. Pre-processing conv layers.
+        # 3. Pre-processing conv layers.
         if self.preconv_layers is not None:
             streams = self.preconv_layers(streams)
 
-        # 5. Attention blocks.
+        # 4. Attention blocks.
         for block in self.blocks:
             streams = block(streams, compressed=compressed, views=views)
 
-        # 6. Extract logits, scale back up, apply softcap.
+        # 5. Extract logits, scale back up, apply softcap.
         logits = streams[_LOGIT_SID] * self.logit_stream_normalization_factor
         if self.logit_softcap > 0:
             logits = softcap_linear(x=logits, cap=self.logit_softcap)
 
-        # 7. UTF-8 prior: hard -inf mask (reuses token_mask from step 2).
-        if token_mask is not None:
-            logits = logits + token_mask
+        # 6. UTF-8 prior: hard -inf mask, inference only.
+        #    Skipped during training to avoid injecting a bimodal
+        #    distribution that destabilises CenterLastDim + the ×factor
+        #    scale-up (see NaN analysis).
+        if self.utf8_prior is not None and not self.training:
+            _cat_mask, token_mask = self.utf8_prior(input_ids)
+            logits = logits + token_mask.to(dtype=logits.dtype)
 
         return logits, streams
 
