@@ -19,6 +19,30 @@ from multi_streams import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Stream normalization helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_stream_norms(streams: list[StreamConfig]) -> nn.ModuleDict:
+    """Create per-stream norm instances for streams that have a norm_type."""
+    return nn.ModuleDict({
+        s.key: s.norm_type() for s in streams if s.norm_type is not None
+    })
+
+
+def _apply_stream_norms(
+    norms: nn.ModuleDict,
+    streams: list[StreamConfig],
+    data: dict[StreamID, Tensor],
+) -> dict[StreamID, Tensor]:
+    """Return dict with norms applied to streams that have them."""
+    return {
+        s.name: norms[s.key](data[s.name]) if s.key in norms else data[s.name]
+        for s in streams
+    }
+
+
 class MixingMode(StrEnum):
     ADDITIVE = "additive"
     GLU = "glu"
@@ -852,9 +876,7 @@ class MultiStreamCausalConvLayers(nn.Module):
 
         self.norms = nn.ModuleList(
             [
-                nn.ModuleDict(
-                    {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
-                )
+                _build_stream_norms(list(stream_config.streams))
                 for _ in range(num_layers)
             ]
         )
@@ -908,15 +930,13 @@ class MultiStreamCausalConvLayers(nn.Module):
         x = dict(input_streams)
         for layer_idx in range(self.num_layers):
             norms = self.norms[layer_idx]
-            normed = {
-                s.name: norms[s.key](x[s.name]) if s.normalize else x[s.name]
-                for s in self.stream_config.streams
-            }
+            normed = _apply_stream_norms(norms, self.stream_config.streams, x)
             conv_out = self.convs[layer_idx](normed)
             for s in self._output_streams:
                 alpha = torch.sigmoid(self.alphas[layer_idx][s.key])
                 beta = torch.sigmoid(self.betas[layer_idx][s.key])
-                x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
+                mixed = beta * normed[s.name] + alpha * conv_out[s.name]
+                x[s.name] = norms[s.key](mixed) if s.key in norms else mixed
         return x
 
 
@@ -1302,13 +1322,10 @@ class MultiStreamBlock(nn.Module):
         super().__init__()
         self.stream_config = stream_config
 
-        # Per-stream norms (weight-free RMSNorm) — only for streams with normalize=True
-        self.attn_norms = nn.ModuleDict(
-            {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
-        )
-        self.mlp_norms = nn.ModuleDict(
-            {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
-        )
+        # Per-stream norms — type determined by stream_config.norm_type
+        all_streams = list(stream_config.streams)
+        self.attn_norms = _build_stream_norms(all_streams)
+        self.mlp_norms = _build_stream_norms(all_streams)
 
         # Attention
         attn_kwargs = dict(
@@ -1379,9 +1396,7 @@ class MultiStreamBlock(nn.Module):
         # Optional causal conv (between attention and MLP, before arith_attn)
         self.conv = conv
         if conv is not None:
-            self.conv_norms = nn.ModuleDict(
-                {s.key: RMSNorm() for s in stream_config.streams if s.normalize}
-            )
+            self.conv_norms = _build_stream_norms(all_streams)
             conv_out_streams = conv.output_streams
             self.conv_alpha = nn.ParameterDict(
                 {
@@ -1399,6 +1414,7 @@ class MultiStreamBlock(nn.Module):
         # Optional arithmetic attention (between attention and MLP)
         self.arith_attn = arith_attn
         if arith_attn is not None:
+            self.arith_norms = _build_stream_norms(all_streams)
             self.arith_alpha = nn.ParameterDict(
                 {
                     s.key: nn.Parameter(torch.full((s.dim,), arith_alpha_init))
@@ -1420,63 +1436,71 @@ class MultiStreamBlock(nn.Module):
         compressed: dict[str, dict[StreamID, Tensor]] | None = None,
         views: dict[str, CompressedView] | None = None,
     ) -> dict[StreamID, Tensor]:
-        # --- Attention sub-layer ---
-        normed = {
-            s.name: self.attn_norms[s.key](input_streams[s.name])
-            if s.normalize
-            else input_streams[s.name]
-            for s in self.stream_config.streams
-        }
+        streams = list(self.stream_config.streams)
+
+        # --- Attention sub-layer: pre-norm → attn → mix → re-norm ---
+        normed = _apply_stream_norms(self.attn_norms, streams, input_streams)
         attn_out = self.attn(normed)
 
         x: dict[StreamID, Tensor] = {}
-        for s in self.stream_config.streams:
+        for s in streams:
             if s.read_only:
                 x[s.name] = input_streams[s.name]
             else:
                 alpha = torch.sigmoid(self.attn_alpha[s.key])
                 beta = torch.sigmoid(self.attn_beta[s.key])
-                x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
+                mixed = beta * normed[s.name] + alpha * attn_out[s.name]
+                x[s.name] = (
+                    self.attn_norms[s.key](mixed) if s.key in self.attn_norms
+                    else mixed
+                )
 
-        # --- Optional causal conv (between attention and MLP) ---
+        # --- Optional causal conv: pre-norm → conv → mix → re-norm ---
         if self.conv is not None:
-            normed = {
-                s.name: self.conv_norms[s.key](x[s.name]) if s.normalize else x[s.name]
-                for s in self.stream_config.streams
-            }
+            normed = _apply_stream_norms(self.conv_norms, streams, x)
             conv_out = self.conv(normed)
-            for s in self.stream_config.streams:
+            for s in streams:
                 if not s.read_only and s.name in conv_out:
                     alpha = torch.sigmoid(self.conv_alpha[s.key])
                     beta = torch.sigmoid(self.conv_beta[s.key])
-                    x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
+                    mixed = beta * normed[s.name] + alpha * conv_out[s.name]
+                    x[s.name] = (
+                        self.conv_norms[s.key](mixed) if s.key in self.conv_norms
+                        else mixed
+                    )
 
-        # --- Optional arithmetic attention (between attention and MLP) ---
+        # --- Optional arithmetic attention: pre-norm → arith → mix → re-norm ---
         if self.arith_attn is not None and compressed is not None and views is not None:
+            normed = _apply_stream_norms(self.arith_norms, streams, x)
             num_compressed = compressed[CompressionType.NUMBER]
             num_view = views[CompressionType.NUMBER]
-            arith_out = self.arith_attn(x, num_compressed, num_view)
-            for s in self.stream_config.streams:
+            arith_out = self.arith_attn(normed, num_compressed, num_view)
+            for s in streams:
                 if not s.read_only and s.name in arith_out:
                     alpha = torch.sigmoid(self.arith_alpha[s.key])
                     beta = torch.sigmoid(self.arith_beta[s.key])
-                    x[s.name] = beta * x[s.name] + alpha * arith_out[s.name]
+                    mixed = beta * normed[s.name] + alpha * arith_out[s.name]
+                    x[s.name] = (
+                        self.arith_norms[s.key](mixed) if s.key in self.arith_norms
+                        else mixed
+                    )
 
-        # --- MLP sub-layer ---
-        normed = {
-            s.name: self.mlp_norms[s.key](x[s.name]) if s.normalize else x[s.name]
-            for s in self.stream_config.streams
-        }
+        # --- MLP sub-layer: pre-norm → mlp → mix → re-norm ---
+        normed = _apply_stream_norms(self.mlp_norms, streams, x)
         mlp_out = self.mlp(normed)
 
         output: dict[StreamID, Tensor] = {}
-        for s in self.stream_config.streams:
+        for s in streams:
             if s.read_only:
                 output[s.name] = x[s.name]
             elif s.name in mlp_out:
                 alpha = torch.sigmoid(self.mlp_alpha[s.key])
                 beta = torch.sigmoid(self.mlp_beta[s.key])
-                output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
+                mixed = beta * normed[s.name] + alpha * mlp_out[s.name]
+                output[s.name] = (
+                    self.mlp_norms[s.key](mixed) if s.key in self.mlp_norms
+                    else mixed
+                )
             else:
                 output[s.name] = x[s.name]
 

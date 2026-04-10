@@ -40,7 +40,7 @@ from multi_stream_attention import (
     MultiStreamCausalConvLayers,
     StreamMixingConfig,
 )
-from modules import softcap_linear
+from modules import softcap_linear, RMSNorm, CenterLastDim
 from multi_streams import (
     CompressionType,
     DocBoundaryComponent,
@@ -154,20 +154,23 @@ def build_multi_stream_components(
 
     stream_defs = [
         StreamDef(
-            logit_id, read_only=False, normalize=False, dim=vocab_size, auto_zeros=True
+            logit_id,
+            read_only=False,
+            norm_type=CenterLastDim,
+            dim=vocab_size,
+            auto_zeros=True,
         ),
-        StreamDef(tokens_id, read_only=True, normalize=False, auto_onehot=True),
+        StreamDef(tokens_id, read_only=True, auto_onehot=True),
         StreamDef(
             context_id,
             read_only=False,
-            normalize=True,
+            norm_type=RMSNorm,
             dim=context_dim,
             auto_zeros=True,
         ),
         StreamDef(
             structural_id,
             read_only=True,
-            normalize=False,
             components=structural_components,
         ),
     ]
@@ -348,6 +351,15 @@ class MultiStreamGPT(nn.Module):
         self.num_layers = num_layers
 
         stream_config = components.stream_config
+        self._stream_config = stream_config
+
+        # Initial norms to establish the "always normalized" invariant
+        # before streams enter the first block.
+        self.init_norms = nn.ModuleDict({
+            s.key: s.norm_type()
+            for s in stream_config.streams
+            if s.norm_type is not None and not s.read_only
+        })
         vocab_size = components.vocab_size
 
         # -- Broadcast per-layer params --
@@ -525,6 +537,11 @@ class MultiStreamGPT(nn.Module):
             streams[_LOGIT_SID] = streams[_LOGIT_SID] * (
                 1.0 / self.logit_stream_normalization_factor
             )
+
+        # 3c. Initial normalization to establish the "always normalized" invariant.
+        for s in self._stream_config.streams:
+            if s.key in self.init_norms:
+                streams[s.name] = self.init_norms[s.key](streams[s.name])
 
         # 4. Pre-processing conv layers.
         if self.preconv_layers is not None:

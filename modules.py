@@ -21,6 +21,17 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class CenterLastDim(nn.Module):
+    """Subtract per-position mean from the last dimension.
+
+    softmax(x) == softmax(x - mean(x)), so this is lossless for
+    cross-entropy but prevents mean drift in the logit stream.
+    """
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x - x.mean(dim=-1, keepdim=True)
+
+
 class CastedLinear(nn.Linear):
     """Linear layer that casts weights to input dtype at forward time."""
 
