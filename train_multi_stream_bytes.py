@@ -846,6 +846,32 @@ def main():
             f"min={bl.min():.3f} max={bl.max():.3f}"
         )
 
+    # --- Calibrate structural stream standardization ---
+    structural = base_model.builder.composites.get("structural")
+    if structural is not None:
+        calib_files = sorted(glob.glob(args.train_files))[:1]
+        if calib_files:
+            calib_shard = load_data_shard(Path(calib_files[0]))
+            calib_tokens = remap_shard_tokens(calib_shard, tok)
+            # Reshape into batches of (batch_size, seq_len)
+            calib_seq_len = args.train_seq_len
+            calib_batch_size = 16
+            calib_total = calib_tokens.numel() // calib_seq_len
+            calib_total = min(calib_total, calib_batch_size * 20)
+            calib_flat = calib_tokens[: calib_total * calib_seq_len].reshape(
+                -1, calib_seq_len
+            )
+            calib_batches = list(calib_flat.split(calib_batch_size))
+            structural.calibrate(calib_batches)
+            n_std = sum(
+                int(m) for c in structural.components for m in c.standardizable_mask
+            )
+            log0(
+                f"structural_calibration: {n_std}/{structural.dim} dims calibrated "
+                f"from {calib_flat.shape[0]} sequences"
+            )
+            del calib_shard, calib_tokens, calib_flat, calib_batches
+
     # --- Sanity-check: prior-only BPB ---
     uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb = eval_prior_bpb(
         args,

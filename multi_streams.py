@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from modules import sincos_encode
+from modules import StreamComponent, sincos_encode
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ CompressionFn = Callable[[Tensor], CompressedView]
 # ---------------------------------------------------------------------------
 
 
-class SinCosPositionComponent(nn.Module):
+class SinCosPositionComponent(StreamComponent):
     """Absolute position sin/cos encoding as a stream component.
 
     No learnable params. Equivalent to the positional information RoPE provides,
@@ -145,19 +145,20 @@ class SinCosPositionComponent(nn.Module):
         self.num_freqs = num_freqs
         self.base = base
         self._dim = num_freqs * 2
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         positions = torch.arange(S, device=input_ids.device)
         enc = sincos_encode(positions, self.num_freqs, self.base)  # (S, dim)
         return enc.unsqueeze(0).expand(B, -1, -1).to(dtype=dtype)
 
 
-class DocBoundaryComponent(nn.Module):
+class DocBoundaryComponent(StreamComponent):
     """Document boundary (BOS cumsum) encoded as sin/cos.
 
     Causal: uses cumsum over BOS markers (only depends on positions ≤ t).
@@ -170,12 +171,13 @@ class DocBoundaryComponent(nn.Module):
         self.num_freqs = num_freqs
         self.base = base
         self._dim = num_freqs * 2
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         doc_ids = (input_ids == self.bos_id).cumsum(dim=1)  # (B, S), causal
         return sincos_encode(doc_ids, self.num_freqs, self.base).to(dtype=dtype)
 
@@ -183,23 +185,44 @@ class DocBoundaryComponent(nn.Module):
 class CompositeStream(nn.Module):
     """Concatenates stream components into a single read-only stream.
 
-    Each component must implement:
-      .dim -> int
-      .forward(input_ids: Tensor, dtype: torch.dtype) -> Tensor  # (B, S, component_dim)
+    Each component must be a :class:`StreamComponent` subclass with
+    ``.dim``, ``.compute()``, and ``.standardizable_mask``.
+
+    At runtime, ``forward()`` calls each component's ``compute()`` (raw
+    output), concatenates, and applies a single fused affine transform
+    (one multiply-add on the full concatenated tensor).  The affine
+    coefficients are identity until :meth:`calibrate` is called.
     """
 
-    def __init__(self, components: list[nn.Module]):
+    def __init__(self, components: list[StreamComponent]):
         super().__init__()
         self.components = nn.ModuleList(components)
         self._dim = sum(c.dim for c in components)
+        # Combined standardization buffers (identity until calibrated)
+        self.register_buffer("_scale", torch.ones(self._dim))
+        self.register_buffer("_shift", torch.zeros(self._dim))
 
     @property
     def dim(self) -> int:
         return self._dim
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        parts = [c(input_ids, dtype) for c in self.components]
-        return torch.cat(parts, dim=-1)
+        parts = [c.compute(input_ids, dtype) for c in self.components]
+        x = torch.cat(parts, dim=-1)
+        return (x * self._scale + self._shift).to(dtype=dtype)
+
+    @torch.no_grad()
+    def calibrate(self, input_ids_batches: list[Tensor]) -> None:
+        """Calibrate all components, then collect into combined buffers."""
+        for c in self.components:
+            c.calibrate(input_ids_batches)
+        # Collect per-component scale/shift into combined buffers
+        offset = 0
+        for c in self.components:
+            d = c.dim
+            self._scale[offset : offset + d] = c._std_scale
+            self._shift[offset : offset + d] = c._std_shift
+            offset += d
 
 
 # ---------------------------------------------------------------------------

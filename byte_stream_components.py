@@ -9,7 +9,13 @@ from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
-from modules import binary_embedding, ContinuousRotation, RotationCodebook, sincos_encode
+from modules import (
+    StreamComponent,
+    binary_embedding,
+    ContinuousRotation,
+    RotationCodebook,
+    sincos_encode,
+)
 from byte_modules import (
     BYTE_CATEGORY_DEFS,
     NUM_BYTE_CATEGORIES,
@@ -44,7 +50,7 @@ class HashBoundary(StrEnum):
 # ---------------------------------------------------------------------------
 
 
-class ByteCategoryComponent(nn.Module):
+class ByteCategoryComponent(StreamComponent):
     """Byte category (8 classes) as fixed embedding stream component.
 
     Categories: BOS, PAD, DIGIT, LETTER, SEPARATOR, PUNCTUATION, SYMBOL, MULTIBYTE.
@@ -88,19 +94,20 @@ class ByteCategoryComponent(nn.Module):
             raise ValueError(
                 f"ByteCategoryComponent does not support encoding={encoding!r}"
             )
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         cat_ids = self.token_to_cat[input_ids]  # (B, S), per-token lookup
         if self._encoding == DiscreteEncoding.ROTATION:
             return self._rotation_codebook.encode(cat_ids).to(dtype=dtype)
         return self.embed[cat_ids].to(dtype=dtype)
 
 
-class BoundaryComponent(nn.Module):
+class BoundaryComponent(StreamComponent):
     """Word/sentence/paragraph boundary features as sin/cos stream component.
 
     Encodes both position-within-segment (distance from last boundary, via
@@ -159,12 +166,13 @@ class BoundaryComponent(nn.Module):
             + self.para_pos_freqs
             + self.para_id_freqs
         )
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         device = input_ids.device
         reset_mask = input_ids == self.bos_id
@@ -212,7 +220,7 @@ class BoundaryComponent(nn.Module):
         return torch.cat(parts, dim=-1).to(dtype=dtype)
 
 
-class MultiByteStateComponent(nn.Module):
+class MultiByteStateComponent(StreamComponent):
     """UTF-8 multibyte state as raw features + codepoint ID sin/cos (no learnable params).
 
     Raw features (2 dims):
@@ -274,12 +282,17 @@ class MultiByteStateComponent(nn.Module):
         lead_expected[self.BT_LEAD_3] = 2
         lead_expected[self.BT_LEAD_4] = 3
         self.register_buffer("lead_expected", lead_expected)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 2 + self.id_freqs * 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True, True) + (False,) * (self.id_freqs * 2)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         device = input_ids.device
 
@@ -383,7 +396,7 @@ def _run_length(cat_ids: Tensor) -> Tensor:
     return (positions - last_change).float().log1p()
 
 
-class CaseComponent(nn.Module):
+class CaseComponent(StreamComponent):
     """Letter case state + consecutive same-case run length. 2 dims, 0 params.
 
     Dim 0 (case_state): +1=uppercase, -1=lowercase, 0=non-letter.
@@ -405,19 +418,24 @@ class CaseComponent(nn.Module):
             elif lower_mask[tid]:
                 token_case[tid] = 2
         self.register_buffer("token_case", token_case)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True, True)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         case_type = self.token_case[input_ids]  # (B, S), 0/1/2
         state = torch.where(case_type == 1, 1.0, torch.where(case_type == 2, -1.0, 0.0))
         run_len = _run_length(case_type)
         return torch.stack([state, run_len], dim=-1).to(dtype=dtype)
 
 
-class VowelConsonantComponent(nn.Module):
+class VowelConsonantComponent(StreamComponent):
     """Vowel/consonant state + consecutive run length. 2 dims, 0 params.
 
     Dim 0 (vc_state): +1=vowel, -1=consonant, 0=non-letter.
@@ -439,19 +457,24 @@ class VowelConsonantComponent(nn.Module):
             elif consonant_mask[tid]:
                 token_vc[tid] = 2
         self.register_buffer("token_vc", token_vc)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True, True)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         vc_type = self.token_vc[input_ids]  # (B, S), 0/1/2
         state = torch.where(vc_type == 1, 1.0, torch.where(vc_type == 2, -1.0, 0.0))
         run_len = _run_length(vc_type)
         return torch.stack([state, run_len], dim=-1).to(dtype=dtype)
 
 
-class ColumnPositionComponent(nn.Module):
+class ColumnPositionComponent(StreamComponent):
     """Position since last newline (column number), sin/cos encoded. 0 params.
 
     Useful for indentation-sensitive content (code, lists, tables, markdown).
@@ -472,12 +495,13 @@ class ColumnPositionComponent(nn.Module):
             if info is not None and info.byte_value == 0x0A:
                 is_newline[tid] = 1
         self.register_buffer("is_newline", is_newline)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self.num_freqs * 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
         is_nl = self.is_newline[input_ids].bool() | (input_ids == self.bos_id)
@@ -490,7 +514,7 @@ class ColumnPositionComponent(nn.Module):
         return sincos_encode(col_pos, self.num_freqs, self.base).to(dtype=dtype)
 
 
-class DigitSequenceComponent(nn.Module):
+class DigitSequenceComponent(StreamComponent):
     """Digit run state + number ID. 0 params.
 
     Dim 0 (in_digit): +1=digit, -1=non-digit.
@@ -517,12 +541,17 @@ class DigitSequenceComponent(nn.Module):
                 is_digit[tid] = 1
         self.register_buffer("is_digit", is_digit)
         self._pos_codebook = RotationCodebook(MAX_RESULT_DIGITS + 1)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 3 + self.id_freqs * 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True, False, False) + (False,) * (self.id_freqs * 2)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         is_dig = self.is_digit[input_ids].bool()  # (B, S)
 
@@ -558,7 +587,7 @@ class DigitSequenceComponent(nn.Module):
         return torch.cat(parts, dim=-1).to(dtype=dtype)
 
 
-class RepeatedByteComponent(nn.Module):
+class RepeatedByteComponent(StreamComponent):
     """Repeated byte detection + log1p-compressed run length. 2 dims, 0 params.
 
     Dim 0 (is_repeat): +1=same as previous byte, -1=different (or position 0).
@@ -567,17 +596,25 @@ class RepeatedByteComponent(nn.Module):
     Causal: compares adjacent positions only.
     """
 
+    def __init__(self):
+        super().__init__()
+        self._register_standardization()
+
     @property
     def dim(self) -> int:
         return 2
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True, True)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         run_len = _run_length(input_ids)  # log1p-compressed
         is_repeat = torch.where(run_len > 0, 1.0, -1.0)
         return torch.stack([is_repeat, run_len], dim=-1).to(dtype=dtype)
 
 
-class PunctuationDepthComponent(nn.Module):
+class PunctuationDepthComponent(StreamComponent):
     """Bracket nesting depth + quote parity. 3 dims, 0 params.
 
     Dims 0-1 (bracket_depth): 2D rotation-encoded nesting depth via
@@ -620,12 +657,17 @@ class PunctuationDepthComponent(nn.Module):
         self.register_buffer("is_open", is_open)
         self.register_buffer("is_close", is_close)
         self.register_buffer("is_quote", is_quote)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 3
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (False, False, True)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         reset_mask = input_ids == self.bos_id
         opens = _segmented_cumsum(self.is_open[input_ids], reset_mask)
         closes = _segmented_cumsum(self.is_close[input_ids], reset_mask)
@@ -648,7 +690,7 @@ _STATS_CATEGORIES = [
 ]
 
 
-class ByteCategoryStatsComponent(nn.Module):
+class ByteCategoryStatsComponent(StreamComponent):
     """Running fraction of each byte category seen so far. 6 dims, 0 params.
 
     At position t, output[c] = count(category c in positions 0..t) / (t + 1).
@@ -674,12 +716,17 @@ class ByteCategoryStatsComponent(nn.Module):
                 if mask[tid]:
                     token_to_cat_oh[tid, ci] = 1.0
         self.register_buffer("token_to_cat_oh", token_to_cat_oh)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self.NUM_STATS_CATS
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (True,) * self.NUM_STATS_CATS
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         reset_mask = input_ids == self.bos_id
         cat_oh = self.token_to_cat_oh[input_ids]  # (B, S, 6)
@@ -691,7 +738,7 @@ class ByteCategoryStatsComponent(nn.Module):
         return fractions.to(dtype=dtype)
 
 
-class ByteHashComponent(nn.Module):
+class ByteHashComponent(StreamComponent):
     """Rolling polynomial hash of byte sequences. 0 learnable params.
 
     Computes independent hash functions over bytes within the current segment
@@ -789,10 +836,17 @@ class ByteHashComponent(nn.Module):
                         is_lead[tid] = True
             self.register_buffer("is_multibyte", is_mb)
             self.register_buffer("is_lead_byte", is_lead)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return 2 * self.num_hashes + (2 if self.track_hits else 0)
+
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        return (False,) * (2 * self.num_hashes) + (
+            (True, True) if self.track_hits else ()
+        )
 
     def _effective_lookback(self, input_ids: Tensor) -> Tensor:
         """Per-position lookback depth. -1 means inactive (hash = 0).
@@ -852,7 +906,7 @@ class ByteHashComponent(nn.Module):
 
         raise ValueError(f"Unknown boundary: {self.boundary!r}")
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         B, S = input_ids.shape
         device = input_ids.device
         P = self.MODULUS
@@ -967,7 +1021,7 @@ _PAIRWISE_ARITH_OPS = frozenset(
 _PAIRWISE_CMP_OPS = frozenset({PairwiseOp.GT, PairwiseOp.EQ, PairwiseOp.LT})
 
 
-class DigitComputeComponent(nn.Module):
+class DigitComputeComponent(StreamComponent):
     """Pairwise arithmetic features from recent numbers in the byte stream.
 
     Detects numbers in two forms:
@@ -1079,13 +1133,23 @@ class DigitComputeComponent(nn.Module):
             vals = torch.tensor([_v for _p, _v in group], dtype=torch.long)
             self.register_buffer(f"_word_pat_{wl}", pats)
             self.register_buffer(f"_word_val_{wl}", vals)
+        self._register_standardization()
 
     @property
     def dim(self) -> int:
         return self._dim
 
-    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        """Vectorized forward — no .item(), torch.compile(fullgraph=True) safe."""
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        pair_mask: list[bool] = []
+        for _ in self._arith_ops:
+            pair_mask.append(True)  # sign (ternary)
+            pair_mask.extend([False] * self._digit_dim)  # rotation/onehot
+        pair_mask.extend([True] * len(self._cmp_ops))  # comparisons
+        return tuple(pair_mask * self._num_pairs)
+
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        """Vectorized compute — no .item(), torch.compile(fullgraph=True) safe."""
         B, S = input_ids.shape
         device = input_ids.device
         k = self.k

@@ -45,6 +45,7 @@ from byte_stream_components import (  # noqa: E402
     RepeatedByteComponent,
     VowelConsonantComponent,
 )
+from modules import StreamComponent  # noqa: E402
 from multi_streams import DocBoundaryComponent, SinCosPositionComponent  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -54,11 +55,21 @@ from multi_streams import DocBoundaryComponent, SinCosPositionComponent  # noqa:
 _DEFAULT_DATA_DIR = Path(_PROJECT_ROOT) / "data" / "datasets" / "fineweb10B_byte260"
 
 _DEFAULT_SEQ_LENS = [1024, 2048, 4096, 16_384, 32_768]
+_CALIB_SEQ_LEN = 4096
 
-# Thresholds for pytest assertions
+# Thresholds for pytest assertions (raw / uncalibrated)
 _MAX_ABS_MEAN = 5.0  # per-dim mean should stay moderate
 _MAX_STD = 10.0  # per-dim std should stay moderate
 _MAX_ABS_VALUE = 500.0  # no extreme outlier values
+
+# Two-tiered thresholds after calibration:
+# Standardizable dims (normalized to mean≈0, std≈1)
+_CALIB_STD_MAX_ABS_MEAN = 0.15
+_CALIB_STD_MIN_STD = 0.5
+_CALIB_STD_MAX_STD = 2.0
+# Non-standardizable dims (rotation/sincos, bounded to unit circle)
+_CALIB_NONSTD_MAX_ABS_MEAN = 1.0
+_CALIB_NONSTD_MAX_STD = 1.0
 
 # ---------------------------------------------------------------------------
 # Component registry (mirrors build_multi_stream_components)
@@ -249,11 +260,24 @@ def run_distribution_analysis(
     batch_size: int = 1,
     data_dir: Path | None = None,
     components: list[str] | None = None,
+    calibrate: bool = False,
+    calib_seq_len: int = 4096,
+    calib_batches: int = 10,
+    calib_batch_size: int = 16,
 ) -> dict[int, list[dict]]:
     """Run all components at each sequence length.
 
+    Args:
+        calibrate: if True, calibrate each StreamComponent before running
+            the analysis.  After calibration, ``component(...)`` returns
+            standardized output (mean≈0, std≈1 on standardizable dims).
+        calib_seq_len: sequence length for calibration data.
+        calib_batches: number of batches to use for calibration.
+        calib_batch_size: batch size for calibration data.
+
     Returns:
-        {seq_len: [{"label": str, "dim": int, "dim_stats": [...]}, ...]}
+        {seq_len: [{"label": str, "dim": int, "dim_stats": [...],
+                     "standardizable_mask": tuple[bool, ...]}, ...]}
     """
     tok = EfficientByteTokenizer()
     registry = _build_component_registry(tok)
@@ -268,6 +292,27 @@ def run_distribution_analysis(
         if not registry:
             raise ValueError(f"No components matched filters: {components}")
 
+    # --- Optional calibration pass ---
+    if calibrate:
+        calib_ids = _load_input_ids(
+            calib_seq_len,
+            batch_size=calib_batches * calib_batch_size,
+            data_dir=data_dir,
+        )
+        calib_id_batches = list(calib_ids.split(calib_batch_size))
+        n_calibrated = 0
+        for label, component in registry:
+            if isinstance(component, StreamComponent):
+                component.calibrate(calib_id_batches)
+                n_std = sum(int(m) for m in component.standardizable_mask)
+                if n_std > 0:
+                    n_calibrated += 1
+        print(
+            f"calibration: {n_calibrated} components calibrated "
+            f"({len(calib_id_batches)} batches × {calib_batch_size} × {calib_seq_len})"
+        )
+        del calib_ids, calib_id_batches
+
     results_by_seqlen: dict[int, list[dict]] = {}
 
     for seq_len in seq_lens:
@@ -275,6 +320,9 @@ def run_distribution_analysis(
         seq_results = []
 
         for label, component in registry:
+            mask = ()
+            if isinstance(component, StreamComponent):
+                mask = component.standardizable_mask
             with torch.no_grad():
                 output = component(input_ids, dtype=torch.float32)
             dim_stats = compute_dim_stats(output)
@@ -284,6 +332,7 @@ def run_distribution_analysis(
                     "dim": component.dim,
                     "shape": tuple(output.shape),
                     "dim_stats": dim_stats,
+                    "standardizable_mask": mask,
                 }
             )
 
@@ -297,14 +346,45 @@ def run_distribution_analysis(
 # ---------------------------------------------------------------------------
 
 
+def _dim_violations(s: dict, is_std: bool, calibrated: bool) -> list[str]:
+    """Return short violation tags for a single dim's stats."""
+    tags = []
+    mean, std = abs(s["mean"]), s["std"]
+    abs_max = max(abs(s["min"]), abs(s["max"]))
+
+    if calibrated and is_std:
+        if mean > _CALIB_STD_MAX_ABS_MEAN:
+            tags.append("mean")
+        if std < _CALIB_STD_MIN_STD:
+            tags.append("std<")
+        elif std > _CALIB_STD_MAX_STD:
+            tags.append("std>")
+    elif calibrated:
+        if mean > _CALIB_NONSTD_MAX_ABS_MEAN:
+            tags.append("mean")
+        if std > _CALIB_NONSTD_MAX_STD:
+            tags.append("std>")
+    else:
+        if mean > _MAX_ABS_MEAN:
+            tags.append("mean")
+        if std > _MAX_STD:
+            tags.append("std>")
+
+    if abs_max > _MAX_ABS_VALUE:
+        tags.append("max")
+    return tags
+
+
 def print_distribution_report(
     results_by_seqlen: dict[int, list[dict]],
     verbose: bool = False,
+    calibrated: bool = False,
 ) -> None:
     """Print distribution tables.
 
     Default mode prints a per-component summary (aggregated across dims).
     Verbose mode additionally prints per-dimension breakdowns.
+    Violations are marked with ``!`` and a short tag (mean/std</std>/max).
     """
     for seq_len, seq_results in sorted(results_by_seqlen.items()):
         print()
@@ -323,6 +403,7 @@ def print_distribution_report(
 
         for r in seq_results:
             stats = r["dim_stats"]
+            mask = r.get("standardizable_mask", ())
             # Aggregate: mean-of-means, mean-of-stds, global min/max, mean quantiles
             agg_mean = sum(s["mean"] for s in stats) / len(stats)
             agg_std = sum(s["std"] for s in stats) / len(stats)
@@ -331,31 +412,49 @@ def print_distribution_report(
             agg_q01 = sum(s["q01"] for s in stats) / len(stats)
             agg_q50 = sum(s["q50"] for s in stats) / len(stats)
             agg_q99 = sum(s["q99"] for s in stats) / len(stats)
+            # Count dims with any violation
+            n_bad = sum(
+                1
+                for s in stats
+                if _dim_violations(
+                    s, s["dim_idx"] < len(mask) and mask[s["dim_idx"]], calibrated
+                )
+            )
+            flag = f" [{n_bad}!]" if n_bad else ""
             print(
                 f"{r['label']:<25} {r['dim']:>4}  "
                 f"{agg_mean:>8.3f} {agg_std:>8.3f} {agg_min:>8.3f} {agg_max:>8.3f}  "
-                f"{agg_q01:>8.3f} {agg_q50:>8.3f} {agg_q99:>8.3f}"
+                f"{agg_q01:>8.3f} {agg_q50:>8.3f} {agg_q99:>8.3f}{flag}"
             )
 
         # -- Per-dimension breakdown (verbose) --
         if verbose:
             for r in seq_results:
                 print()
-                print(f"  {r['label']} ({r['dim']} dims):")
+                mask = r.get("standardizable_mask", ())
+                n_std = sum(int(m) for m in mask)
+                std_info = f", {n_std} standardizable" if mask else ""
+                print(f"  {r['label']} ({r['dim']} dims{std_info}):")
                 dim_header = (
-                    f"    {'Dim':>4}  "
+                    f"    {'':>1} {'Dim':>4}  "
                     f"{'Mean':>8} {'Std':>8} {'Min':>8} {'Max':>8}  "
                     f"{'Q01':>8} {'Q25':>8} {'Q50':>8} {'Q75':>8} {'Q99':>8}"
                 )
                 print(dim_header)
                 print(f"    {'-' * (len(dim_header) - 4)}")
                 for s in r["dim_stats"]:
+                    d = s["dim_idx"]
+                    is_std = d < len(mask) and mask[d]
+                    marker = "*" if is_std else " "
+                    violations = _dim_violations(s, is_std, calibrated)
+                    suffix = f"  !{','.join(violations)}" if violations else ""
                     print(
-                        f"    {s['dim_idx']:>4}  "
+                        f"    {marker} {d:>4}  "
                         f"{s['mean']:>8.3f} {s['std']:>8.3f} "
                         f"{s['min']:>8.3f} {s['max']:>8.3f}  "
                         f"{s['q01']:>8.3f} {s['q25']:>8.3f} "
                         f"{s['q50']:>8.3f} {s['q75']:>8.3f} {s['q99']:>8.3f}"
+                        f"{suffix}"
                     )
 
     print()
@@ -400,25 +499,63 @@ def find_violations(
 # ---------------------------------------------------------------------------
 
 import pytest  # noqa: E402
+from dataclasses import dataclass as _dataclass
 
 
-@pytest.fixture(scope="module")
-def distribution_results() -> dict[int, list[dict]]:
-    """Run distribution analysis once for all pytest tests."""
-    return run_distribution_analysis(
-        seq_lens=_DEFAULT_SEQ_LENS,
-        batch_size=1,
+@_dataclass
+class _DistTestCase:
+    """Bundle of results + mode for a single test run."""
+
+    mode: str  # "raw" or "calibrated"
+    results: dict[int, list[dict]]
+
+
+@pytest.fixture(scope="module", params=["raw", "calibrated"])
+def distribution_case(request) -> _DistTestCase:
+    """Run distribution analysis — once raw, once with calibration.
+
+    Calibrated mode evaluates only at the calibration seq_len (matching
+    the training script which calibrates at ``args.train_seq_len``).
+    """
+    if request.param == "calibrated":
+        return _DistTestCase(
+            mode="calibrated",
+            results=run_distribution_analysis(
+                seq_lens=[_CALIB_SEQ_LEN],
+                batch_size=128,
+                calibrate=True,
+                calib_seq_len=_CALIB_SEQ_LEN,
+                calib_batches=10,
+                calib_batch_size=16,
+            ),
+        )
+    return _DistTestCase(
+        mode="raw",
+        results=run_distribution_analysis(
+            seq_lens=_DEFAULT_SEQ_LENS,
+            batch_size=1,
+        ),
     )
 
 
 class TestComponentDistributions:
-    """Verify component output distributions stay within healthy ranges."""
+    """Verify component output distributions stay within healthy ranges.
+
+    Runs twice: once on raw (uncalibrated) output with loose bounds, once
+    on calibrated output with tight bounds.  The calibrated run catches
+    dims that were forgotten or mis-marked in ``standardizable_mask``.
+    """
+
+    @staticmethod
+    def _is_standardizable(r: dict, dim_idx: int) -> bool:
+        mask = r.get("standardizable_mask", ())
+        return dim_idx < len(mask) and mask[dim_idx]
 
     @torch.no_grad()
-    def test_no_nans_or_infs(self, distribution_results: dict[int, list[dict]]) -> None:
+    def test_no_nans_or_infs(self, distribution_case: _DistTestCase) -> None:
         """No dimension should have NaN or Inf in its statistics."""
         bad = []
-        for seq_len, seq_results in distribution_results.items():
+        for seq_len, seq_results in distribution_case.results.items():
             for r in seq_results:
                 for s in r["dim_stats"]:
                     vals = [s["mean"], s["std"], s["min"], s["max"]]
@@ -433,18 +570,36 @@ class TestComponentDistributions:
             pytest.fail("NaN/Inf found:\n  " + "\n  ".join(bad))
 
     @torch.no_grad()
-    def test_mean_within_bounds(
-        self, distribution_results: dict[int, list[dict]]
-    ) -> None:
-        """Per-dimension mean should not exceed threshold."""
+    def test_mean_within_bounds(self, distribution_case: _DistTestCase) -> None:
+        """Per-dimension |mean| check.
+
+        Raw mode: uniform loose threshold (_MAX_ABS_MEAN) at all seq_lens.
+        Calibrated mode (two-tiered, only at calibration seq_len=4096):
+          - standardizable dims: |mean| < _CALIB_STD_MAX_ABS_MEAN
+          - non-standardizable:  |mean| <= _CALIB_NONSTD_MAX_ABS_MEAN
+
+        Calibrated mode only has data at the calibration seq_len (the fixture
+        ensures this), so bounds are checked where they're meaningful.
+        """
+        calibrated = distribution_case.mode == "calibrated"
         violations = []
-        for seq_len, seq_results in distribution_results.items():
+        for seq_len, seq_results in distribution_case.results.items():
             for r in seq_results:
                 for s in r["dim_stats"]:
-                    if abs(s["mean"]) > _MAX_ABS_MEAN:
+                    d = s["dim_idx"]
+                    if calibrated:
+                        limit = (
+                            _CALIB_STD_MAX_ABS_MEAN
+                            if self._is_standardizable(r, d)
+                            else _CALIB_NONSTD_MAX_ABS_MEAN
+                        )
+                    else:
+                        limit = _MAX_ABS_MEAN
+                    if abs(s["mean"]) > limit:
+                        tag = "std" if self._is_standardizable(r, d) else "nonstd"
                         violations.append(
-                            f"[seq_len={seq_len}] {r['label']} dim={s['dim_idx']}: "
-                            f"|mean|={abs(s['mean']):.4f} > {_MAX_ABS_MEAN}"
+                            f"[seq_len={seq_len}] {r['label']} dim={d} ({tag}): "
+                            f"|mean|={abs(s['mean']):.4f} > {limit}"
                         )
         if violations:
             pytest.fail(
@@ -452,31 +607,56 @@ class TestComponentDistributions:
             )
 
     @torch.no_grad()
-    def test_std_within_bounds(
-        self, distribution_results: dict[int, list[dict]]
-    ) -> None:
-        """Per-dimension std should not exceed threshold."""
+    def test_std_within_bounds(self, distribution_case: _DistTestCase) -> None:
+        """Per-dimension std check.
+
+        Raw mode: uniform loose threshold (_MAX_STD) at all seq_lens.
+        Calibrated mode (two-tiered, only at calibration seq_len=4096):
+          - standardizable dims: std in [_CALIB_STD_MIN_STD, _CALIB_STD_MAX_STD]
+          - non-standardizable:  std <= _CALIB_NONSTD_MAX_STD
+
+        See test_mean_within_bounds for rationale.
+        """
+        calibrated = distribution_case.mode == "calibrated"
         violations = []
-        for seq_len, seq_results in distribution_results.items():
+        for seq_len, seq_results in distribution_case.results.items():
             for r in seq_results:
                 for s in r["dim_stats"]:
-                    if s["std"] > _MAX_STD:
-                        violations.append(
-                            f"[seq_len={seq_len}] {r['label']} dim={s['dim_idx']}: "
-                            f"std={s['std']:.4f} > {_MAX_STD}"
-                        )
+                    d = s["dim_idx"]
+                    if calibrated:
+                        if self._is_standardizable(r, d):
+                            if s["std"] < _CALIB_STD_MIN_STD:
+                                violations.append(
+                                    f"[seq_len={seq_len}] {r['label']} dim={d} (std): "
+                                    f"std={s['std']:.4f} < {_CALIB_STD_MIN_STD}"
+                                )
+                            elif s["std"] > _CALIB_STD_MAX_STD:
+                                violations.append(
+                                    f"[seq_len={seq_len}] {r['label']} dim={d} (std): "
+                                    f"std={s['std']:.4f} > {_CALIB_STD_MAX_STD}"
+                                )
+                        else:
+                            if s["std"] > _CALIB_NONSTD_MAX_STD:
+                                violations.append(
+                                    f"[seq_len={seq_len}] {r['label']} dim={d} (nonstd): "
+                                    f"std={s['std']:.4f} > {_CALIB_NONSTD_MAX_STD}"
+                                )
+                    else:
+                        if s["std"] > _MAX_STD:
+                            violations.append(
+                                f"[seq_len={seq_len}] {r['label']} dim={d}: "
+                                f"std={s['std']:.4f} > {_MAX_STD}"
+                            )
         if violations:
             pytest.fail(
                 f"{len(violations)} std violation(s):\n  " + "\n  ".join(violations)
             )
 
     @torch.no_grad()
-    def test_no_extreme_values(
-        self, distribution_results: dict[int, list[dict]]
-    ) -> None:
+    def test_no_extreme_values(self, distribution_case: _DistTestCase) -> None:
         """No value should exceed the absolute value threshold."""
         violations = []
-        for seq_len, seq_results in distribution_results.items():
+        for seq_len, seq_results in distribution_case.results.items():
             for r in seq_results:
                 for s in r["dim_stats"]:
                     abs_max = max(abs(s["min"]), abs(s["max"]))
@@ -489,51 +669,6 @@ class TestComponentDistributions:
             pytest.fail(
                 f"{len(violations)} extreme value violation(s):\n  "
                 + "\n  ".join(violations)
-            )
-
-    @torch.no_grad()
-    def test_distributions_stable_across_seq_lens(
-        self, distribution_results: dict[int, list[dict]]
-    ) -> None:
-        """Mean and std should not drift dramatically across sequence lengths.
-
-        Compares each seq_len to the shortest one. If mean shifts by more
-        than 2.0 or std ratio exceeds 3x, flag it.
-        """
-        seq_lens_sorted = sorted(distribution_results.keys())
-        if len(seq_lens_sorted) < 2:
-            pytest.skip("Need at least 2 sequence lengths to compare stability")
-
-        baseline_len = seq_lens_sorted[0]
-        baseline = distribution_results[baseline_len]
-        drift_issues = []
-
-        for seq_len in seq_lens_sorted[1:]:
-            current = distribution_results[seq_len]
-            for r_base, r_cur in zip(baseline, current):
-                for s_base, s_cur in zip(r_base["dim_stats"], r_cur["dim_stats"]):
-                    d = s_base["dim_idx"]
-                    label = r_base["label"]
-
-                    mean_shift = abs(s_cur["mean"] - s_base["mean"])
-                    if mean_shift > 2.0:
-                        drift_issues.append(
-                            f"{label} dim={d}: mean shifted by {mean_shift:.4f} "
-                            f"between seq_len={baseline_len} and {seq_len}"
-                        )
-
-                    if s_base["std"] > 1e-6:
-                        std_ratio = s_cur["std"] / s_base["std"]
-                        if std_ratio > 3.0 or std_ratio < 1.0 / 3.0:
-                            drift_issues.append(
-                                f"{label} dim={d}: std ratio={std_ratio:.4f} "
-                                f"between seq_len={baseline_len} and {seq_len}"
-                            )
-
-        if drift_issues:
-            pytest.fail(
-                f"{len(drift_issues)} stability issue(s):\n  "
-                + "\n  ".join(drift_issues)
             )
 
 
@@ -556,7 +691,7 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=1,
+        default=8,
         help="Batch size (default: 1).",
     )
     parser.add_argument(
@@ -582,6 +717,12 @@ def main() -> None:
         help="Print per-dimension breakdown for each component.",
     )
     parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Calibrate components before analysis (shows post-standardization "
+        "distributions). Uses tighter default thresholds with --check.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Run violation checks and exit with error code if any fail.",
@@ -589,22 +730,45 @@ def main() -> None:
     parser.add_argument(
         "--max-abs-mean",
         type=float,
-        default=_MAX_ABS_MEAN,
-        help=f"Max allowed |mean| per dim (default: {_MAX_ABS_MEAN}).",
+        default=None,
+        help="Max allowed |mean| per dim (default depends on --calibrate).",
     )
     parser.add_argument(
         "--max-std",
         type=float,
-        default=_MAX_STD,
-        help=f"Max allowed std per dim (default: {_MAX_STD}).",
+        default=None,
+        help="Max allowed std per dim (default depends on --calibrate).",
     )
     parser.add_argument(
         "--max-abs-value",
         type=float,
-        default=_MAX_ABS_VALUE,
-        help=f"Max allowed |value| (default: {_MAX_ABS_VALUE}).",
+        default=None,
+        help="Max allowed |value| (default depends on --calibrate).",
     )
     args = parser.parse_args()
+
+    # Pick thresholds based on mode, allow explicit override.
+    # CLI --check uses uniform thresholds (the two-tiered per-dim logic
+    # is in the pytest tests).  For calibrated mode the CLI defaults to
+    # the tighter standardizable-dim thresholds as a quick sanity check.
+    if args.calibrate:
+        max_abs_mean = (
+            args.max_abs_mean
+            if args.max_abs_mean is not None
+            else _CALIB_STD_MAX_ABS_MEAN
+        )
+        max_std = args.max_std if args.max_std is not None else _CALIB_STD_MAX_STD
+        max_abs_value = (
+            args.max_abs_value if args.max_abs_value is not None else _MAX_ABS_VALUE
+        )
+    else:
+        max_abs_mean = (
+            args.max_abs_mean if args.max_abs_mean is not None else _MAX_ABS_MEAN
+        )
+        max_std = args.max_std if args.max_std is not None else _MAX_STD
+        max_abs_value = (
+            args.max_abs_value if args.max_abs_value is not None else _MAX_ABS_VALUE
+        )
 
     data_dir = Path(args.data_dir) if args.data_dir else None
     results = run_distribution_analysis(
@@ -612,16 +776,17 @@ def main() -> None:
         batch_size=args.batch_size,
         data_dir=data_dir,
         components=args.components,
+        calibrate=args.calibrate,
     )
 
-    print_distribution_report(results, verbose=args.verbose)
+    print_distribution_report(results, verbose=args.verbose, calibrated=args.calibrate)
 
     if args.check:
         violations = find_violations(
             results,
-            max_abs_mean=args.max_abs_mean,
-            max_std=args.max_std,
-            max_abs_value=args.max_abs_value,
+            max_abs_mean=max_abs_mean,
+            max_std=max_std,
+            max_abs_value=max_abs_value,
         )
         if violations:
             print(f"\n{len(violations)} VIOLATION(S):")

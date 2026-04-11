@@ -1,6 +1,9 @@
 """Shared building blocks for multi-stream and related training scripts."""
 
+from __future__ import annotations
+
 import math
+from abc import abstractmethod
 
 import torch
 import torch.nn.functional as F
@@ -280,6 +283,97 @@ class SemanticRotary(nn.Module):
 # ---------------------------------------------------------------------------
 # Stream components (composable read-only stream builders)
 # ---------------------------------------------------------------------------
+
+
+class StreamComponent(nn.Module):
+    """Base class for structural stream components.
+
+    Subclasses must implement:
+        ``dim`` (property): number of output dimensions.
+        ``compute(input_ids, dtype)``: raw output tensor ``(B, S, dim)``.
+
+    Optionally override:
+        ``standardizable_mask``: per-dim bool tuple — ``True`` for dims that
+            can be standardized to mean=0, std=1 without breaking geometric
+            structure (e.g. rotation pairs must remain ``False``).
+        ``calibrate(input_ids_batches)``: custom calibration logic.
+
+    Each subclass should call ``self._register_standardization()`` at the end
+    of its ``__init__()`` (after ``dim`` is determined) to register the
+    ``_std_scale`` / ``_std_shift`` buffers used by the default ``calibrate``.
+    """
+
+    @property
+    @abstractmethod
+    def dim(self) -> int: ...
+
+    @abstractmethod
+    def compute(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        """Return raw (pre-standardization) output of shape ``(B, S, dim)``."""
+        ...
+
+    def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
+        """Return standardized output: ``compute() * scale + shift``.
+
+        Before ``calibrate()`` is called, scale=1 and shift=0 (identity).
+        After calibration, standardizable dims are normalized to mean≈0, std≈1.
+
+        ``CompositeStream`` bypasses this by calling ``compute()`` directly
+        and applying its own fused transform over all components at once.
+        """
+        raw = self.compute(input_ids, dtype)
+        return (raw * self._std_scale + self._std_shift).to(dtype=dtype)
+
+    @property
+    def standardizable_mask(self) -> tuple[bool, ...]:
+        """Per-dim mask: True if the dim can be standardized (mean=0, std=1).
+
+        Dims encoding geometric structure (sin/cos pairs, rotation vectors)
+        should return False.  Scalar features with arbitrary scale (log1p,
+        fractions, biased binary signals) should return True.
+        """
+        return (False,) * self.dim
+
+    def _register_standardization(self) -> None:
+        """Register scale/shift buffers. Call at end of subclass ``__init__``."""
+        mask = self.standardizable_mask
+        if len(mask) != self.dim:
+            raise ValueError(
+                f"{type(self).__name__}: standardizable_mask length {len(mask)} "
+                f"!= dim {self.dim}"
+            )
+        self.register_buffer("_std_scale", torch.ones(self.dim))
+        self.register_buffer("_std_shift", torch.zeros(self.dim))
+
+    @torch.no_grad()
+    def calibrate(self, input_ids_batches: list[Tensor]) -> None:
+        """Compute standardization stats from data.  Override for custom logic.
+
+        Default implementation: set mean=0, std=1 on dims where
+        ``standardizable_mask`` is True, using a two-pass computation over
+        the supplied batches.  Calls ``compute()`` (not ``forward()``) so
+        statistics are always computed on raw values.
+
+        Dims whose observed std is at or below numerical noise (1e-5 for
+        float32) are left unscaled to avoid amplifying a constant feature.
+        """
+        mask = torch.tensor(self.standardizable_mask, dtype=torch.bool)
+        if not mask.any():
+            return
+        device = self._std_scale.device
+        outputs: list[Tensor] = []
+        for ids in input_ids_batches:
+            raw = self.compute(ids.to(device), dtype=torch.float32)
+            outputs.append(raw.reshape(-1, self.dim))
+        cat = torch.cat(outputs, dim=0)
+        mean = cat.mean(dim=0)
+        std = cat.std(dim=0)
+        # Skip dims with std at numerical noise level — these are effectively
+        # constant and scaling them would just amplify floating-point noise.
+        active = mask & (std > 1e-5)
+        scale = (1.0 / std[active]).clamp(max=1000.0)
+        self._std_scale[active] = scale
+        self._std_shift[active] = -mean[active] * scale
 
 
 def sincos_encode(ids: Tensor, num_freqs: int, base: float = 10000.0) -> Tensor:

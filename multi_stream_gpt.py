@@ -113,7 +113,7 @@ def build_multi_stream_components(
         VowelConsonantComponent(tok=tok),  # 2
         ColumnPositionComponent(tok=tok, num_freqs=3),  # 6
         RepeatedByteComponent(),  # 2
-        PunctuationDepthComponent(tok=tok),  # 2
+        PunctuationDepthComponent(tok=tok),  # 3
         ByteCategoryStatsComponent(tok=tok),  # 6
         DigitSequenceComponent(tok=tok, id_freqs=5),  # 13
         DigitComputeComponent(tok=tok),  # 27 (ROTATION encoding: 1 pair * (8*3 + 3))
