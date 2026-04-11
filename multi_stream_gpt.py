@@ -95,7 +95,7 @@ def build_multi_stream_components(
     - **LOGIT** (writable, dim=vocab_size): starts as zeros (uniform prior).
     - **TOKENS** (read-only, dim=vocab_size): one-hot of input_ids.
     - **CONTEXT** (writable, dim=context_dim): zero-initialized scratch.
-    - **STRUCTURAL** (read-only, dim~239): precomputed byte-level features.
+    - **STRUCTURAL** (read-only, dim~158): precomputed byte-level features.
 
     Also configures number-position compression via ``NumberExtractor``.
 
@@ -103,7 +103,7 @@ def build_multi_stream_components(
         A :class:`MultiStreamComponents` dataclass with builder, hierarchy,
         and UTF-8 prior ready to be passed to :class:`MultiStreamGPT`.
     """
-    # -- STRUCTURAL stream components (~180 dims total) --
+    # -- STRUCTURAL stream components (~158 dims total) --
     structural_components: list[nn.Module] = [
         DocBoundaryComponent(bos_id=tok.bos_id, num_freqs=2),  # 4
         SinCosPositionComponent(num_freqs=10),  # 20
@@ -115,8 +115,8 @@ def build_multi_stream_components(
         RepeatedByteComponent(),  # 2
         PunctuationDepthComponent(tok=tok),  # 2
         ByteCategoryStatsComponent(tok=tok),  # 6
-        DigitSequenceComponent(tok=tok, id_freqs=5),  # 12
-        DigitComputeComponent(tok=tok),  # 107
+        DigitSequenceComponent(tok=tok, id_freqs=5),  # 13
+        DigitComputeComponent(tok=tok),  # 27 (ROTATION encoding: 1 pair * (8*3 + 3))
         ByteHashComponent(
             tok, window=20, num_hashes=2, boundary=HashBoundary.WORD, track_hits=True
         ),  # 6

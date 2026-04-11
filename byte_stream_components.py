@@ -9,7 +9,7 @@ from torch import Tensor, nn
 
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 
-from modules import binary_embedding, RotationCodebook, sincos_encode
+from modules import binary_embedding, ContinuousRotation, RotationCodebook, sincos_encode
 from byte_modules import (
     BYTE_CATEGORY_DEFS,
     NUM_BYTE_CATEGORIES,
@@ -578,20 +578,31 @@ class RepeatedByteComponent(nn.Module):
 
 
 class PunctuationDepthComponent(nn.Module):
-    """Bracket nesting depth + quote parity. 2 dims, 0 params.
+    """Bracket nesting depth + quote parity. 3 dims, 0 params.
 
-    Dim 0 (bracket_depth): cumsum(opens) - cumsum(closes) for ( [ { vs ) ] }.
-    Dim 1 (quote_state): +1=inside double quotes (odd cumsum), -1=outside (even).
+    Dims 0-1 (bracket_depth): 2D rotation-encoded nesting depth via
+        ContinuousRotation(cap).  Depths in [min_depth, max_depth] get
+        unique angles; values beyond saturate at the boundary.
+        Bounded [-1, +1], no wrap-around aliasing.
+    Dim 2 (quote_state): +1=inside double quotes (odd cumsum), -1=outside.
 
     Bracket depth can go negative in noisy web text (unbalanced closes) —
-    this is left as-is since it's also a useful signal.
+    this is captured by the negative side of the rotation.
 
     Causal: cumsum only depends on positions ≤ t.
     """
 
-    def __init__(self, tok: EfficientByteTokenizer):
+    def __init__(
+        self,
+        tok: EfficientByteTokenizer,
+        min_depth: int = -3,
+        max_depth: int = 8,
+    ):
         super().__init__()
         self.bos_id = tok.bos_id
+        self._depth_enc = ContinuousRotation(
+            min_val=min_depth, max_val=max_depth, mode="cap",
+        )
         V = tok.vocab_size
         is_open = torch.zeros(V, dtype=torch.long)
         is_close = torch.zeros(V, dtype=torch.long)
@@ -612,18 +623,19 @@ class PunctuationDepthComponent(nn.Module):
 
     @property
     def dim(self) -> int:
-        return 2
+        return 3
 
     def forward(self, input_ids: Tensor, dtype: torch.dtype) -> Tensor:
         reset_mask = input_ids == self.bos_id
         opens = _segmented_cumsum(self.is_open[input_ids], reset_mask)
         closes = _segmented_cumsum(self.is_close[input_ids], reset_mask)
-        bracket_depth = (opens - closes).float()
+        bracket_depth = opens - closes
+        depth_enc = self._depth_enc.encode(bracket_depth)  # (B, S, 2)
 
         quote_count = _segmented_cumsum(self.is_quote[input_ids], reset_mask)
         quote_state = torch.where(quote_count % 2 == 1, 1.0, -1.0)
 
-        return torch.stack([bracket_depth, quote_state], dim=-1).to(dtype=dtype)
+        return torch.cat([depth_enc, quote_state.unsqueeze(-1)], dim=-1).to(dtype=dtype)
 
 
 _STATS_CATEGORIES = [

@@ -85,48 +85,73 @@ def _build_component_registry(
         (
             "ByteHash_word_w20",
             ByteHashComponent(
-                tok, window=20, num_hashes=2,
-                boundary=HashBoundary.WORD, track_hits=True,
+                tok,
+                window=20,
+                num_hashes=2,
+                boundary=HashBoundary.WORD,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w2",
             ByteHashComponent(
-                tok, window=2, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=2,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w3",
             ByteHashComponent(
-                tok, window=3, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=3,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w5",
             ByteHashComponent(
-                tok, window=5, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=5,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_w8",
             ByteHashComponent(
-                tok, window=8, num_hashes=2, boundary=None, track_hits=True,
+                tok,
+                window=8,
+                num_hashes=2,
+                boundary=None,
+                track_hits=True,
             ),
         ),
         (
             "ByteHash_digit_w8",
             ByteHashComponent(
-                tok, window=8, num_hashes=2,
-                boundary=HashBoundary.DIGIT, track_hits=True,
+                tok,
+                window=8,
+                num_hashes=2,
+                boundary=HashBoundary.DIGIT,
+                track_hits=True,
             ),
         ),
         (
             "Boundary",
             BoundaryComponent(
                 tok,
-                word_pos_freqs=3, word_id_freqs=3,
-                sent_pos_freqs=2, sent_id_freqs=2,
-                para_pos_freqs=2, para_id_freqs=2,
+                word_pos_freqs=3,
+                word_id_freqs=3,
+                sent_pos_freqs=2,
+                sent_id_freqs=2,
+                para_pos_freqs=2,
+                para_id_freqs=2,
             ),
         ),
     ]
@@ -146,8 +171,6 @@ def _load_input_ids(
     data_dir = data_dir or Path(os.environ.get("DATA_PATH", str(_DEFAULT_DATA_DIR)))
     shards = sorted(data_dir.glob("fineweb_val_*.bin"))
     if not shards:
-        shards = sorted(data_dir.glob("fineweb_train_*.bin"))
-    if not shards:
         raise FileNotFoundError(
             f"No .bin shards found in {data_dir}. Set DATA_PATH or pass --data-dir."
         )
@@ -164,6 +187,9 @@ def _load_input_ids(
             break
     tokens = torch.cat(chunks).long()
     if tokens.numel() < total_needed:
+        raise ValueError(
+            f"Not enough tokens in {data_dir} to fill batch_size={batch_size}, seq_len={seq_len} (got {tokens.numel()})"
+        )
         repeats = (total_needed + tokens.numel() - 1) // tokens.numel()
         tokens = tokens.repeat(repeats)
     tokens = tokens[:total_needed]
@@ -196,18 +222,20 @@ def compute_dim_stats(output: torch.Tensor) -> list[dict]:
 
     stats = []
     for d in range(D):
-        stats.append({
-            "dim_idx": d,
-            "mean": means[d].item(),
-            "std": stds[d].item(),
-            "min": mins[d].item(),
-            "max": maxs[d].item(),
-            "q01": quantiles[0, d].item(),
-            "q25": quantiles[1, d].item(),
-            "q50": quantiles[2, d].item(),
-            "q75": quantiles[3, d].item(),
-            "q99": quantiles[4, d].item(),
-        })
+        stats.append(
+            {
+                "dim_idx": d,
+                "mean": means[d].item(),
+                "std": stds[d].item(),
+                "min": mins[d].item(),
+                "max": maxs[d].item(),
+                "q01": quantiles[0, d].item(),
+                "q25": quantiles[1, d].item(),
+                "q50": quantiles[2, d].item(),
+                "q75": quantiles[3, d].item(),
+                "q99": quantiles[4, d].item(),
+            }
+        )
     return stats
 
 
@@ -233,7 +261,8 @@ def run_distribution_analysis(
     if components:
         lc_filters = [f.lower() for f in components]
         registry = [
-            (label, comp) for label, comp in registry
+            (label, comp)
+            for label, comp in registry
             if any(f in label.lower() for f in lc_filters)
         ]
         if not registry:
@@ -249,12 +278,14 @@ def run_distribution_analysis(
             with torch.no_grad():
                 output = component(input_ids, dtype=torch.float32)
             dim_stats = compute_dim_stats(output)
-            seq_results.append({
-                "label": label,
-                "dim": component.dim,
-                "shape": tuple(output.shape),
-                "dim_stats": dim_stats,
-            })
+            seq_results.append(
+                {
+                    "label": label,
+                    "dim": component.dim,
+                    "shape": tuple(output.shape),
+                    "dim_stats": dim_stats,
+                }
+            )
 
         results_by_seqlen[seq_len] = seq_results
 
@@ -355,9 +386,7 @@ def find_violations(
                         f"{prefix}: |mean|={abs(s['mean']):.4f} > {max_abs_mean}"
                     )
                 if s["std"] > max_std:
-                    violations.append(
-                        f"{prefix}: std={s['std']:.4f} > {max_std}"
-                    )
+                    violations.append(f"{prefix}: std={s['std']:.4f} > {max_std}")
                 abs_max = max(abs(s["min"]), abs(s["max"]))
                 if abs_max > max_abs_value:
                     violations.append(
@@ -386,9 +415,7 @@ class TestComponentDistributions:
     """Verify component output distributions stay within healthy ranges."""
 
     @torch.no_grad()
-    def test_no_nans_or_infs(
-        self, distribution_results: dict[int, list[dict]]
-    ) -> None:
+    def test_no_nans_or_infs(self, distribution_results: dict[int, list[dict]]) -> None:
         """No dimension should have NaN or Inf in its statistics."""
         bad = []
         for seq_len, seq_results in distribution_results.items():
@@ -421,8 +448,7 @@ class TestComponentDistributions:
                         )
         if violations:
             pytest.fail(
-                f"{len(violations)} mean violation(s):\n  "
-                + "\n  ".join(violations)
+                f"{len(violations)} mean violation(s):\n  " + "\n  ".join(violations)
             )
 
     @torch.no_grad()
@@ -441,8 +467,7 @@ class TestComponentDistributions:
                         )
         if violations:
             pytest.fail(
-                f"{len(violations)} std violation(s):\n  "
-                + "\n  ".join(violations)
+                f"{len(violations)} std violation(s):\n  " + "\n  ".join(violations)
             )
 
     @torch.no_grad()
@@ -541,7 +566,8 @@ def main() -> None:
         help="Path to byte260 data directory (default: auto-detect).",
     )
     parser.add_argument(
-        "-c", "--component",
+        "-c",
+        "--component",
         type=str,
         nargs="+",
         default=None,
@@ -550,7 +576,8 @@ def main() -> None:
         "(case-insensitive substring match).",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Print per-dimension breakdown for each component.",
     )

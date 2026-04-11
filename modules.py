@@ -351,6 +351,69 @@ class RotationCodebook(nn.Module):
         return dots.argmax(dim=-1)
 
 
+class ContinuousRotation(nn.Module):
+    """2D unit-circle encoding for scalar values.
+
+    Maps each input value to a ``(cos θ, sin θ)`` pair on the unit circle.
+
+    Modes:
+        ``'cap'``: values are clamped to ``[min_val, max_val]`` and linearly
+            mapped to an arc of length *arc* radians.  Values at *min_val*
+            map to the start of the arc, values at *max_val* to the end.
+            The particular placement on the circle is arbitrary (learned
+            projections absorb any rotation).
+
+        ``'wrap'``: full ``2π`` periodic over ``[min_val, max_val]``.
+            *arc* is ignored.  Useful for inherently cyclic quantities.
+
+    Args:
+        min_val: lower bound of the input range.
+        max_val: upper bound of the input range (must be > *min_val*).
+        arc: total angular span in radians for *cap* mode (default ``π``).
+            Wider arc = more angular resolution between adjacent values,
+            but extremes get closer to each other on the circle.
+        mode: ``'cap'`` or ``'wrap'``.
+    """
+
+    def __init__(
+        self,
+        min_val: float,
+        max_val: float,
+        arc: float = math.pi,
+        mode: str = "cap",
+    ):
+        super().__init__()
+        if mode not in ("cap", "wrap"):
+            raise ValueError(f"mode must be 'cap' or 'wrap', got {mode!r}")
+        if max_val <= min_val:
+            raise ValueError(f"max_val must be > min_val, got {min_val}, {max_val}")
+        self.mode = mode
+        self.min_val = min_val
+        self.max_val = max_val
+        self.arc = arc
+
+    def encode(self, values: Tensor) -> Tensor:
+        """Map scalar values to 2D unit vectors.
+
+        Args:
+            values: ``(...,)`` tensor (integer or float).
+
+        Returns:
+            ``(..., 2)`` float tensor of ``(cos θ, sin θ)`` pairs.
+        """
+        v = values.float()
+        if self.mode == "cap":
+            v = v.clamp(self.min_val, self.max_val)
+            # Linearly map [min_val, max_val] → [0, arc]
+            t = (v - self.min_val) / (self.max_val - self.min_val)
+            angle = t * self.arc
+        else:  # wrap
+            # Linearly map [min_val, max_val] → [0, 2π], periodic
+            t = (v - self.min_val) / (self.max_val - self.min_val)
+            angle = t * (2.0 * math.pi)
+        return torch.stack([angle.cos(), angle.sin()], dim=-1)
+
+
 def binary_embedding(num_classes: int, dim: int) -> Tensor:
     """Deterministic binary embedding for a small number of classes.
 
