@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -771,7 +772,9 @@ def build_multi_stream_gpt(
         structural_stream: CompositeStream = components.builder.composites[
             str(StreamID(StreamType.STRUCTURAL))
         ]  # type: ignore
+        t0 = time.perf_counter()
         structural_stream.calibrate(calibration_tokens, compile=compile_calibration)
+        print(f"structural_calibration: {time.perf_counter() - t0:.2f}s")
     else:
         print("Skipping structural stream calibration")
 
@@ -786,6 +789,7 @@ def build_multi_stream_gpt(
     if include_bigram_prior:
         if model.bigram_prior is None:
             raise ValueError("bigram_prior should be included based on the flag")
+        t0 = time.perf_counter()
         bigram_log_probs = compute_bigram_log_probs(
             train_pattern=train_pattern,
             tok=tok,
@@ -798,7 +802,8 @@ def build_multi_stream_gpt(
         bl = model.bigram_prior.bigram_logits.data
         print(
             f"bigram_prior: mean={bl.mean():.3f} std={bl.std():.3f} "
-            f"min={bl.min():.3f} max={bl.max():.3f}"
+            f"min={bl.min():.3f} max={bl.max():.3f} "
+            f"({time.perf_counter() - t0:.2f}s)"
         )
     else:
         print("bigram_prior: not included, skipping initialization")
