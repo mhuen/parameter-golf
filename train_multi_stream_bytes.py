@@ -701,6 +701,7 @@ def main():
         include_bigram_prior=args.include_bigram_prior,
         train_pattern=args.train_files,
         bigram_init_smoothing=args.bigram_init_smoothing,
+        device=device,
         multi_head_dim=args.multi_head_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -728,7 +729,7 @@ def main():
         },
         init_noise_std=args.init_noise_std,
     )
-    base_model = base_model.to(device).bfloat16()
+    base_model = base_model.bfloat16()
 
     # Restore CastedLinear / KroneckerLinear / MonarchLinear / Conv1d to float32 weights.
     for module in base_model.modules():

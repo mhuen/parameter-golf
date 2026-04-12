@@ -721,12 +721,13 @@ def build_multi_stream_gpt(
     structured_output_logits: bool = True,
     calibrate_structural_stream: bool = True,
     calibration_sequence_length: int | None = None,
-    calibration_n_sequences: int = 320,
+    calibration_n_sequences: int = 500,
     calibration_tokens: Tensor | None = None,
     compile_calibration: bool = False,
     include_bigram_prior: bool = True,
     train_pattern: str = "./data/datasets/fineweb10B_byte260/fineweb_train_*.bin",
     bigram_init_smoothing: float = 0.1,
+    device: torch.device | str = "cpu",
     **model_kwargs,
 ) -> MultiStreamGPT:
     """Convenience factory to build a MultiStreamGPT with default components.
@@ -735,6 +736,9 @@ def build_multi_stream_gpt(
     - ``calibration_tokens``: pre-built ``(N, seq_len)`` token tensor
     - ``train_pattern`` + ``calibration_sequence_length``: load from shard files
     If ``calibration_tokens`` is given it takes priority.
+
+    The model (and components) are moved to ``device`` before calibration
+    so that compiled calibration runs on the target device.
     """
     components = build_multi_stream_components(
         tok=tok,
@@ -744,6 +748,7 @@ def build_multi_stream_gpt(
         logit_softcap=logit_softcap,
         structured_output_logits=structured_output_logits,
     )
+    components.builder.to(device)
 
     # calibrate structural stream
     if calibrate_structural_stream:
@@ -775,7 +780,7 @@ def build_multi_stream_gpt(
         include_bigram_prior=include_bigram_prior,
         logit_softcap=logit_softcap,
         **model_kwargs,
-    )
+    ).to(device)
 
     # compute bigram init from training data and load into the model
     if include_bigram_prior:
