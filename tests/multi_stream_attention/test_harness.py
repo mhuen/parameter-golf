@@ -284,12 +284,12 @@ class MultiStreamGPTTestModel(nn.Module):
 
         calibration_sequence_length = make_batch_fn(tok, 1)[0].shape[-1]
 
-        calib_batches: list[Tensor] | None = None
+        calibration_tokens: Tensor | None = None
         if use_synthetic_calibration:
-            calib_batches = [
+            calibration_tokens = torch.cat([
                 make_batch_fn(tok, calibration_batch_size)[0]
                 for _ in range(calibration_n_batches)
-            ]
+            ])
 
         self.gpt = build_multi_stream_gpt(
             tok=tok,
@@ -298,7 +298,7 @@ class MultiStreamGPTTestModel(nn.Module):
             calibrate_structural_stream=calibrate_structural_stream,
             include_bigram_prior=include_bigram_prior,
             calibration_sequence_length=calibration_sequence_length,
-            calibration_batches=calib_batches,
+            calibration_tokens=calibration_tokens,
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,

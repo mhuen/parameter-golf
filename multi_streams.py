@@ -209,10 +209,12 @@ class CompositeStream(nn.Module):
         return (x * self._scale + self._shift).to(dtype=dtype)
 
     @torch.no_grad()
-    def calibrate(self, input_ids_batches: list[Tensor]) -> None:
+    def calibrate(
+        self, input_ids: Tensor, batch_size: int = 64, compile: bool = False,
+    ) -> None:
         """Calibrate all components, then collect into combined buffers."""
         for c in self.components:
-            c.calibrate(input_ids_batches)
+            c.calibrate(input_ids, batch_size=batch_size, compile=compile)
         # Collect per-component scale/shift into combined buffers
         offset = 0
         for c in self.components:

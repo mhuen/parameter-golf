@@ -696,6 +696,7 @@ def main():
         logit_softcap=args.logit_softcap,
         structured_output_logits=args.structured_output_logits,
         calibrate_structural_stream=True,
+        compile_calibration=True,
         calibration_sequence_length=args.train_seq_len,
         include_bigram_prior=args.include_bigram_prior,
         train_pattern=args.train_files,

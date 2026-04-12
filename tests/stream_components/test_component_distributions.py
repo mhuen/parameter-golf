@@ -299,19 +299,18 @@ def run_distribution_analysis(
             batch_size=calib_batches * calib_batch_size,
             data_dir=data_dir,
         )
-        calib_id_batches = list(calib_ids.split(calib_batch_size))
         n_calibrated = 0
         for label, component in registry:
             if isinstance(component, StreamComponent):
-                component.calibrate(calib_id_batches)
+                component.calibrate(calib_ids, batch_size=calib_batch_size)
                 n_std = sum(int(m) for m in component.standardizable_mask)
                 if n_std > 0:
                     n_calibrated += 1
         print(
             f"calibration: {n_calibrated} components calibrated "
-            f"({len(calib_id_batches)} batches × {calib_batch_size} × {calib_seq_len})"
+            f"({calib_ids.shape[0]} sequences × {calib_seq_len})"
         )
-        del calib_ids, calib_id_batches
+        del calib_ids
 
     results_by_seqlen: dict[int, list[dict]] = {}
 

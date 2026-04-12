@@ -296,7 +296,7 @@ class StreamComponent(nn.Module):
         ``standardizable_mask``: per-dim bool tuple — ``True`` for dims that
             can be standardized to mean=0, std=1 without breaking geometric
             structure (e.g. rotation pairs must remain ``False``).
-        ``calibrate(input_ids_batches)``: custom calibration logic.
+        ``calibrate(input_ids)``: custom calibration logic.
 
     Each subclass should call ``self._register_standardization()`` at the end
     of its ``__init__()`` (after ``dim`` is determined) to register the
@@ -346,13 +346,21 @@ class StreamComponent(nn.Module):
         self.register_buffer("_std_shift", torch.zeros(self.dim))
 
     @torch.no_grad()
-    def calibrate(self, input_ids_batches: list[Tensor]) -> None:
+    def calibrate(
+        self, input_ids: Tensor, batch_size: int = 64, compile: bool = False,
+    ) -> None:
         """Compute standardization stats from data.  Override for custom logic.
 
         Default implementation: set mean=0, std=1 on dims where
         ``standardizable_mask`` is True, using a two-pass computation over
-        the supplied batches.  Calls ``compute()`` (not ``forward()``) so
+        the supplied data.  Calls ``compute()`` (not ``forward()``) so
         statistics are always computed on raw values.
+
+        Args:
+            input_ids: ``(N, seq_len)`` token IDs for calibration.
+            batch_size: chunk size for processing (controls peak memory).
+            compile: if True, ``torch.compile`` the ``compute`` method
+                before running the calibration loop.
 
         Dims whose observed std is at or below numerical noise (1e-5 for
         float32) are left unscaled to avoid amplifying a constant feature.
@@ -361,9 +369,11 @@ class StreamComponent(nn.Module):
         if not mask.any():
             return
         device = self._std_scale.device
+        ids = input_ids.to(device=device, dtype=torch.long)
+        compute_fn = torch.compile(self.compute) if compile else self.compute
         outputs: list[Tensor] = []
-        for ids in input_ids_batches:
-            raw = self.compute(ids.to(device=device, dtype=torch.long), dtype=torch.float32)
+        for chunk in ids.split(batch_size):
+            raw = compute_fn(chunk, dtype=torch.float32)
             outputs.append(raw.reshape(-1, self.dim))
         cat = torch.cat(outputs, dim=0)
         mean = cat.mean(dim=0)

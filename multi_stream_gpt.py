@@ -240,21 +240,19 @@ class BigramPriorLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-# TODO: pull out and simplify shared loading logic from load_calibration_batches and compute_bigram_log_probs
-def load_calibration_batches(
+# TODO: pull out and simplify shared loading logic from load_calibration_tokens and compute_bigram_log_probs
+def load_calibration_tokens(
     train_pattern: str,
     tok: EfficientByteTokenizer,
     seq_len: int = 512,
-    batch_size: int = 16,
-    n_batches: int = 20,
-) -> list[Tensor]:
-    """Load token batches from training shards for model calibration.
+    n_sequences: int = 320,
+) -> Tensor:
+    """Load token sequences from training shards for model calibration.
 
-    Reads as many shard files as needed to fill *n_batches* batches of
-    shape ``(batch_size, seq_len)``.
+    Reads as many shard files as needed to produce up to *n_sequences*
+    sequences and returns a single ``(N, seq_len)`` tensor.
     """
-
-    needed = n_batches * batch_size * seq_len
+    needed = n_sequences * seq_len
     files = [Path(p) for p in sorted(glob.glob(train_pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
@@ -269,9 +267,8 @@ def load_calibration_batches(
             break
 
     all_tokens = torch.cat(chunks)
-    n_seqs = min(all_tokens.numel() // seq_len, n_batches * batch_size)
-    all_tokens = all_tokens[: n_seqs * seq_len].reshape(-1, seq_len)
-    return list(all_tokens.split(batch_size))
+    n_seqs = min(all_tokens.numel() // seq_len, n_sequences)
+    return all_tokens[: n_seqs * seq_len].reshape(-1, seq_len)
 
 
 def compute_bigram_log_probs(
@@ -280,23 +277,21 @@ def compute_bigram_log_probs(
     vocab_size: int,
     smoothing: float = 0.1,
     max_data_bytes: int = 1_000_000,
-    token_batches: list[Tensor] | None = None,
+    calibration_tokens: Tensor | None = None,
 ) -> Tensor:
     """Compute bigram log-probabilities from training data.
 
     Counts consecutive-token bigrams, smooths, normalizes, and returns
     ``(V, V)`` float32 log-probabilities.
 
-    If ``token_batches`` is provided, uses those directly instead of loading
-    from shard files.
+    If ``calibration_tokens`` is provided (``(N, seq_len)``), uses those
+    directly instead of loading from shard files.
     """
-    if token_batches is not None:
-        all_tokens = (
-            torch.cat([b.reshape(-1) for b in token_batches]).numpy().astype(np.int64)
-        )
+    if calibration_tokens is not None:
+        all_tokens = calibration_tokens.reshape(-1).numpy().astype(np.int64)
         if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
             all_tokens = all_tokens[:max_data_bytes]
-        if len(all_tokens) < max_data_bytes:
+        if max_data_bytes > 0 and len(all_tokens) < max_data_bytes:
             raise ValueError(
                 f"Not enough tokens in provided batches: {len(all_tokens):,} < max_data_bytes ({max_data_bytes:,})"
             )
@@ -726,9 +721,9 @@ def build_multi_stream_gpt(
     structured_output_logits: bool = True,
     calibrate_structural_stream: bool = True,
     calibration_sequence_length: int | None = None,
-    calibration_batch_size: int = 32,
-    calibration_n_batches: int = 10,
-    calibration_batches: list[Tensor] | None = None,
+    calibration_n_sequences: int = 320,
+    calibration_tokens: Tensor | None = None,
+    compile_calibration: bool = False,
     include_bigram_prior: bool = True,
     train_pattern: str = "./data/datasets/fineweb10B_byte260/fineweb_train_*.bin",
     bigram_init_smoothing: float = 0.1,
@@ -737,9 +732,9 @@ def build_multi_stream_gpt(
     """Convenience factory to build a MultiStreamGPT with default components.
 
     Calibration data can be provided in two ways:
-    - ``calibration_batches``: pre-built list of ``(B, S)`` token tensors
+    - ``calibration_tokens``: pre-built ``(N, seq_len)`` token tensor
     - ``train_pattern`` + ``calibration_sequence_length``: load from shard files
-    If ``calibration_batches`` is given it takes priority.
+    If ``calibration_tokens`` is given it takes priority.
     """
     components = build_multi_stream_components(
         tok=tok,
@@ -754,25 +749,24 @@ def build_multi_stream_gpt(
     if calibrate_structural_stream:
         print("Calibrating structural stream with training data...")
 
-        if calibration_batches is None:
+        if calibration_tokens is None:
             if calibration_sequence_length is None:
                 raise ValueError(
                     "calibration_sequence_length must be specified when "
-                    "calibrate_structural_stream is True and calibration_batches "
+                    "calibrate_structural_stream is True and calibration_tokens "
                     "is not provided"
                 )
-            calibration_batches = load_calibration_batches(
+            calibration_tokens = load_calibration_tokens(
                 train_pattern=train_pattern,
                 tok=tok,
                 seq_len=calibration_sequence_length,
-                batch_size=calibration_batch_size,
-                n_batches=calibration_n_batches,
+                n_sequences=calibration_n_sequences,
             )
 
         structural_stream: CompositeStream = components.builder.composites[
             str(StreamID(StreamType.STRUCTURAL))
         ]  # type: ignore
-        structural_stream.calibrate(input_ids_batches=calibration_batches)
+        structural_stream.calibrate(calibration_tokens, compile=compile_calibration)
     else:
         print("Skipping structural stream calibration")
 
@@ -792,7 +786,7 @@ def build_multi_stream_gpt(
             tok=tok,
             vocab_size=model.bigram_prior.bigram_logits.shape[0],
             smoothing=bigram_init_smoothing,
-            token_batches=calibration_batches,
+            calibration_tokens=calibration_tokens,
         )
         with torch.no_grad():
             model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
