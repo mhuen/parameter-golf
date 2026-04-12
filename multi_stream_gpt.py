@@ -727,7 +727,7 @@ def build_multi_stream_gpt(
     calibrate_structural_stream: bool = True,
     calibration_sequence_length: int | None = None,
     calibration_batch_size: int = 32,
-    calibration_n_batches: int = 1000,
+    calibration_n_batches: int = 50,
     calibration_batches: list[Tensor] | None = None,
     include_bigram_prior: bool = True,
     train_pattern: str = "./data/datasets/fineweb10B_byte260/fineweb_train_*.bin",
