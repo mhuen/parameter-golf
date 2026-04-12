@@ -137,10 +137,11 @@ class Hyperparameters:
     mixing_source = os.environ.get("MIXING_SOURCE", "dynamic_bottleneck")
     mixing_bottleneck_dim = int(os.environ.get("MIXING_BOTTLENECK_DIM", 32))
 
-    # Residual mixing, skip connections, and alpha bounding
+    # Residual mixing, skip connections, and alpha/beta bounding
     use_resid_mix = bool(int(os.environ.get("USE_RESID_MIX", "0")))
     use_unet_skip = bool(int(os.environ.get("USE_UNET_SKIP", "0")))
-    bound_alpha = bool(int(os.environ.get("BOUND_ALPHA", "1")))
+    bound_alpha = bool(int(os.environ.get("BOUND_ALPHA", "0")))
+    bound_beta = bool(int(os.environ.get("BOUND_BETA", "0")))
 
     # Bigram prior
     include_bigram_prior = bool(int(os.environ.get("INCLUDE_BIGRAM_PRIOR", "1")))
@@ -735,6 +736,7 @@ def main():
         use_resid_mix=args.use_resid_mix,
         use_unet_skip=args.use_unet_skip,
         bound_alpha=args.bound_alpha,
+        bound_beta=args.bound_beta,
         init_noise_std=args.init_noise_std,
     )
     base_model = base_model.bfloat16()
@@ -944,7 +946,7 @@ def main():
         f"structured_output_logits={args.structured_output_logits} "
         f"utf8_prior={args.utf8_prior} "
         f"resid_mix={args.use_resid_mix} unet_skip={args.use_unet_skip} "
-        f"bound_alpha={args.bound_alpha}"
+        f"bound_alpha={args.bound_alpha} bound_beta={args.bound_beta}"
     )
     log0(
         f"preconv: layers={args.num_preconv_layers} kernel={args.preconv_kernel_size} "

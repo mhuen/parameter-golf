@@ -239,6 +239,8 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
                 if not stream.read_only
             }
         )
+        for lin in self.W_o_value.values():
+            lin._zero_init = True
         self.W_o_gate = nn.ModuleDict(
             {
                 stream.key: make_linear(
@@ -523,6 +525,8 @@ class CausalMultiStreamAttention(nn.Module):
                 if not stream.read_only
             }
         )
+        for lin in self.W_o_value.values():
+            lin._zero_init = True
         self.W_o_gate = nn.ModuleDict(
             {
                 stream.key: make_linear(
@@ -681,6 +685,8 @@ class MultiStreamMLP(nn.Module):
                 for s in self._output_streams
             }
         )
+        for lin in self.proj_value.values():
+            lin._zero_init = True
         if gated_output:
             self.proj_gate = nn.ModuleDict(
                 {
@@ -830,8 +836,9 @@ class MultiStreamCausalConv(nn.Module):
 class MultiStreamCausalConvLayers(nn.Module):
     """Stack of ``MultiStreamCausalConv`` layers with per-stream norms and residuals.
 
-    Each layer: pre-norm all streams → conv → σ(β)*x + σ(α)*update for writable
-    streams.  Read-only streams pass through unchanged.
+    Each layer: pre-norm all streams → conv → β*x + α*update for writable
+    streams (α/β optionally bounded via scaled sigmoid).
+    Read-only streams pass through unchanged.
 
     Intended as a pre-processing stage to fill initial information into writable
     streams before the attention blocks.
@@ -848,13 +855,17 @@ class MultiStreamCausalConvLayers(nn.Module):
         input_stream_ids: list[StreamID] | None = None,
         output_stream_ids: list[StreamID] | None = None,
         conv_channel_shuffle: bool = True,
-        alpha_init: float = -3.0,
-        beta_init: float = 5.0,
+        alpha_init: float = 1.0,
+        beta_init: float = 1.0,
+        bound_alpha: bool = False,
+        bound_beta: bool = False,
         value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self.num_layers = num_layers
+        self._bound_alpha = bound_alpha
+        self._bound_beta = bound_beta
 
         if isinstance(kernel_size, int):
             kernel_sizes = [kernel_size] * num_layers
@@ -912,11 +923,19 @@ class MultiStreamCausalConvLayers(nn.Module):
                 for i, ks in enumerate(kernel_sizes)
             ]
         )
+        # Convert output-space init values to stored parameter values
+        def _to_param(value: float, bounded: bool) -> float:
+            if bounded:
+                return torch.logit(torch.tensor(value / _SIGMOID_SCALE)).item()
+            return value
+
+        _a = _to_param(alpha_init, bound_alpha)
+        _b = _to_param(beta_init, bound_beta)
         self.alphas = nn.ModuleList(
             [
                 nn.ParameterDict(
                     {
-                        s.key: nn.Parameter(torch.full((s.dim,), alpha_init))
+                        s.key: nn.Parameter(torch.full((s.dim,), _a))
                         for s in self._output_streams
                     }
                 )
@@ -927,7 +946,7 @@ class MultiStreamCausalConvLayers(nn.Module):
             [
                 nn.ParameterDict(
                     {
-                        s.key: nn.Parameter(torch.full((s.dim,), beta_init))
+                        s.key: nn.Parameter(torch.full((s.dim,), _b))
                         for s in self._output_streams
                     }
                 )
@@ -942,8 +961,8 @@ class MultiStreamCausalConvLayers(nn.Module):
             normed = _apply_stream_norms(norms, self.stream_config.streams, x)
             conv_out = self.convs[layer_idx](normed)
             for s in self._output_streams:
-                alpha = torch.sigmoid(self.alphas[layer_idx][s.key])
-                beta = torch.sigmoid(self.betas[layer_idx][s.key])
+                alpha = torch.sigmoid(self.alphas[layer_idx][s.key]) * _SIGMOID_SCALE if self._bound_alpha else self.alphas[layer_idx][s.key]
+                beta = torch.sigmoid(self.betas[layer_idx][s.key]) * _SIGMOID_SCALE if self._bound_beta else self.betas[layer_idx][s.key]
                 x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
         return x
 
@@ -1316,6 +1335,11 @@ class CausalArithmeticMultiStreamAttention(nn.Module):
         return output
 
 
+# Scaled sigmoid so bounded mode can represent 1.0 exactly.
+# sigmoid(x) * _SIGMOID_SCALE has range (0, _SIGMOID_SCALE).
+_SIGMOID_SCALE = 1.1
+
+
 class MultiStreamBlock(nn.Module):
     """Multi-stream transformer block: pre-norm → attention → residual → pre-norm → MLP → residual.
 
@@ -1351,25 +1375,31 @@ class MultiStreamBlock(nn.Module):
         logit_hierarchy: ByteLogitHierarchy | None = None,
         mlp_input_stream_ids: list[StreamID] | None = None,
         mlp_output_stream_ids: list[StreamID] | None = None,
-        attn_alpha_init: float = 0.27,
-        attn_beta_init: float = 0.99,
-        mlp_alpha_init: float = 0.05,
-        mlp_beta_init: float = 0.99,
-        conv_alpha_init: float = 0.05,
-        conv_beta_init: float = 0.99,
-        arith_alpha_init: float = 0.05,
-        arith_beta_init: float = 0.99,
-        bound_alpha: bool = True,
+        attn_alpha_init: float = 1.0,
+        attn_beta_init: float = 1.0,
+        mlp_alpha_init: float = 1.0,
+        mlp_beta_init: float = 1.0,
+        conv_alpha_init: float = 1.0,
+        conv_beta_init: float = 1.0,
+        arith_alpha_init: float = 1.0,
+        arith_beta_init: float = 1.0,
+        bound_alpha: bool = False,
+        bound_beta: bool = False,
         value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
         self._bound_alpha = bound_alpha
+        self._bound_beta = bound_beta
 
         def _to_param(value: float, bounded: bool) -> float:
-            """Convert output-space multiplier to stored parameter value."""
+            """Convert output-space multiplier to stored parameter value.
+
+            When bounded, the forward pass uses ``sigmoid(x) * _SIGMOID_SCALE``
+            so the representable range is (0, _SIGMOID_SCALE).
+            """
             if bounded:
-                return torch.logit(torch.tensor(value)).item()
+                return torch.logit(torch.tensor(value / _SIGMOID_SCALE)).item()
             return value
 
         # Per-stream input norms (pre-norm only, no post-norm on residual)
@@ -1417,13 +1447,13 @@ class MultiStreamBlock(nn.Module):
         mlp_out_streams = self.mlp.output_streams
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)
-        # output = σ(β) * x + α_eff * update
-        # where α_eff = σ(α) when bound_alpha=True, or α directly when False.
-        # Init values are in output space; internally converted via logit() when bounded.
+        # output = σ(β)*S * x + σ(α)*S * update  (when bounded, S=_SIGMOID_SCALE)
+        # output = β * x + α * update             (when unbounded)
+        # Init values are in output space; internally converted via logit(v/S) when bounded.
         _a_attn = _to_param(attn_alpha_init, bound_alpha)
-        _b_attn = _to_param(attn_beta_init, True)
+        _b_attn = _to_param(attn_beta_init, bound_beta)
         _a_mlp = _to_param(mlp_alpha_init, bound_alpha)
-        _b_mlp = _to_param(mlp_beta_init, True)
+        _b_mlp = _to_param(mlp_beta_init, bound_beta)
         self.attn_alpha = nn.ParameterDict(
             {
                 s.key: nn.Parameter(torch.full((s.dim,), _a_attn))
@@ -1457,7 +1487,7 @@ class MultiStreamBlock(nn.Module):
             self.conv_norms = _build_stream_norms(all_streams)
             conv_out_streams = conv.output_streams
             _a_conv = _to_param(conv_alpha_init, bound_alpha)
-            _b_conv = _to_param(conv_beta_init, True)
+            _b_conv = _to_param(conv_beta_init, bound_beta)
             self.conv_alpha = nn.ParameterDict(
                 {
                     s.key: nn.Parameter(torch.full((s.dim,), _a_conv))
@@ -1476,7 +1506,7 @@ class MultiStreamBlock(nn.Module):
         if arith_attn is not None:
             self.arith_norms = _build_stream_norms(all_streams)
             _a_arith = _to_param(arith_alpha_init, bound_alpha)
-            _b_arith = _to_param(arith_beta_init, True)
+            _b_arith = _to_param(arith_beta_init, bound_beta)
             self.arith_alpha = nn.ParameterDict(
                 {
                     s.key: nn.Parameter(torch.full((s.dim,), _a_arith))
@@ -1509,8 +1539,8 @@ class MultiStreamBlock(nn.Module):
             if s.read_only:
                 x[s.name] = input_streams[s.name]
             else:
-                alpha = torch.sigmoid(self.attn_alpha[s.key]) if self._bound_alpha else self.attn_alpha[s.key]
-                beta = torch.sigmoid(self.attn_beta[s.key])
+                alpha = torch.sigmoid(self.attn_alpha[s.key]) * _SIGMOID_SCALE if self._bound_alpha else self.attn_alpha[s.key]
+                beta = torch.sigmoid(self.attn_beta[s.key]) * _SIGMOID_SCALE if self._bound_beta else self.attn_beta[s.key]
                 x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
 
         # --- Optional causal conv: pre-norm → conv → residual mix ---
@@ -1519,8 +1549,8 @@ class MultiStreamBlock(nn.Module):
             conv_out = self.conv(normed)
             for s in streams:
                 if not s.read_only and s.name in conv_out:
-                    alpha = torch.sigmoid(self.conv_alpha[s.key]) if self._bound_alpha else self.conv_alpha[s.key]
-                    beta = torch.sigmoid(self.conv_beta[s.key])
+                    alpha = torch.sigmoid(self.conv_alpha[s.key]) * _SIGMOID_SCALE if self._bound_alpha else self.conv_alpha[s.key]
+                    beta = torch.sigmoid(self.conv_beta[s.key]) * _SIGMOID_SCALE if self._bound_beta else self.conv_beta[s.key]
                     x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
 
         # --- Optional arithmetic attention: pre-norm → arith → residual mix ---
@@ -1531,8 +1561,8 @@ class MultiStreamBlock(nn.Module):
             arith_out = self.arith_attn(normed, num_compressed, num_view)
             for s in streams:
                 if not s.read_only and s.name in arith_out:
-                    alpha = torch.sigmoid(self.arith_alpha[s.key]) if self._bound_alpha else self.arith_alpha[s.key]
-                    beta = torch.sigmoid(self.arith_beta[s.key])
+                    alpha = torch.sigmoid(self.arith_alpha[s.key]) * _SIGMOID_SCALE if self._bound_alpha else self.arith_alpha[s.key]
+                    beta = torch.sigmoid(self.arith_beta[s.key]) * _SIGMOID_SCALE if self._bound_beta else self.arith_beta[s.key]
                     x[s.name] = beta * x[s.name] + alpha * arith_out[s.name]
 
         # --- MLP sub-layer: pre-norm → mlp → residual mix ---
@@ -1544,8 +1574,8 @@ class MultiStreamBlock(nn.Module):
             if s.read_only:
                 output[s.name] = x[s.name]
             elif s.name in mlp_out:
-                alpha = torch.sigmoid(self.mlp_alpha[s.key]) if self._bound_alpha else self.mlp_alpha[s.key]
-                beta = torch.sigmoid(self.mlp_beta[s.key])
+                alpha = torch.sigmoid(self.mlp_alpha[s.key]) * _SIGMOID_SCALE if self._bound_alpha else self.mlp_alpha[s.key]
+                beta = torch.sigmoid(self.mlp_beta[s.key]) * _SIGMOID_SCALE if self._bound_beta else self.mlp_beta[s.key]
                 output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
             else:
                 output[s.name] = x[s.name]

@@ -45,7 +45,7 @@ from multi_stream_attention import (
     MultiStreamCausalConvLayers,
     StreamMixingConfig,
 )
-from modules import SoftcapLinear, RMSNorm, CenterLastDim
+from modules import SoftcapLinear, RMSNorm, CenterLastDim, KroneckerLinear, MonarchLinear
 from multi_streams import (
     CompositeStream,
     CompressionType,
@@ -454,8 +454,9 @@ class MultiStreamGPT(nn.Module):
         # Residual mixing and skip connections
         use_resid_mix: bool = False,
         use_unet_skip: bool = False,
-        # Alpha bounding (passed to each MultiStreamBlock)
-        bound_alpha: bool = True,
+        # Alpha/beta bounding (passed to each MultiStreamBlock)
+        bound_alpha: bool = False,
+        bound_beta: bool = False,
         # Init noise
         init_noise_std: float = 0.01,
     ):
@@ -521,6 +522,8 @@ class MultiStreamGPT(nn.Module):
                 input_stream_ids=conv_input_streams,
                 output_stream_ids=conv_output_streams,
                 conv_channel_shuffle=preconv_channel_shuffle,
+                bound_alpha=bound_alpha,
+                bound_beta=bound_beta,
                 value_softcap=value_softcap,
             )
 
@@ -603,6 +606,7 @@ class MultiStreamGPT(nn.Module):
                     mlp_output_stream_ids=[_LOGIT_SID] if is_last_block else None,
                     value_softcap=value_softcap,
                     bound_alpha=bound_alpha,
+                    bound_beta=bound_beta,
                 )
             )
 
@@ -642,11 +646,25 @@ class MultiStreamGPT(nn.Module):
                 ]
             )
 
-        # -- Init noise for symmetry breaking --
+        # -- Zero-init output projections, then apply noise for symmetry breaking --
+        self._init_weights()
         if init_noise_std > 0:
             self._apply_init_noise(init_noise_std)
 
     # -- Initialization --
+
+    def _init_weights(self) -> None:
+        """Zero-init output projections marked with _zero_init."""
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Conv1d)) and getattr(
+                module, "_zero_init", False
+            ):
+                nn.init.zeros_(module.weight)
+            elif isinstance(module, (KroneckerLinear, MonarchLinear)) and getattr(
+                module, "_zero_init", False
+            ):
+                for p in module.parameters():
+                    nn.init.zeros_(p)
 
     def _apply_init_noise(self, std: float) -> None:
         """Add small Gaussian noise to alpha/beta/gate params for symmetry breaking."""
