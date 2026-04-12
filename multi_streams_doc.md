@@ -8,7 +8,7 @@ normalization and scaling are set up correctly for stable training.
 - `multi_stream_gpt.py` -- model definition, forward flow
 - `multi_streams.py` -- StreamDef, MultiStreamBuilder, StreamConfig
 - `multi_stream_attention.py` -- MultiStreamBlock, conv, MLP, mixing
-- `modules.py` -- RMSNorm, CenterLastDim, SoftcapLinear, GatedCausalConv
+- `modules.py` -- RMSNorm, CenterLastDim, SoftcapLinear, GatedCausalConv, StreamComponent, ContinuousRotation
 - `byte_modules.py` -- ByteLogitHierarchy, UTF8Prior, NumberExtractor
 - `byte_stream_components.py` -- STRUCTURAL stream components
 - `train_multi_stream_bytes.py` -- training hyperparameters, optimizer setup
@@ -35,7 +35,7 @@ pass through unchanged.
 input_ids (B, S)
     |
     v
-[1. Build Streams]  -->  LOGIT=zeros(208)  TOKENS=onehot(208)  CONTEXT=zeros(64)  STRUCTURAL=components(158)
+[1. Build Streams]  -->  LOGIT=zeros(208)  TOKENS=onehot(208)  CONTEXT=zeros(64)  STRUCTURAL=components(159)
     |
     v
 [2. Bigram Prior]   -->  LOGIT += bigram_logits[input_ids]      (trainable V x V lookup)
@@ -74,7 +74,7 @@ logits (B, S, 208)
 | **LOGIT** | 208 (=vocab_size) | No | `CenterLastDim` | zeros + bigram prior, /10, centered | ~[-0.5, +0.5] centered | Next-token logits |
 | **TOKENS** | 208 | Yes | None | `F.one_hot(input_ids, 208)` | {0, 1}, L2=1.0 | Token identity |
 | **CONTEXT** | 64 | No | `RMSNorm` | `torch.zeros(B, S, 64)` | 0 (all zeros) | Working memory |
-| **STRUCTURAL** | 158 (actual) | Yes | None | Concatenated components | mixed, mostly [-1, +1] | Byte-level features |
+| **STRUCTURAL** | 159 (actual) | Yes | None | Concatenated components | calibrated (mean≈0, std≈1 on ~46 dims) | Byte-level features |
 
 > **STRUCTURAL dim:** The inline comments in `build_multi_stream_components()` have been
 > corrected to reflect the actual dimensions with current ROTATION encoding defaults.
@@ -131,23 +131,27 @@ deterministic features from `input_ids` only (no learnable parameters).
 | `VowelConsonantComponent` | 2 | {-1,0,+1} + **[0, ~7]** | vc_state + log1p(run_length) |
 | `ColumnPositionComponent(num_freqs=3)` | 6 | [-1, +1] | sin/cos of column position |
 | `RepeatedByteComponent` | 2 | {-1,+1} + **[0, ~7]** | is_repeat + log1p(run_length) |
-| `PunctuationDepthComponent` | 2 | **unbounded int** + {-1,+1} | bracket_depth + quote_state |
+| `PunctuationDepthComponent` | 3 | [-1, +1] + {-1,+1} | ContinuousRotation(bracket_depth) + quote_state |
 | `ByteCategoryStatsComponent` | 6 | [0, 1] | running category fractions |
 | `DigitSequenceComponent(id_freqs=5)` | 13 | {-1,+1} + [-1,+1] | in_digit + rotation + sincos |
 | `DigitComputeComponent` | 27 | {-1,0,+1} + [-1,+1] + {0,1} | sign + rotation digits + comparisons |
 | `ByteHashComponent` (x6) | 36 | [-1,+1] + **[0, ~7]** + [0,1] | sin/cos hashes + log1p(hits) + hit_frac |
 | `BoundaryComponent(3,3,2,2,2,2)` | 28 | [-1, +1] | sin/cos word/sent/para position+ID |
-| **Total** | **158** | | |
+| **Total** | **159** | | |
 
 **Scale concerns** (bolded above):
 - **log1p run lengths**: CaseComponent, VowelConsonantComponent, RepeatedByteComponent,
   ByteHashComponent hit_log -- can reach ~7 for seq_len=1024 (`log1p(1023) ~ 6.9`).
   Most other features are in [-1, +1].
-- **PunctuationDepthComponent bracket_depth**: raw integer cumsum, theoretically unbounded.
-  In practice rarely exceeds ~10 for web text.
-- **No normalization is applied to STRUCTURAL.** The mixed scales are absorbed by learned
-  W_q/W_k/W_v projection weights, but some dimensions will have 7x larger gradients than
-  others initially.
+- **PunctuationDepthComponent bracket_depth**: now encoded via `ContinuousRotation(cap)`
+  with `min_depth=-3, max_depth=8`, mapping depths to a 2D unit rotation. Bounded to
+  [-1, +1]. Depths beyond the range saturate at boundary angles.
+
+**Calibration:** `CompositeStream.calibrate()` standardizes ~46 of 159 dims (those marked
+`standardizable=True`) to mean≈0, std≈1 using a two-pass mean/std computed from training
+data. Non-standardizable dims (rotation pairs, sin/cos) are left unchanged (scale=1,
+shift=0). Calibration is run once during training init at `args.train_seq_len`.
+A noise floor (std ≤ 1e-5 → skip) and scale cap (max 1000×) guard against degenerate dims.
 
 ---
 
@@ -166,7 +170,7 @@ streams, compressed, views = self.builder(input_ids, dtype=dtype)
 | LOGIT | `zeros(B, S, 208)` | 0 |
 | TOKENS | `one_hot(input_ids, 208)` | {0, 1} |
 | CONTEXT | `zeros(B, S, 64)` | 0 |
-| STRUCTURAL | `cat(components)` shape `(B, S, 158)` | mixed, mostly [-1, +1] |
+| STRUCTURAL | `cat(components)` shape `(B, S, 159)` | calibrated, mostly [-1, +1] |
 
 Also produces `compressed` (streams gathered at number positions) and `views` (CompressedView
 metadata) for arithmetic attention.
@@ -217,8 +221,8 @@ See `MultiStreamCausalConvLayers` (`multi_stream_attention.py:826`).
 
 Each conv layer:
 1. Pre-norm all streams: `CenterLastDim(LOGIT)`, `RMSNorm(CONTEXT)`
-2. Concatenate input streams: dim = 208 + 64 + 158 = 430
-3. `GatedCausalConv(dim=430, kernel_size=4, groups=6)`:
+2. Concatenate input streams: dim = 208 + 64 + 159 = 431
+3. `GatedCausalConv(dim=431, kernel_size=4, groups=6)`:
    - `gate = sigmoid(conv_gate(x) * std_repair)` -- in [0, 1]
    - `value = SiLU(conv_value(x) * std_repair)` -- std_repair = `1/sqrt(fan_in)`
    - `value_softcap(value)` -- caps at +/-30 (identity for |x|<24)
@@ -277,7 +281,7 @@ Adds 0 (valid token) or -inf (impossible token) based on UTF-8 byte state.
 
 | Stage | LOGIT | CONTEXT | TOKENS | STRUCTURAL |
 |-------|-------|---------|--------|------------|
-| After builder | 0 | 0 | {0,1} | mixed [-1,+1] mostly |
+| After builder | 0 | 0 | {0,1} | calibrated, mostly [-1,+1] |
 | After bigram | ~[-5, +5] | 0 | {0,1} | same |
 | After /10 | ~[-0.5, +0.5] | 0 | {0,1} | same |
 | After init norms | centered ~[-0.5, +0.5] | 0 | {0,1} | same |
@@ -358,7 +362,7 @@ centered (zero-mean), CONTEXT stays at RMS=1.
 Used when `mixing_config is None` (default).
 
 - **Reads:** All 4 streams, concatenated into a single vector.
-  Input dim = 208 + 208 + 64 + 158 = 638.
+  Input dim = 208 + 208 + 64 + 159 = 639.
 - **Q/K/V:** Single projection from concatenated input:
   - `W_q`: 638 -> `num_heads * head_dim` (8 * 16 = 128)
   - `W_k`: 638 -> `num_kv_heads * head_dim` (4 * 16 = 64)
@@ -401,7 +405,7 @@ Used when `mixing_config is not None`.
 **File:** `multi_stream_attention.py:604`
 
 - **Reads:** All streams (configurable via `input_stream_ids`), concatenated.
-  Input dim = sum of selected stream dims (default: all = 638).
+  Input dim = sum of selected stream dims (default: all = 639).
 - **Up-projection:** `fc_up`: 638 -> `hidden_dim` (default = 2 * writable_dim = 2 * 272 = 544)
 - **Activation:** `leaky_relu(x, slope=0.5).square()` -- squared activation for self-gating.
 - **Down-projection per stream:**
@@ -420,7 +424,7 @@ Used when `mixing_config is not None`.
 **Conv Layers:** `multi_stream_attention.py:826`
 
 - **Reads:** Configurable via `input_stream_ids`. Default: LOGIT + CONTEXT + STRUCTURAL
-  (excludes TOKENS). Concatenated: dim = 208 + 64 + 158 = 430.
+  (excludes TOKENS). Concatenated: dim = 208 + 64 + 159 = 431.
 - **Writes:** Configurable via `output_stream_ids`. Default: CONTEXT only
   (excludes LOGIT). In `MultiStreamBlock`, block conv can write to different streams.
 - **Mechanism:** `GatedCausalConv` (`modules.py:495`):
@@ -513,28 +517,39 @@ CenterLastDim only removes the mean, not the variance. In bfloat16, large interm
 values (>~100) lose precision. However, value_softcap inside sub-layers + sigmoid gating
 make this unlikely in practice.
 
-### 7.3 STRUCTURAL Stream: Mixed Scales
+### 7.3 STRUCTURAL Stream: Calibrated Standardization
 
-**Issue:** Most STRUCTURAL features are in [-1, +1], but several are not:
+All 19 STRUCTURAL components inherit from `StreamComponent` (`modules.py`).  Each
+component declares a `standardizable_mask` — a per-dim bool tuple indicating which
+dims can be z-normalized without breaking geometric structure (rotation pairs and
+sin/cos must remain untouched).
 
-| Feature | Scale | Concern |
-|---------|-------|---------|
-| Case/VC/Repeat run lengths | [0, ~7] (log1p) | 7x larger than sin/cos features |
-| ByteHash hit_log | [0, ~7] (log1p) | Same |
-| PunctuationDepth bracket_depth | unbounded integer | Can exceed 10 for deeply nested text |
-| MultiByteState remaining | [-1, +3] | 3x on positive side |
-| ByteCategoryStats | [0, 1] | Centered at ~0.5, not [-1,+1] |
+`CompositeStream.calibrate()` computes per-dim mean/std from training data, then
+applies `scale = (1/std).clamp(max=1000)`, `shift = -mean * scale` on standardizable
+dims only.  At runtime, `forward()` applies one fused `x * scale + shift` over the
+full 159-dim concatenation.  ~46 of 159 dims are standardizable.
 
-**Impact:** Since STRUCTURAL is read-only and feeds into learned linear projections
-(W_q, W_k, W_v, conv), the mixed scales are absorbed by the projection weights. However:
-- Larger-scale dimensions will have proportionally larger initial gradients
-- The projection weights must learn to down-weight large-scale features
-- PunctuationDepthComponent's unbounded bracket_depth is the most concerning --
-  extreme nesting depths could cause outlier activations
+**Remaining scale heterogeneity** (non-standardizable dims):
 
-**No normalization is applied to STRUCTURAL.** This is deliberate (deterministic features
-with known distributions), but the scale mismatch between features could slow initial
-convergence for balanced feature utilization.
+| Feature | Scale | Notes |
+|---------|-------|-------|
+| Sin/cos pairs (SinCosPosition, ColumnPosition, Boundary, etc.) | [-1, +1] | Unit circle, consistent |
+| Rotation pairs (ByteCategory, PunctuationDepth depth, DigitSequence/Compute) | [-1, +1] | Unit norm vectors |
+
+**Standardizable dims** (post-calibration, mean≈0, std≈1):
+
+| Feature | Raw Scale | Notes |
+|---------|-----------|-------|
+| Case/VC/Repeat run lengths | [0, ~7] (log1p) | Was 7x larger than sin/cos before calibration |
+| ByteHash hit_log + hit_frac | [0, ~7] + [0, 1] | Now centered and scaled |
+| ByteCategoryStats fractions | [0, 1], std 0.01-0.03 | Heavily upscaled |
+| DigitCompute signs/comparisons | {-1, 0, +1} sparse | Centered; sparse dims may drift between data splits |
+| PunctuationDepth quote_state | {-1, +1} biased | ~99% outside quotes |
+| MultiByteState binary/scalar | {-1,+1} + [0, 3] | First 2 dims standardized |
+
+**PunctuationDepth bracket_depth** was formerly an unbounded integer cumsum.
+It is now encoded via `ContinuousRotation(min_depth=-3, max_depth=8, mode="cap")`,
+producing a 2D unit rotation bounded to [-1, +1].
 
 ### 7.4 q_gain Initialization at 0.0
 
@@ -578,8 +593,9 @@ The normalization scheme is **layered and deliberate**:
    arbitrary mixing. Post-norm after every mix maintains invariants.
 
 The main areas that could benefit from attention:
-- **STRUCTURAL scale heterogeneity**: Consider normalizing or clamping
-  PunctuationDepthComponent bracket_depth (e.g., `tanh(depth/10)` or log1p).
+- **STRUCTURAL sparse features**: After calibration, ~46 standardizable dims are
+  well-behaved at the training seq_len, but sparse features (digit signs, quote state)
+  can drift between data splits or at different sequence lengths.
 - **LOGIT magnitude control**: CenterLastDim doesn't bound variance. If training shows
   growing LOGIT magnitudes inside blocks, consider RMSNorm (but note it would no longer
   be lossless for cross-entropy -- the model would need to learn the softmax temperature
