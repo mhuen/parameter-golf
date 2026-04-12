@@ -49,8 +49,8 @@ def _make_arith_attn(n_max: int = 4) -> CausalArithmeticMultiStreamAttention:
     context_id = StreamID(StreamType.CONTEXT)
     stream_config = MultiStreamConfig(
         streams=[
-            StreamConfig(logit_id, dim=tok.vocab_size, read_only=False, norm_type=CenterLastDim),
-            StreamConfig(context_id, dim=16, read_only=False, norm_type=RMSNorm),
+            StreamConfig(logit_id, dim=tok.vocab_size, read_only=False, input_norm_types=[CenterLastDim, RMSNorm]),
+            StreamConfig(context_id, dim=16, read_only=False, input_norm_types=[RMSNorm]),
         ]
     )
     return CausalArithmeticMultiStreamAttention(

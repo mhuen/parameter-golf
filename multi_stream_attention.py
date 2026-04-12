@@ -32,9 +32,13 @@ from multi_streams import (
 
 
 def _build_stream_norms(streams: list[StreamConfig]) -> nn.ModuleDict:
-    """Create per-stream norm instances for streams that have a norm_type."""
+    """Create per-stream input norm stacks from ``input_norm_types``."""
     return nn.ModuleDict(
-        {s.key: s.norm_type() for s in streams if s.norm_type is not None}
+        {
+            s.key: nn.Sequential(*[nt() for nt in s.input_norm_types])
+            for s in streams
+            if s.input_norm_types
+        }
     )
 
 
@@ -114,7 +118,9 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
-        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
+        self.value_softcap = (
+            SoftcapLinear(value_softcap) if value_softcap is not None else None
+        )
 
         self.stream_config = stream_config
         self.mixing_config = mixing_config
@@ -452,7 +458,9 @@ class CausalMultiStreamAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
-        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
+        self.value_softcap = (
+            SoftcapLinear(value_softcap) if value_softcap is not None else None
+        )
         self.stream_config = stream_config
         self._stream_lookup: dict[StreamID, StreamConfig] = {
             s.name: s for s in stream_config.streams
@@ -622,7 +630,9 @@ class MultiStreamMLP(nn.Module):
         super().__init__()
         self.stream_config = stream_config
         self.gated_output = gated_output
-        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
+        self.value_softcap = (
+            SoftcapLinear(value_softcap) if value_softcap is not None else None
+        )
         self.leaky_relu_slope = leaky_relu_slope
         self._logit_hierarchy = logit_hierarchy
         _lkw = linear_kwargs or {}
@@ -934,8 +944,7 @@ class MultiStreamCausalConvLayers(nn.Module):
             for s in self._output_streams:
                 alpha = torch.sigmoid(self.alphas[layer_idx][s.key])
                 beta = torch.sigmoid(self.betas[layer_idx][s.key])
-                mixed = beta * normed[s.name] + alpha * conv_out[s.name]
-                x[s.name] = norms[s.key](mixed) if s.key in norms else mixed
+                x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
         return x
 
 
@@ -1355,7 +1364,7 @@ class MultiStreamBlock(nn.Module):
         super().__init__()
         self.stream_config = stream_config
 
-        # Per-stream norms — type determined by stream_config.norm_type
+        # Per-stream input norms (pre-norm only, no post-norm on residual)
         all_streams = list(stream_config.streams)
         self.attn_norms = _build_stream_norms(all_streams)
         self.mlp_norms = _build_stream_norms(all_streams)
@@ -1474,7 +1483,7 @@ class MultiStreamBlock(nn.Module):
     ) -> dict[StreamID, Tensor]:
         streams = list(self.stream_config.streams)
 
-        # --- Attention sub-layer: pre-norm → attn → mix → re-norm ---
+        # --- Attention sub-layer: pre-norm → attn → residual mix ---
         normed = _apply_stream_norms(self.attn_norms, streams, input_streams)
         attn_out = self.attn(normed)
 
@@ -1485,12 +1494,9 @@ class MultiStreamBlock(nn.Module):
             else:
                 alpha = torch.sigmoid(self.attn_alpha[s.key])
                 beta = torch.sigmoid(self.attn_beta[s.key])
-                mixed = beta * normed[s.name] + alpha * attn_out[s.name]
-                x[s.name] = (
-                    self.attn_norms[s.key](mixed) if s.key in self.attn_norms else mixed
-                )
+                x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
 
-        # --- Optional causal conv: pre-norm → conv → mix → re-norm ---
+        # --- Optional causal conv: pre-norm → conv → residual mix ---
         if self.conv is not None:
             normed = _apply_stream_norms(self.conv_norms, streams, x)
             conv_out = self.conv(normed)
@@ -1498,14 +1504,9 @@ class MultiStreamBlock(nn.Module):
                 if not s.read_only and s.name in conv_out:
                     alpha = torch.sigmoid(self.conv_alpha[s.key])
                     beta = torch.sigmoid(self.conv_beta[s.key])
-                    mixed = beta * normed[s.name] + alpha * conv_out[s.name]
-                    x[s.name] = (
-                        self.conv_norms[s.key](mixed)
-                        if s.key in self.conv_norms
-                        else mixed
-                    )
+                    x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
 
-        # --- Optional arithmetic attention: pre-norm → arith → mix → re-norm ---
+        # --- Optional arithmetic attention: pre-norm → arith → residual mix ---
         if self.arith_attn is not None and compressed is not None and views is not None:
             normed = _apply_stream_norms(self.arith_norms, streams, x)
             num_compressed = compressed[CompressionType.NUMBER]
@@ -1515,14 +1516,9 @@ class MultiStreamBlock(nn.Module):
                 if not s.read_only and s.name in arith_out:
                     alpha = torch.sigmoid(self.arith_alpha[s.key])
                     beta = torch.sigmoid(self.arith_beta[s.key])
-                    mixed = beta * normed[s.name] + alpha * arith_out[s.name]
-                    x[s.name] = (
-                        self.arith_norms[s.key](mixed)
-                        if s.key in self.arith_norms
-                        else mixed
-                    )
+                    x[s.name] = beta * x[s.name] + alpha * arith_out[s.name]
 
-        # --- MLP sub-layer: pre-norm → mlp → mix → re-norm ---
+        # --- MLP sub-layer: pre-norm → mlp → residual mix ---
         normed = _apply_stream_norms(self.mlp_norms, streams, x)
         mlp_out = self.mlp(normed)
 
@@ -1533,10 +1529,7 @@ class MultiStreamBlock(nn.Module):
             elif s.name in mlp_out:
                 alpha = torch.sigmoid(self.mlp_alpha[s.key])
                 beta = torch.sigmoid(self.mlp_beta[s.key])
-                mixed = beta * normed[s.name] + alpha * mlp_out[s.name]
-                output[s.name] = (
-                    self.mlp_norms[s.key](mixed) if s.key in self.mlp_norms else mixed
-                )
+                output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
             else:
                 output[s.name] = x[s.name]
 

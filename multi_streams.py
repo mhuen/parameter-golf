@@ -60,11 +60,7 @@ class StreamConfig:
     dim: int
     read_only: bool = False
     norm_type: type[nn.Module] | None = None
-
-    @property
-    def normalize(self) -> bool:
-        """Backward compat: True when any norm is configured."""
-        return self.norm_type is not None
+    input_norm_types: list[type[nn.Module]] | None = None
 
     @property
     def key(self) -> str:
@@ -90,6 +86,7 @@ class StreamDef:
     name: StreamID
     read_only: bool = False
     norm_type: type[nn.Module] | None = None
+    input_norm_types: list[type[nn.Module]] | None = None
     dim: int | None = None
     components: list[nn.Module] | None = None
     auto_zeros: bool = False
@@ -276,7 +273,11 @@ class MultiStreamBuilder(nn.Module):
             dim = self._resolve_dim(sd)
             stream_configs.append(
                 StreamConfig(
-                    sd.name, dim=dim, read_only=sd.read_only, norm_type=sd.norm_type
+                    sd.name,
+                    dim=dim,
+                    read_only=sd.read_only,
+                    norm_type=sd.norm_type,
+                    input_norm_types=sd.input_norm_types,
                 )
             )
             if sd.components is not None:

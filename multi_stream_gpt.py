@@ -157,6 +157,7 @@ def build_multi_stream_components(
             logit_id,
             read_only=False,
             norm_type=CenterLastDim,
+            input_norm_types=[CenterLastDim, RMSNorm],
             dim=vocab_size,
             auto_zeros=True,
         ),
@@ -165,6 +166,7 @@ def build_multi_stream_components(
             context_id,
             read_only=False,
             norm_type=RMSNorm,
+            input_norm_types=[RMSNorm],
             dim=context_dim,
             auto_zeros=True,
         ),
@@ -354,8 +356,8 @@ class MultiStreamGPT(nn.Module):
         stream_config = components.stream_config
         self._stream_config = stream_config
 
-        # Initial norms to establish the "always normalized" invariant
-        # before streams enter the first block.
+        # One-time init norms (from norm_type) before the first block.
+        # Blocks use input_norm_types as pre-norm; no post-norm on residual.
         self.init_norms = nn.ModuleDict(
             {
                 s.key: s.norm_type()
@@ -526,17 +528,17 @@ class MultiStreamGPT(nn.Module):
         if self.bigram_prior is not None:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] + self.bigram_prior(input_ids)
 
-        # 2b. Scale LOGIT stream down so all streams are at ~unit scale.
+        # 2b. Initial normalization to each stream if specified.
+        for s in self._stream_config.streams:
+            if s.key in self.init_norms:
+                streams[s.name] = self.init_norms[s.key](streams[s.name])
+
+        # 2c. Scale LOGIT stream down so all streams are at ~unit scale.
         #     Reversed in step 5 before softcap.
         if self.logit_stream_normalization_factor != 1:
             streams[_LOGIT_SID] = streams[_LOGIT_SID] * (
                 1.0 / self.logit_stream_normalization_factor
             )
-
-        # 2c. Initial normalization to establish the "always normalized" invariant.
-        for s in self._stream_config.streams:
-            if s.key in self.init_norms:
-                streams[s.name] = self.init_norms[s.key](streams[s.name])
 
         # 3. Pre-processing conv layers.
         if self.preconv_layers is not None:
