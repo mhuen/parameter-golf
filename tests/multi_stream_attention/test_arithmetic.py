@@ -433,6 +433,7 @@ if __name__ == "__main__":
     msgpt_model = MultiStreamGPTTestModel(
         tok=tok,
         vocab_size=tok.vocab_size,
+        make_batch_fn=make_batch,
         num_heads=2,
         num_kv_heads=2,
         num_layers=1,

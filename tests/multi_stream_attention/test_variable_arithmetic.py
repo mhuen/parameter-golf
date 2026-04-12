@@ -375,6 +375,7 @@ if __name__ == "__main__":
             MultiStreamGPTTestModel(
                 tok=tok,
                 vocab_size=tok.vocab_size,
+                make_batch_fn=make_batch_mixed,
                 num_heads=2,
                 num_kv_heads=2,
                 num_layers=1,

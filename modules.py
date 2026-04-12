@@ -363,7 +363,7 @@ class StreamComponent(nn.Module):
         device = self._std_scale.device
         outputs: list[Tensor] = []
         for ids in input_ids_batches:
-            raw = self.compute(ids.to(device), dtype=torch.float32)
+            raw = self.compute(ids.to(device=device, dtype=torch.long), dtype=torch.float32)
             outputs.append(raw.reshape(-1, self.dim))
         cat = torch.cat(outputs, dim=0)
         mean = cat.mean(dim=0)
@@ -687,7 +687,9 @@ class GatedCausalConv(nn.Module):
 
         self.pad = kernel_size - 1
         self.gated = gated
-        self.value_softcap = SoftcapLinear(value_softcap) if value_softcap is not None else None
+        self.value_softcap = (
+            SoftcapLinear(value_softcap) if value_softcap is not None else None
+        )
         # Shifting only matters when groups partition channels into 2+ groups
         self.channel_shift = channel_shift if groups not in (1, dim) else 0
 
@@ -753,7 +755,6 @@ class SoftcapLinear(nn.Module):
         excess = (x.abs() - self.knee).clamp(min=0)
         compression = excess.square() / (self.r + excess)
         return x - x.sign() * compression
-
 
 
 # ---------------------------------------------------------------------------

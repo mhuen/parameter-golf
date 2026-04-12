@@ -15,8 +15,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+import glob
+from pathlib import Path
+import numpy as np
 
 from byte_modules import ByteLogitHierarchy, NumberExtractor, UTF8Prior
+from data import load_shard_byte260
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_stream_components import (
     BoundaryComponent,
@@ -42,6 +46,7 @@ from multi_stream_attention import (
 )
 from modules import SoftcapLinear, RMSNorm, CenterLastDim
 from multi_streams import (
+    CompositeStream,
     CompressionType,
     DocBoundaryComponent,
     MultiStreamBuilder,
@@ -157,7 +162,8 @@ def build_multi_stream_components(
             logit_id,
             read_only=False,
             norm_type=CenterLastDim,
-            input_norm_types=[CenterLastDim, RMSNorm],
+            # input_norm_types=[CenterLastDim, RMSNorm],
+            input_norm_types=[CenterLastDim],
             dim=vocab_size,
             auto_zeros=True,
         ),
@@ -227,6 +233,113 @@ class BigramPriorLayer(nn.Module):
     def forward(self, input_ids: Tensor) -> Tensor:
         """Return (B, S, vocab_size) bigram logit deltas."""
         return self.bigram_logits[input_ids]
+
+
+# ---------------------------------------------------------------------------
+# Calibration and bigram initialization
+# ---------------------------------------------------------------------------
+
+
+# TODO: pull out and simplify shared loading logic from load_calibration_batches and compute_bigram_log_probs
+def load_calibration_batches(
+    train_pattern: str,
+    tok: EfficientByteTokenizer,
+    seq_len: int = 512,
+    batch_size: int = 16,
+    n_batches: int = 20,
+) -> list[Tensor]:
+    """Load token batches from training shards for model calibration.
+
+    Reads as many shard files as needed to fill *n_batches* batches of
+    shape ``(batch_size, seq_len)``.
+    """
+
+    needed = n_batches * batch_size * seq_len
+    files = [Path(p) for p in sorted(glob.glob(train_pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
+
+    chunks: list[Tensor] = []
+    total = 0
+    for f in files:
+        tokens = load_shard_byte260(f, tok)
+        chunks.append(tokens)
+        total += tokens.numel()
+        if total >= needed:
+            break
+
+    all_tokens = torch.cat(chunks)
+    n_seqs = min(all_tokens.numel() // seq_len, n_batches * batch_size)
+    all_tokens = all_tokens[: n_seqs * seq_len].reshape(-1, seq_len)
+    return list(all_tokens.split(batch_size))
+
+
+def compute_bigram_log_probs(
+    train_pattern: str,
+    tok: EfficientByteTokenizer,
+    vocab_size: int,
+    smoothing: float = 0.1,
+    max_data_bytes: int = 1_000_000,
+    token_batches: list[Tensor] | None = None,
+) -> Tensor:
+    """Compute bigram log-probabilities from training data.
+
+    Counts consecutive-token bigrams, smooths, normalizes, and returns
+    ``(V, V)`` float32 log-probabilities.
+
+    If ``token_batches`` is provided, uses those directly instead of loading
+    from shard files.
+    """
+    if token_batches is not None:
+        all_tokens = (
+            torch.cat([b.reshape(-1) for b in token_batches]).numpy().astype(np.int64)
+        )
+        if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
+            all_tokens = all_tokens[:max_data_bytes]
+        if len(all_tokens) < max_data_bytes:
+            raise ValueError(
+                f"Not enough tokens in provided batches: {len(all_tokens):,} < max_data_bytes ({max_data_bytes:,})"
+            )
+    else:
+        files = [Path(p) for p in sorted(glob.glob(train_pattern))]
+        if not files:
+            raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
+
+        print(f"bigram_init: loading tokens (max={max_data_bytes:,})...")
+
+        token_chunks: list[np.ndarray] = []
+        total = 0
+        for f in files:
+            toks = load_shard_byte260(f, tok).numpy().astype(np.int64)
+            token_chunks.append(toks)
+            total += len(toks)
+            if max_data_bytes > 0 and total >= max_data_bytes:
+                break
+        all_tokens = np.concatenate(token_chunks)
+        if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
+            all_tokens = all_tokens[:max_data_bytes]
+        del token_chunks
+
+    print(f"bigram_init: counting bigrams over {len(all_tokens):,} tokens...")
+
+    # Count bigrams: (all_tokens[i], all_tokens[i+1]) for all consecutive pairs.
+    prev_tokens = all_tokens[:-1]
+    next_tokens = all_tokens[1:]
+    counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
+    np.add.at(counts, (prev_tokens, next_tokens), 1)
+    del all_tokens, prev_tokens, next_tokens
+
+    # Smooth, normalize, log-transform.
+    counts += smoothing
+    counts /= counts.sum(axis=1, keepdims=True)
+    log_probs = np.log(counts).astype(np.float32)
+
+    print(
+        f"bigram_init: done (min={log_probs.min():.3f} "
+        f"max={log_probs.max():.3f} mean={log_probs.mean():.3f})"
+    )
+
+    return torch.from_numpy(log_probs)
 
 
 # ---------------------------------------------------------------------------
@@ -596,3 +709,111 @@ class MultiStreamGPT(nn.Module):
             flat_targets = input_ids[:, 1:].contiguous().view(-1)
         loss = F.cross_entropy(flat_logits, flat_targets, reduction="mean")
         return loss, logits
+
+
+# ----------------------------
+# MultiStreamGPT factory class
+# ----------------------------
+
+
+# TODO: do placment to device, bfloat16 and restore_low_dim_params_to_fp32 here as well?
+def build_multi_stream_gpt(
+    tok: EfficientByteTokenizer,
+    vocab_size: int,
+    context_dim: int = 64,
+    n_max: int = 32,
+    logit_softcap: float = 30.0,
+    structured_output_logits: bool = True,
+    calibrate_structural_stream: bool = True,
+    calibration_sequence_length: int | None = None,
+    calibration_batch_size: int = 32,
+    calibration_n_batches: int = 1000,
+    calibration_batches: list[Tensor] | None = None,
+    include_bigram_prior: bool = True,
+    train_pattern: str = "./data/datasets/fineweb10B_byte260/fineweb_train_*.bin",
+    bigram_init_smoothing: float = 0.1,
+    **model_kwargs,
+) -> MultiStreamGPT:
+    """Convenience factory to build a MultiStreamGPT with default components.
+
+    Calibration data can be provided in two ways:
+    - ``calibration_batches``: pre-built list of ``(B, S)`` token tensors
+    - ``train_pattern`` + ``calibration_sequence_length``: load from shard files
+    If ``calibration_batches`` is given it takes priority.
+    """
+    components = build_multi_stream_components(
+        tok=tok,
+        vocab_size=vocab_size,
+        context_dim=context_dim,
+        n_max=n_max,
+        logit_softcap=logit_softcap,
+        structured_output_logits=structured_output_logits,
+    )
+
+    # calibrate structural stream
+    if calibrate_structural_stream:
+        print("Calibrating structural stream with training data...")
+
+        if calibration_batches is None:
+            if calibration_sequence_length is None:
+                raise ValueError(
+                    "calibration_sequence_length must be specified when "
+                    "calibrate_structural_stream is True and calibration_batches "
+                    "is not provided"
+                )
+            calibration_batches = load_calibration_batches(
+                train_pattern=train_pattern,
+                tok=tok,
+                seq_len=calibration_sequence_length,
+                batch_size=calibration_batch_size,
+                n_batches=calibration_n_batches,
+            )
+
+        structural_stream: CompositeStream = components.builder.composites[
+            str(StreamID(StreamType.STRUCTURAL))
+        ]  # type: ignore
+        structural_stream.calibrate(input_ids_batches=calibration_batches)
+    else:
+        print("Skipping structural stream calibration")
+
+    model = MultiStreamGPT(
+        components=components,
+        include_bigram_prior=include_bigram_prior,
+        logit_softcap=logit_softcap,
+        **model_kwargs,
+    )
+
+    # compute bigram init from training data and load into the model
+    if include_bigram_prior:
+        if model.bigram_prior is None:
+            raise ValueError("bigram_prior should be included based on the flag")
+        bigram_log_probs = compute_bigram_log_probs(
+            train_pattern=train_pattern,
+            tok=tok,
+            vocab_size=model.bigram_prior.bigram_logits.shape[0],
+            smoothing=bigram_init_smoothing,
+            token_batches=calibration_batches,
+        )
+        with torch.no_grad():
+            model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
+        bl = model.bigram_prior.bigram_logits.data
+        print(
+            f"bigram_prior: mean={bl.mean():.3f} std={bl.std():.3f} "
+            f"min={bl.min():.3f} max={bl.max():.3f}"
+        )
+    else:
+        print("bigram_prior: not included, skipping initialization")
+
+    # Print per-component parameter breakdown
+    print("MultiStreamGPT components:")
+    for name, child in model.named_children():
+        n = sum(p.numel() for p in child.parameters())
+        if n > 0:
+            suffix = ""
+            if isinstance(child, nn.ModuleList) and len(child) > 0:
+                suffix = f" ({len(child)} modules)"
+            print(f"  {name}: {n:,} params{suffix}")
+    total = sum(p.numel() for p in model.parameters())
+    print(f"  total: {total:,} params")
+
+    return model

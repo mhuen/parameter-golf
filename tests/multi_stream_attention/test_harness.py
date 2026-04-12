@@ -37,8 +37,12 @@ from multi_stream_attention import (
     MultiStreamBlock,
     StreamMixingConfig,
 )
-from multi_stream_gpt import MultiStreamGPT, build_multi_stream_components
+from multi_stream_gpt import build_multi_stream_gpt
 
+MakeBatchFn = Callable[
+    [EfficientByteTokenizer, int],  # (tok, batch_size) ->
+    tuple[Tensor, Tensor],  # (input_ids, targets)
+]
 
 # ---------------------------------------------------------------------------
 # TinyGPT baseline (self-contained, no train_gpt.py dependency)
@@ -247,49 +251,60 @@ class MultiStreamTestModel(nn.Module):
 class MultiStreamGPTTestModel(nn.Module):
     """Wraps MultiStreamGPT for test compatibility (returns only logits).
 
-    Uses build_multi_stream_components() for the full default stream setup
-    (LOGIT, TOKENS, CONTEXT, STRUCTURAL with all byte-stream components).
+    Uses build_multi_stream_gpt() with the full default stream setup.
+
+    Args:
+        make_batch_fn: Required. Used to derive calibration_sequence_length
+            and, when ``use_synthetic_calibration=True``, to generate
+            calibration data for structural stream and bigram init.
+        use_synthetic_calibration: If True (default), generate calibration
+            batches from ``make_batch_fn``. If False, use fineweb shard files.
     """
 
     def __init__(
         self,
         tok: EfficientByteTokenizer,
         vocab_size: int,
+        make_batch_fn: MakeBatchFn,
         num_heads: int = 1,
         num_kv_heads: int = 1,
         num_layers: int = 1,
         multi_head_dim: int = 32,
         context_dim: int = 64,
         dtype: torch.dtype = torch.float32,
+        calibrate_structural_stream: bool = True,
+        include_bigram_prior: bool = True,
+        use_synthetic_calibration: bool = True,
+        calibration_n_batches: int = 1000,
+        calibration_batch_size: int = 64,
         **gpt_kwargs,
     ):
         super().__init__()
         self.dtype = dtype
-        components = build_multi_stream_components(
+
+        calibration_sequence_length = make_batch_fn(tok, 1)[0].shape[-1]
+
+        calib_batches: list[Tensor] | None = None
+        if use_synthetic_calibration:
+            calib_batches = [
+                make_batch_fn(tok, calibration_batch_size)[0]
+                for _ in range(calibration_n_batches)
+            ]
+
+        self.gpt = build_multi_stream_gpt(
             tok=tok,
             vocab_size=vocab_size,
             context_dim=context_dim,
-        )
-        self.gpt = MultiStreamGPT(
-            components=components,
+            calibrate_structural_stream=calibrate_structural_stream,
+            include_bigram_prior=include_bigram_prior,
+            calibration_sequence_length=calibration_sequence_length,
+            calibration_batches=calib_batches,
             multi_head_dim=multi_head_dim,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             num_layers=num_layers,
             **gpt_kwargs,
         )
-
-        # Print per-component parameter breakdown
-        print("MultiStreamGPT components:")
-        for name, child in self.gpt.named_children():
-            n = sum(p.numel() for p in child.parameters())
-            if n > 0:
-                suffix = ""
-                if isinstance(child, nn.ModuleList) and len(child) > 0:
-                    suffix = f" ({len(child)} modules)"
-                print(f"  {name}: {n:,} params{suffix}")
-        total = sum(p.numel() for p in self.gpt.parameters())
-        print(f"  total: {total:,} params")
 
     def forward(self, input_ids: Tensor) -> Tensor:
         logits, _streams = self.gpt(input_ids, dtype=self.dtype)
@@ -338,12 +353,6 @@ def count_params(model: nn.Module, label: str = "") -> int:
     else:
         print(f"  params: {n:,}")
     return n
-
-
-MakeBatchFn = Callable[
-    [EfficientByteTokenizer, int],  # (tok, batch_size) ->
-    tuple[Tensor, Tensor],  # (input_ids, targets)
-]
 
 
 def _collect_k_shift_modules(model: nn.Module) -> list[tuple[str, nn.Module]]:

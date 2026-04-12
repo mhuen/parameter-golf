@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime
-import glob
 import io
 import math
 import os
@@ -51,8 +50,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from efficient_byte_tokenizer import ByteCategory, EfficientByteTokenizer
 from multi_stream_gpt import (
     MultiStreamGPT,
-    build_multi_stream_components,
-    BigramPriorLayer,
+    build_multi_stream_gpt,
 )
 from multi_stream_attention import StreamMixingConfig, MixingMode, MixingSource
 from multi_streams import StreamID, StreamType
@@ -66,7 +64,6 @@ import optim as _optim_mod
 from optim import Muon, _GRAM_NS_LIB
 from debug_nan import NaNWatchdog
 from data import (
-    load_raw_shard,
     load_validation_tokens_byte260,
     DistributedTokenLoaderByte260,
 )
@@ -527,83 +524,7 @@ def dequantize_state_dict_int8(obj):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-load_data_shard = load_raw_shard
-
-
-def remap_shard_tokens(
-    shard_tokens: np.ndarray, tok: EfficientByteTokenizer
-) -> torch.Tensor:
-    """Convert byte260 shard tokens to EfficientByteTokenizer IDs."""
-    remapped = tok.remap_byte260_shard(shard_tokens)
-    remapped = tok.filter_stream(remapped)
-    return torch.from_numpy(remapped)
-
-
 DistributedTokenLoader = DistributedTokenLoaderByte260
-
-
-# ---------------------------------------------------------------------------
-# Bigram prior initialization
-# ---------------------------------------------------------------------------
-
-
-def compute_bigram_log_probs(
-    train_pattern: str,
-    tok: EfficientByteTokenizer,
-    vocab_size: int,
-    smoothing: float = 0.1,
-    max_data_bytes: int = 1_000_000,
-) -> Tensor:
-    """Compute bigram log-probabilities from training data.
-
-    Reads shard files directly with numpy, counts consecutive-token bigrams,
-    smooths, normalizes, and returns ``(V, V)`` float32 log-probabilities.
-    """
-    files = [Path(p) for p in sorted(glob.glob(train_pattern))]
-    if not files:
-        raise FileNotFoundError(f"No files found for pattern: {train_pattern}")
-
-    print(f"bigram_init: loading tokens (max={max_data_bytes:,})...")
-
-    token_chunks: list[np.ndarray] = []
-    total = 0
-    for f in files:
-        shard = load_data_shard(f)
-        toks = remap_shard_tokens(shard, tok).numpy().astype(np.int64)
-        token_chunks.append(toks)
-        total += len(toks)
-        if max_data_bytes > 0 and total >= max_data_bytes:
-            break
-    all_tokens = np.concatenate(token_chunks)
-    if max_data_bytes > 0 and len(all_tokens) > max_data_bytes:
-        all_tokens = all_tokens[:max_data_bytes]
-    del token_chunks
-
-    print(f"bigram_init: counting bigrams over {len(all_tokens):,} tokens...")
-
-    # Count bigrams: (all_tokens[i], all_tokens[i+1]) for all consecutive pairs.
-    prev_tokens = all_tokens[:-1]
-    next_tokens = all_tokens[1:]
-    counts = np.zeros((vocab_size, vocab_size), dtype=np.float64)
-    np.add.at(counts, (prev_tokens, next_tokens), 1)
-    del all_tokens, prev_tokens, next_tokens
-
-    # Smooth, normalize, log-transform.
-    counts += smoothing
-    counts /= counts.sum(axis=1, keepdims=True)
-    log_probs = np.log(counts).astype(np.float32)
-
-    print(
-        f"bigram_init: done (min={log_probs.min():.3f} "
-        f"max={log_probs.max():.3f} mean={log_probs.mean():.3f})"
-    )
-
-    return torch.from_numpy(log_probs)
-
 
 # ---------------------------------------------------------------------------
 # Training wrapper
@@ -766,52 +687,47 @@ def main():
             bottleneck_dim=args.mixing_bottleneck_dim,
         )
 
-    # --- Build multi-stream components ---
-    components = build_multi_stream_components(
+    # --- Build model (with bigram init + structural calibration) ---
+    base_model = build_multi_stream_gpt(
         tok=tok,
         vocab_size=vocab_size,
         context_dim=args.context_dim,
         n_max=args.n_max,
         logit_softcap=args.logit_softcap,
         structured_output_logits=args.structured_output_logits,
+        calibrate_structural_stream=True,
+        calibration_sequence_length=args.train_seq_len,
+        include_bigram_prior=args.include_bigram_prior,
+        train_pattern=args.train_files,
+        bigram_init_smoothing=args.bigram_init_smoothing,
+        multi_head_dim=args.multi_head_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        num_layers=args.num_layers,
+        num_preconv_layers=args.num_preconv_layers,
+        preconv_kernel_size=preconv_kernel_size,
+        preconv_groups=args.preconv_groups,
+        preconv_channel_shuffle=args.preconv_channel_shuffle,
+        block_conv_map=block_conv_map,
+        block_conv_kernel_size=block_conv_kernel_size,
+        block_conv_groups=block_conv_groups,
+        block_arith_map=block_arith_map,
+        block_arith_n_max=args.block_arith_n_max,
+        mixing_config=mixing_config,
+        mlp_hidden_dim=args.mlp_hidden_dim if args.mlp_hidden_dim > 0 else None,
+        gated_mlp_output=args.gated_mlp_output,
+        qk_gain_init=args.qk_gain_init,
+        k_shift=args.k_shift,
+        value_softcap=args.value_softcap,
+        include_utf8_prior=args.utf8_prior,
+        linear_mode=args.linear_mode,
+        linear_kwargs={
+            "kronecker_terms": args.kronecker_terms,
+            "monarch_nblocks": args.monarch_nblocks,
+        },
+        init_noise_std=args.init_noise_std,
     )
-
-    # --- Build model ---
-    base_model = (
-        MultiStreamGPT(
-            components=components,
-            multi_head_dim=args.multi_head_dim,
-            num_heads=args.num_heads,
-            num_kv_heads=args.num_kv_heads,
-            num_layers=args.num_layers,
-            num_preconv_layers=args.num_preconv_layers,
-            preconv_kernel_size=preconv_kernel_size,
-            preconv_groups=args.preconv_groups,
-            preconv_channel_shuffle=args.preconv_channel_shuffle,
-            block_conv_map=block_conv_map,
-            block_conv_kernel_size=block_conv_kernel_size,
-            block_conv_groups=block_conv_groups,
-            block_arith_map=block_arith_map,
-            block_arith_n_max=args.block_arith_n_max,
-            mixing_config=mixing_config,
-            mlp_hidden_dim=args.mlp_hidden_dim if args.mlp_hidden_dim > 0 else None,
-            gated_mlp_output=args.gated_mlp_output,
-            qk_gain_init=args.qk_gain_init,
-            k_shift=args.k_shift,
-            logit_softcap=args.logit_softcap,
-            value_softcap=args.value_softcap,
-            include_bigram_prior=args.include_bigram_prior,
-            include_utf8_prior=args.utf8_prior,
-            linear_mode=args.linear_mode,
-            linear_kwargs={
-                "kronecker_terms": args.kronecker_terms,
-                "monarch_nblocks": args.monarch_nblocks,
-            },
-            init_noise_std=args.init_noise_std,
-        )
-        .to(device)
-        .bfloat16()
-    )
+    base_model = base_model.to(device).bfloat16()
 
     # Restore CastedLinear / KroneckerLinear / MonarchLinear / Conv1d to float32 weights.
     for module in base_model.modules():
@@ -829,48 +745,6 @@ def main():
             scale = 1.0 / (1.0 + block_idx * args.depth_lr_decay)
             for p in block.parameters():
                 p._depth_lr_scale = scale
-
-    # --- Initialize bigram prior from training data ---
-    if args.include_bigram_prior and base_model.bigram_prior is not None:
-        bigram_log_probs = compute_bigram_log_probs(
-            train_pattern=args.train_files,
-            tok=tok,
-            vocab_size=base_model.bigram_prior.bigram_logits.shape[0],
-            smoothing=args.bigram_init_smoothing,
-        )
-        with torch.no_grad():
-            base_model.bigram_prior.bigram_logits.data.copy_(bigram_log_probs)
-        bl = base_model.bigram_prior.bigram_logits.data
-        log0(
-            f"bigram_prior: mean={bl.mean():.3f} std={bl.std():.3f} "
-            f"min={bl.min():.3f} max={bl.max():.3f}"
-        )
-
-    # --- Calibrate structural stream standardization ---
-    structural = base_model.builder.composites.get("structural")
-    if structural is not None:
-        calib_files = sorted(glob.glob(args.train_files))[:1]
-        if calib_files:
-            calib_shard = load_data_shard(Path(calib_files[0]))
-            calib_tokens = remap_shard_tokens(calib_shard, tok)
-            # Reshape into batches of (batch_size, seq_len)
-            calib_seq_len = args.train_seq_len
-            calib_batch_size = 16
-            calib_total = calib_tokens.numel() // calib_seq_len
-            calib_total = min(calib_total, calib_batch_size * 20)
-            calib_flat = calib_tokens[: calib_total * calib_seq_len].reshape(
-                -1, calib_seq_len
-            )
-            calib_batches = list(calib_flat.split(calib_batch_size))
-            structural.calibrate(calib_batches)
-            n_std = sum(
-                int(m) for c in structural.components for m in c.standardizable_mask
-            )
-            log0(
-                f"structural_calibration: {n_std}/{structural.dim} dims calibrated "
-                f"from {calib_flat.shape[0]} sequences"
-            )
-            del calib_shard, calib_tokens, calib_flat, calib_batches
 
     # --- Sanity-check: prior-only BPB ---
     uniform_bpb, utf8_bpb, bigram_only_bpb, bigram_utf8_bpb = eval_prior_bpb(
