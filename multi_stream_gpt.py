@@ -45,7 +45,13 @@ from multi_stream_attention import (
     MultiStreamCausalConvLayers,
     StreamMixingConfig,
 )
-from modules import SoftcapLinear, RMSNorm, CenterLastDim, KroneckerLinear, MonarchLinear
+from modules import (
+    SoftcapLinear,
+    RMSNorm,
+    CenterLastDim,
+    KroneckerLinear,
+    MonarchLinear,
+)
 from multi_streams import (
     CompositeStream,
     CompressionType,
@@ -435,6 +441,8 @@ class MultiStreamGPT(nn.Module):
         mixing_config: StreamMixingConfig | None = None,
         mlp_hidden_dim: int | None = None,
         gated_mlp_output: bool = True,
+        gated_attn_output: bool = True,
+        gated_conv: bool = True,
         qk_gain_init: float = 0.0,
         k_shift: bool = True,
         # Output
@@ -455,8 +463,8 @@ class MultiStreamGPT(nn.Module):
         use_resid_mix: bool = False,
         use_unet_skip: bool = False,
         # Alpha/beta bounding (passed to each MultiStreamBlock)
-        bound_alpha: bool = False,
-        bound_beta: bool = False,
+        bound_alpha: bool = True,
+        bound_beta: bool = True,
         # Init noise
         init_noise_std: float = 0.01,
     ):
@@ -518,6 +526,7 @@ class MultiStreamGPT(nn.Module):
                 num_layers=num_preconv_layers,
                 kernel_size=preconv_kernel_size,
                 conv_groups=preconv_groups,
+                gated_conv=gated_conv,
                 logit_hierarchy=components.logit_hierarchy,
                 input_stream_ids=conv_input_streams,
                 output_stream_ids=conv_output_streams,
@@ -567,6 +576,7 @@ class MultiStreamGPT(nn.Module):
                     stream_config=stream_config,
                     kernel_size=bconv_ks[j],
                     conv_groups=bconv_g[j],
+                    gated_conv=gated_conv,
                     logit_hierarchy=components.logit_hierarchy,
                     input_stream_ids=conv_input_streams,
                     value_softcap=value_softcap,
@@ -596,6 +606,7 @@ class MultiStreamGPT(nn.Module):
                     mixing_config=mixing_config,
                     mlp_hidden_dim=mlp_hidden_dim,
                     gated_mlp_output=gated_mlp_output,
+                    gated_attn_output=gated_attn_output,
                     qk_gain_init=qk_gain_init,
                     linear_mode=linear_mode,
                     linear_kwargs=linear_kwargs,
@@ -618,9 +629,7 @@ class MultiStreamGPT(nn.Module):
                     nn.ParameterDict(
                         {
                             s.key: nn.Parameter(
-                                torch.stack(
-                                    [torch.ones(s.dim), torch.zeros(s.dim)]
-                                )
+                                torch.stack([torch.ones(s.dim), torch.zeros(s.dim)])
                             )
                             for s in self._writable_stream_configs
                         }
@@ -719,9 +728,7 @@ class MultiStreamGPT(nn.Module):
         # 3b. Capture x0 for resid_mix (writable streams only, after preconv).
         x0: dict[StreamID, Tensor] | None = None
         if self.resid_mix_params is not None:
-            x0 = {
-                s.name: streams[s.name] for s in self._writable_stream_configs
-            }
+            x0 = {s.name: streams[s.name] for s in self._writable_stream_configs}
 
         # 4. Attention blocks (with optional skip connections and resid_mix).
         skip_stack: list[dict[StreamID, Tensor]] = []
@@ -736,8 +743,7 @@ class MultiStreamGPT(nn.Module):
                 for s in self._writable_stream_configs:
                     streams[s.name] = (
                         streams[s.name]
-                        + sw[s.key].to(dtype=streams[s.name].dtype)
-                        * skip_data[s.name]
+                        + sw[s.key].to(dtype=streams[s.name].dtype) * skip_data[s.name]
                     )
 
             # Resid_mix: blend current state with x0
@@ -745,9 +751,7 @@ class MultiStreamGPT(nn.Module):
                 mix = self.resid_mix_params[i]
                 for s in self._writable_stream_configs:
                     m = mix[s.key].to(dtype=streams[s.name].dtype)
-                    streams[s.name] = (
-                        m[0] * streams[s.name] + m[1] * x0[s.name]
-                    )
+                    streams[s.name] = m[0] * streams[s.name] + m[1] * x0[s.name]
 
             # Block
             streams = block(streams, compressed=compressed, views=views)
@@ -755,10 +759,7 @@ class MultiStreamGPT(nn.Module):
             # Skip: store in encoder half (after block)
             if self.skip_weights is not None and i < num_enc:
                 skip_stack.append(
-                    {
-                        s.name: streams[s.name]
-                        for s in self._writable_stream_configs
-                    }
+                    {s.name: streams[s.name] for s in self._writable_stream_configs}
                 )
 
         # 5. Scale logits back up, apply softcap.

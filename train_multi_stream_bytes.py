@@ -120,6 +120,8 @@ class Hyperparameters:
     n_max = int(os.environ.get("N_MAX", 32))
     mlp_hidden_dim = int(os.environ.get("MLP_HIDDEN_DIM", 0))  # 0 = auto
     gated_mlp_output = bool(int(os.environ.get("GATED_MLP_OUTPUT", "1")))
+    gated_attn_output = bool(int(os.environ.get("GATED_ATTN_OUTPUT", "1")))
+    gated_conv = bool(int(os.environ.get("GATED_CONV", "1")))
     k_shift = bool(int(os.environ.get("K_SHIFT", "1")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 0.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -739,6 +741,8 @@ def main():
         mixing_config=mixing_config,
         mlp_hidden_dim=args.mlp_hidden_dim if args.mlp_hidden_dim > 0 else None,
         gated_mlp_output=args.gated_mlp_output,
+        gated_attn_output=args.gated_attn_output,
+        gated_conv=args.gated_conv,
         qk_gain_init=args.qk_gain_init,
         k_shift=args.k_shift,
         value_softcap=args.value_softcap,

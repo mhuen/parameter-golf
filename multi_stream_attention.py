@@ -106,6 +106,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         skip_residual: bool = True,
         alpha_pre_sigmoid_init: float = -2.0,
         value_softcap: float | None = None,
+        gated_attn_output: bool = True,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -118,6 +119,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
+        self.gated_attn_output = gated_attn_output
         self.value_softcap = (
             SoftcapLinear(value_softcap) if value_softcap is not None else None
         )
@@ -215,7 +217,7 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
             LearnableShift(num_channels=num_kv_heads) if k_shift else None
         )
 
-        # --- Output projection (gated write-back per writable stream) ---
+        # --- Output projection (optionally gated write-back per writable stream) ---
         if not skip_residual:
             self.alpha_pre_sigmoid = nn.ParameterDict(
                 {
@@ -241,19 +243,20 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
         )
         for lin in self.W_o_value.values():
             lin._zero_init = True
-        self.W_o_gate = nn.ModuleDict(
-            {
-                stream.key: make_linear(
-                    self.num_heads * self.head_dim,
-                    stream.dim,
-                    bias=False,
-                    mode=linear_mode,
-                    **_lkw,
-                )
-                for stream in self.stream_config.streams
-                if not stream.read_only
-            }
-        )
+        if gated_attn_output:
+            self.W_o_gate = nn.ModuleDict(
+                {
+                    stream.key: make_linear(
+                        self.num_heads * self.head_dim,
+                        stream.dim,
+                        bias=False,
+                        mode=linear_mode,
+                        **_lkw,
+                    )
+                    for stream in self.stream_config.streams
+                    if not stream.read_only
+                }
+            )
 
     def _compute_mix_logits(self, input_streams: dict[StreamID, Tensor]) -> Tensor:
         """Compute raw mixing logits. Returns shape depends on source:
@@ -413,8 +416,11 @@ class CausalMultiStreamAttentionViaMixing(nn.Module):
             value = self.W_o_value[stream.key](attn_flat)
             if self.value_softcap is not None:
                 value = self.value_softcap(value)
-            gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
-            update = value * gate
+            if self.gated_attn_output:
+                gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
+                update = value * gate
+            else:
+                update = value
 
             if self.skip_residual:
                 output_streams[stream.name] = update
@@ -448,6 +454,7 @@ class CausalMultiStreamAttention(nn.Module):
         skip_residual: bool = True,
         alpha_pre_sigmoid_init: float = -2.0,
         value_softcap: float | None = None,
+        gated_attn_output: bool = True,
     ):
         if multi_head_dim % num_heads != 0:
             raise ValueError("multi_head_dim must be divisible by num_heads")
@@ -460,6 +467,7 @@ class CausalMultiStreamAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.skip_residual = skip_residual
+        self.gated_attn_output = gated_attn_output
         self.value_softcap = (
             SoftcapLinear(value_softcap) if value_softcap is not None else None
         )
@@ -527,19 +535,20 @@ class CausalMultiStreamAttention(nn.Module):
         )
         for lin in self.W_o_value.values():
             lin._zero_init = True
-        self.W_o_gate = nn.ModuleDict(
-            {
-                stream.key: make_linear(
-                    num_heads * self.head_dim,
-                    stream.dim,
-                    bias=False,
-                    mode=linear_mode,
-                    **_lkw,
-                )
-                for stream in stream_config.streams
-                if not stream.read_only
-            }
-        )
+        if gated_attn_output:
+            self.W_o_gate = nn.ModuleDict(
+                {
+                    stream.key: make_linear(
+                        num_heads * self.head_dim,
+                        stream.dim,
+                        bias=False,
+                        mode=linear_mode,
+                        **_lkw,
+                    )
+                    for stream in stream_config.streams
+                    if not stream.read_only
+                }
+            )
 
     def forward(
         self,
@@ -585,7 +594,7 @@ class CausalMultiStreamAttention(nn.Module):
             bsz, seqlen, self.num_heads * self.head_dim
         )
 
-        # Gated write-back per writable stream
+        # Write-back per writable stream (optionally gated)
         output_streams: dict[StreamID, Tensor] = {}
         for stream in self.stream_config.streams:
             if stream.read_only:
@@ -595,8 +604,11 @@ class CausalMultiStreamAttention(nn.Module):
             value = self.W_o_value[stream.key](attn_flat)
             if self.value_softcap is not None:
                 value = self.value_softcap(value)
-            gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
-            update = value * gate
+            if self.gated_attn_output:
+                gate = torch.sigmoid(self.W_o_gate[stream.key](attn_flat))
+                update = value * gate
+            else:
+                update = value
 
             if self.skip_residual:
                 output_streams[stream.name] = update
@@ -1365,6 +1377,7 @@ class MultiStreamBlock(nn.Module):
         mixing_config: StreamMixingConfig | None = None,
         mlp_hidden_dim: int | None = None,
         gated_mlp_output: bool = True,
+        gated_attn_output: bool = True,
         leaky_relu_slope: float = 0.5,
         qk_gain_init: float = 0.0,
         linear_mode: str = "dense",
@@ -1419,6 +1432,7 @@ class MultiStreamBlock(nn.Module):
             k_shift=k_shift,
             skip_residual=True,
             value_softcap=value_softcap,
+            gated_attn_output=gated_attn_output,
         )
         if mixing_config is not None:
             self.attn = CausalMultiStreamAttentionViaMixing(
