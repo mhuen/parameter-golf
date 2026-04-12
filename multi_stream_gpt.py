@@ -451,6 +451,11 @@ class MultiStreamGPT(nn.Module):
         conv_input_streams: list[StreamID] | None = None,
         # Conv output filtering (None = exclude LOGIT, only write to context)
         conv_output_streams: list[StreamID] | None = None,
+        # Residual mixing and skip connections
+        use_resid_mix: bool = False,
+        use_unet_skip: bool = False,
+        # Alpha bounding (passed to each MultiStreamBlock)
+        bound_alpha: bool = True,
         # Init noise
         init_noise_std: float = 0.01,
     ):
@@ -464,6 +469,9 @@ class MultiStreamGPT(nn.Module):
 
         stream_config = components.stream_config
         self._stream_config = stream_config
+        self._writable_stream_configs = [
+            s for s in stream_config.streams if not s.read_only
+        ]
 
         # One-time init norms (from norm_type) before the first block.
         # Blocks use input_norm_types as pre-norm; no post-norm on residual.
@@ -594,7 +602,44 @@ class MultiStreamGPT(nn.Module):
                     logit_hierarchy=components.logit_hierarchy,
                     mlp_output_stream_ids=[_LOGIT_SID] if is_last_block else None,
                     value_softcap=value_softcap,
+                    bound_alpha=bound_alpha,
                 )
+            )
+
+        # -- Resid mix: per-layer blend of current state with initial x0 --
+        self.resid_mix_params: nn.ModuleList | None = None
+        if use_resid_mix:
+            self.resid_mix_params = nn.ModuleList(
+                [
+                    nn.ParameterDict(
+                        {
+                            s.key: nn.Parameter(
+                                torch.stack(
+                                    [torch.ones(s.dim), torch.zeros(s.dim)]
+                                )
+                            )
+                            for s in self._writable_stream_configs
+                        }
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
+
+        # -- U-net skip connections: encoder-decoder split with LIFO skips --
+        self._num_encoder_layers = num_layers // 2 if use_unet_skip else 0
+        num_skips = self._num_encoder_layers
+        self.skip_weights: nn.ModuleList | None = None
+        if use_unet_skip and num_skips > 0:
+            self.skip_weights = nn.ModuleList(
+                [
+                    nn.ParameterDict(
+                        {
+                            s.key: nn.Parameter(torch.ones(s.dim))
+                            for s in self._writable_stream_configs
+                        }
+                    )
+                    for _ in range(num_skips)
+                ]
             )
 
         # -- Init noise for symmetry breaking --
@@ -653,9 +698,50 @@ class MultiStreamGPT(nn.Module):
         if self.preconv_layers is not None:
             streams = self.preconv_layers(streams)
 
-        # 4. Attention blocks.
-        for block in self.blocks:
+        # 3b. Capture x0 for resid_mix (writable streams only, after preconv).
+        x0: dict[StreamID, Tensor] | None = None
+        if self.resid_mix_params is not None:
+            x0 = {
+                s.name: streams[s.name] for s in self._writable_stream_configs
+            }
+
+        # 4. Attention blocks (with optional skip connections and resid_mix).
+        skip_stack: list[dict[StreamID, Tensor]] = []
+        num_enc = self._num_encoder_layers
+
+        for i, block in enumerate(self.blocks):
+            # Skip: consume in decoder half (LIFO, before resid_mix and block)
+            if self.skip_weights is not None and i >= num_enc and skip_stack:
+                skip_idx = i - num_enc
+                skip_data = skip_stack.pop()
+                sw = self.skip_weights[skip_idx]
+                for s in self._writable_stream_configs:
+                    streams[s.name] = (
+                        streams[s.name]
+                        + sw[s.key].to(dtype=streams[s.name].dtype)
+                        * skip_data[s.name]
+                    )
+
+            # Resid_mix: blend current state with x0
+            if self.resid_mix_params is not None:
+                mix = self.resid_mix_params[i]
+                for s in self._writable_stream_configs:
+                    m = mix[s.key].to(dtype=streams[s.name].dtype)
+                    streams[s.name] = (
+                        m[0] * streams[s.name] + m[1] * x0[s.name]
+                    )
+
+            # Block
             streams = block(streams, compressed=compressed, views=views)
+
+            # Skip: store in encoder half (after block)
+            if self.skip_weights is not None and i < num_enc:
+                skip_stack.append(
+                    {
+                        s.name: streams[s.name]
+                        for s in self._writable_stream_configs
+                    }
+                )
 
         # 5. Scale logits back up, apply softcap.
         if self.logit_stream_normalization_factor != 1:

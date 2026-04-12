@@ -1321,9 +1321,9 @@ class MultiStreamBlock(nn.Module):
 
     Norms are applied to all streams; residual updates only to writable streams.
     Each sub-layer uses independent per-dimension α (update scale) and β (residual
-    scale): output = σ(β)*x + σ(α)*update. This allows the model to learn additive
-    (β≈1), interpolating (α+β≈1), or full-replacement (α≈1, β≈0) behavior per
-    dimension per stream.
+    scale): output = σ(β)*x + α_eff*update (where α_eff = σ(α) when bounded, or α
+    directly when unbounded). Init values are specified in output space (the desired
+    effective multiplier) and internally converted via logit() when bounded.
 
     Optional ``conv``: if set, a MultiStreamCausalConv is applied between
     attention and MLP (before arith_attn if present).
@@ -1351,18 +1351,26 @@ class MultiStreamBlock(nn.Module):
         logit_hierarchy: ByteLogitHierarchy | None = None,
         mlp_input_stream_ids: list[StreamID] | None = None,
         mlp_output_stream_ids: list[StreamID] | None = None,
-        attn_alpha_init: float = -1.0,
-        attn_beta_init: float = 5.0,
-        mlp_alpha_init: float = -3.0,
-        mlp_beta_init: float = 5.0,
-        conv_alpha_init: float = -3.0,
-        conv_beta_init: float = 5.0,
-        arith_alpha_init: float = -3.0,
-        arith_beta_init: float = 5.0,
+        attn_alpha_init: float = 0.27,
+        attn_beta_init: float = 0.99,
+        mlp_alpha_init: float = 0.05,
+        mlp_beta_init: float = 0.99,
+        conv_alpha_init: float = 0.05,
+        conv_beta_init: float = 0.99,
+        arith_alpha_init: float = 0.05,
+        arith_beta_init: float = 0.99,
+        bound_alpha: bool = True,
         value_softcap: float | None = None,
     ):
         super().__init__()
         self.stream_config = stream_config
+        self._bound_alpha = bound_alpha
+
+        def _to_param(value: float, bounded: bool) -> float:
+            """Convert output-space multiplier to stored parameter value."""
+            if bounded:
+                return torch.logit(torch.tensor(value)).item()
+            return value
 
         # Per-stream input norms (pre-norm only, no post-norm on residual)
         all_streams = list(stream_config.streams)
@@ -1409,31 +1417,36 @@ class MultiStreamBlock(nn.Module):
         mlp_out_streams = self.mlp.output_streams
 
         # Per-stream, per-dimension independent α (update scale) and β (residual scale)
-        # output = σ(β) * x + σ(α) * update
-        # Init: α=-3 (σ≈0.05, tiny update), β=5 (σ≈0.99, near-identity passthrough)
+        # output = σ(β) * x + α_eff * update
+        # where α_eff = σ(α) when bound_alpha=True, or α directly when False.
+        # Init values are in output space; internally converted via logit() when bounded.
+        _a_attn = _to_param(attn_alpha_init, bound_alpha)
+        _b_attn = _to_param(attn_beta_init, True)
+        _a_mlp = _to_param(mlp_alpha_init, bound_alpha)
+        _b_mlp = _to_param(mlp_beta_init, True)
         self.attn_alpha = nn.ParameterDict(
             {
-                s.key: nn.Parameter(torch.full((s.dim,), attn_alpha_init))
+                s.key: nn.Parameter(torch.full((s.dim,), _a_attn))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
         self.attn_beta = nn.ParameterDict(
             {
-                s.key: nn.Parameter(torch.full((s.dim,), attn_beta_init))
+                s.key: nn.Parameter(torch.full((s.dim,), _b_attn))
                 for s in stream_config.streams
                 if not s.read_only
             }
         )
         self.mlp_alpha = nn.ParameterDict(
             {
-                s.key: nn.Parameter(torch.full((s.dim,), mlp_alpha_init))
+                s.key: nn.Parameter(torch.full((s.dim,), _a_mlp))
                 for s in mlp_out_streams
             }
         )
         self.mlp_beta = nn.ParameterDict(
             {
-                s.key: nn.Parameter(torch.full((s.dim,), mlp_beta_init))
+                s.key: nn.Parameter(torch.full((s.dim,), _b_mlp))
                 for s in mlp_out_streams
             }
         )
@@ -1443,15 +1456,17 @@ class MultiStreamBlock(nn.Module):
         if conv is not None:
             self.conv_norms = _build_stream_norms(all_streams)
             conv_out_streams = conv.output_streams
+            _a_conv = _to_param(conv_alpha_init, bound_alpha)
+            _b_conv = _to_param(conv_beta_init, True)
             self.conv_alpha = nn.ParameterDict(
                 {
-                    s.key: nn.Parameter(torch.full((s.dim,), conv_alpha_init))
+                    s.key: nn.Parameter(torch.full((s.dim,), _a_conv))
                     for s in conv_out_streams
                 }
             )
             self.conv_beta = nn.ParameterDict(
                 {
-                    s.key: nn.Parameter(torch.full((s.dim,), conv_beta_init))
+                    s.key: nn.Parameter(torch.full((s.dim,), _b_conv))
                     for s in conv_out_streams
                 }
             )
@@ -1460,16 +1475,18 @@ class MultiStreamBlock(nn.Module):
         self.arith_attn = arith_attn
         if arith_attn is not None:
             self.arith_norms = _build_stream_norms(all_streams)
+            _a_arith = _to_param(arith_alpha_init, bound_alpha)
+            _b_arith = _to_param(arith_beta_init, True)
             self.arith_alpha = nn.ParameterDict(
                 {
-                    s.key: nn.Parameter(torch.full((s.dim,), arith_alpha_init))
+                    s.key: nn.Parameter(torch.full((s.dim,), _a_arith))
                     for s in stream_config.streams
                     if not s.read_only
                 }
             )
             self.arith_beta = nn.ParameterDict(
                 {
-                    s.key: nn.Parameter(torch.full((s.dim,), arith_beta_init))
+                    s.key: nn.Parameter(torch.full((s.dim,), _b_arith))
                     for s in stream_config.streams
                     if not s.read_only
                 }
@@ -1492,7 +1509,7 @@ class MultiStreamBlock(nn.Module):
             if s.read_only:
                 x[s.name] = input_streams[s.name]
             else:
-                alpha = torch.sigmoid(self.attn_alpha[s.key])
+                alpha = torch.sigmoid(self.attn_alpha[s.key]) if self._bound_alpha else self.attn_alpha[s.key]
                 beta = torch.sigmoid(self.attn_beta[s.key])
                 x[s.name] = beta * input_streams[s.name] + alpha * attn_out[s.name]
 
@@ -1502,7 +1519,7 @@ class MultiStreamBlock(nn.Module):
             conv_out = self.conv(normed)
             for s in streams:
                 if not s.read_only and s.name in conv_out:
-                    alpha = torch.sigmoid(self.conv_alpha[s.key])
+                    alpha = torch.sigmoid(self.conv_alpha[s.key]) if self._bound_alpha else self.conv_alpha[s.key]
                     beta = torch.sigmoid(self.conv_beta[s.key])
                     x[s.name] = beta * x[s.name] + alpha * conv_out[s.name]
 
@@ -1514,7 +1531,7 @@ class MultiStreamBlock(nn.Module):
             arith_out = self.arith_attn(normed, num_compressed, num_view)
             for s in streams:
                 if not s.read_only and s.name in arith_out:
-                    alpha = torch.sigmoid(self.arith_alpha[s.key])
+                    alpha = torch.sigmoid(self.arith_alpha[s.key]) if self._bound_alpha else self.arith_alpha[s.key]
                     beta = torch.sigmoid(self.arith_beta[s.key])
                     x[s.name] = beta * x[s.name] + alpha * arith_out[s.name]
 
@@ -1527,7 +1544,7 @@ class MultiStreamBlock(nn.Module):
             if s.read_only:
                 output[s.name] = x[s.name]
             elif s.name in mlp_out:
-                alpha = torch.sigmoid(self.mlp_alpha[s.key])
+                alpha = torch.sigmoid(self.mlp_alpha[s.key]) if self._bound_alpha else self.mlp_alpha[s.key]
                 beta = torch.sigmoid(self.mlp_beta[s.key])
                 output[s.name] = beta * x[s.name] + alpha * mlp_out[s.name]
             else:

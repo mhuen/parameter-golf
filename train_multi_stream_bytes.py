@@ -137,6 +137,11 @@ class Hyperparameters:
     mixing_source = os.environ.get("MIXING_SOURCE", "dynamic_bottleneck")
     mixing_bottleneck_dim = int(os.environ.get("MIXING_BOTTLENECK_DIM", 32))
 
+    # Residual mixing, skip connections, and alpha bounding
+    use_resid_mix = bool(int(os.environ.get("USE_RESID_MIX", "0")))
+    use_unet_skip = bool(int(os.environ.get("USE_UNET_SKIP", "0")))
+    bound_alpha = bool(int(os.environ.get("BOUND_ALPHA", "1")))
+
     # Bigram prior
     include_bigram_prior = bool(int(os.environ.get("INCLUDE_BIGRAM_PRIOR", "1")))
     bigram_prior_lr = float(os.environ.get("BIGRAM_PRIOR_LR", 0.01))
@@ -382,7 +387,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "alpha,beta,q_gain,shift_logit,mix_logits,gates,bigram_logits",
+        "alpha,beta,q_gain,shift_logit,mix_logits,gates,bigram_logits,resid_mix,skip_weight",
     ).split(",")
     if pattern
 )
@@ -696,7 +701,7 @@ def main():
         logit_softcap=args.logit_softcap,
         structured_output_logits=args.structured_output_logits,
         calibrate_structural_stream=True,
-        compile_calibration=True,
+        compile_calibration=False,
         calibration_sequence_length=args.train_seq_len,
         include_bigram_prior=args.include_bigram_prior,
         train_pattern=args.train_files,
@@ -727,6 +732,9 @@ def main():
             "kronecker_terms": args.kronecker_terms,
             "monarch_nblocks": args.monarch_nblocks,
         },
+        use_resid_mix=args.use_resid_mix,
+        use_unet_skip=args.use_unet_skip,
+        bound_alpha=args.bound_alpha,
         init_noise_std=args.init_noise_std,
     )
     base_model = base_model.bfloat16()
@@ -934,7 +942,9 @@ def main():
         f"arch: layers={args.num_layers} heads={args.num_heads} kv_heads={args.num_kv_heads} "
         f"multi_head_dim={args.multi_head_dim} context_dim={args.context_dim} "
         f"structured_output_logits={args.structured_output_logits} "
-        f"utf8_prior={args.utf8_prior}"
+        f"utf8_prior={args.utf8_prior} "
+        f"resid_mix={args.use_resid_mix} unet_skip={args.use_unet_skip} "
+        f"bound_alpha={args.bound_alpha}"
     )
     log0(
         f"preconv: layers={args.num_preconv_layers} kernel={args.preconv_kernel_size} "
