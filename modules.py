@@ -365,10 +365,10 @@ class StreamComponent(nn.Module):
         Dims whose observed std is at or below numerical noise (1e-5 for
         float32) are left unscaled to avoid amplifying a constant feature.
         """
-        mask = torch.tensor(self.standardizable_mask, dtype=torch.bool)
+        device = self._std_scale.device
+        mask = torch.tensor(self.standardizable_mask, dtype=torch.bool, device=device)
         if not mask.any():
             return
-        device = self._std_scale.device
         ids = input_ids.to(device=device, dtype=torch.long)
         compute_fn = torch.compile(self.compute) if compile else self.compute
         outputs: list[Tensor] = []
