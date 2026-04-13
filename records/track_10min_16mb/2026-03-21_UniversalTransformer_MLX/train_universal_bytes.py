@@ -1878,14 +1878,17 @@ def main():
             f"structural_stream: dim={s_dim} embed_dim={e_dim} "
             f"components={len(structural_stream_mod.components)}"
         )
+        structural_stream_mod.to(device)
         cal_tokens = load_calibration_tokens(
             train_pattern=args.train_files,
             tok=tok,
             seq_len=args.train_seq_len,
             n_sequences=args.structural_calibration_seqs,
-        )
+        ).to(device)
+        t_cal = time.perf_counter()
         structural_stream_mod.calibrate(cal_tokens)
-        log0("structural_stream: calibration done")
+        structural_stream_mod.cpu()
+        log0(f"structural_stream: calibration done in {time.perf_counter() - t_cal:.2f}s")
 
     _needs_tok = (
         args.structured_output_logits
