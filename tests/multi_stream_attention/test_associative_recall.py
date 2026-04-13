@@ -26,7 +26,7 @@ from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_stream_components import ByteHashComponent, HashBoundary
-from multi_streams import StreamType, StreamID, StreamDef
+from multi_streams import StreamType, StreamID, StreamDef, StreamSource
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
@@ -123,10 +123,11 @@ if __name__ == "__main__":
         StreamDef(
             name=StreamID(StreamType.LOGIT), dim=tok.vocab_size
         ),  # caller provides one-hot
-        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, source=StreamSource.ONE_HOT),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 ByteHashComponent(
                     tok,

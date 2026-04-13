@@ -61,6 +61,7 @@ from multi_streams import (
     SinCosPositionComponent,
     StreamDef,
     StreamID,
+    StreamSource,
     StreamType,
 )
 
@@ -167,24 +168,25 @@ def build_multi_stream_components(
     stream_defs = [
         StreamDef(
             logit_id,
+            source=StreamSource.ZEROS,
             read_only=False,
             norm_type=CenterLastDim,
             # input_norm_types=[CenterLastDim, RMSNorm],
             input_norm_types=[CenterLastDim],
             dim=vocab_size,
-            auto_zeros=True,
         ),
-        StreamDef(tokens_id, read_only=True, auto_onehot=True),
+        StreamDef(tokens_id, source=StreamSource.ONE_HOT, read_only=True),
         StreamDef(
             context_id,
+            source=StreamSource.ZEROS,
             read_only=False,
             norm_type=RMSNorm,
             input_norm_types=[RMSNorm],
             dim=context_dim,
-            auto_zeros=True,
         ),
         StreamDef(
             structural_id,
+            source=StreamSource.COMPONENTS,
             read_only=True,
             components=structural_components,
         ),

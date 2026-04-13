@@ -36,6 +36,7 @@ from multi_streams import (
     StreamType,
     StreamID,
     StreamDef,
+    StreamSource,
     MultiStreamBuilder,
 )
 from test_harness import (
@@ -167,6 +168,7 @@ def make_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 ByteHashComponent(
                     tok,

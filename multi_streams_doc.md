@@ -87,7 +87,7 @@ logits (B, S, 208)
 
 | Step | Operation | Approximate Scale | Reference |
 |------|-----------|-------------------|-----------|
-| Init | `torch.zeros(B, S, 208)` via `auto_zeros=True` | 0 | `multi_streams.py` StreamDef |
+| Init | `torch.zeros(B, S, 208)` via `source=StreamSource.ZEROS` | 0 | `multi_streams.py` StreamDef |
 | +Bigram | `+= bigram_logits[input_ids]` | ~[-5, +5] (from data-init log-freq ratios) | `multi_stream_gpt.py:527` |
 | /10 | `*= 1/logit_stream_normalization_factor` | ~[-0.5, +0.5] | `multi_stream_gpt.py:532` |
 | CenterLastDim | `x - x.mean(dim=-1, keepdim=True)` | ~[-0.5, +0.5], zero-mean per position | `multi_stream_gpt.py:539` |
@@ -108,7 +108,7 @@ only recenters.
 
 ### 3.3 CONTEXT Stream
 
-- `torch.zeros(B, S, 64)` via `auto_zeros=True`
+- `torch.zeros(B, S, 64)` via `source=StreamSource.ZEROS`
 - `RMSNorm` applied immediately: `F.rms_norm(x, (64,), eps=None)`
 - When `x = 0`: `0 / sqrt(0 + eps) = 0`. PyTorch default eps prevents NaN.
 - **CONTEXT stays at zero** until the first preconv layer writes to it.

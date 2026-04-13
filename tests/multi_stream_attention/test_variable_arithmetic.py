@@ -49,6 +49,7 @@ from multi_streams import (
     StreamType,
     StreamID,
     StreamDef,
+    StreamSource,
     DocBoundaryComponent,
     SinCosPositionComponent,
     MultiStreamBuilder,
@@ -219,11 +220,12 @@ def make_stream_defs(
 ) -> list[StreamDef]:
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
-        StreamDef(name=StreamID(StreamType.CONTEXT), dim=context_dim, auto_zeros=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, source=StreamSource.ONE_HOT),
+        StreamDef(name=StreamID(StreamType.CONTEXT), dim=context_dim, source=StreamSource.ZEROS),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 DocBoundaryComponent(bos_id=tok.bos_id),
                 SinCosPositionComponent(num_freqs=10),

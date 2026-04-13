@@ -25,7 +25,7 @@ from torch import Tensor
 
 from efficient_byte_tokenizer import EfficientByteTokenizer
 from byte_stream_components import ByteHashComponent, HashBoundary
-from multi_streams import StreamType, StreamID, StreamDef, SinCosPositionComponent
+from multi_streams import StreamType, StreamID, StreamDef, StreamSource, SinCosPositionComponent
 from test_harness import (
     TinyGPT,
     MultiStreamTestModel,
@@ -171,10 +171,11 @@ def build_stream_defs(tok: EfficientByteTokenizer) -> list[StreamDef]:
     """
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, source=StreamSource.ONE_HOT),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 SinCosPositionComponent(num_freqs=32),  # 12d
                 ByteHashComponent(

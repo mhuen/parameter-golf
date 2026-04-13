@@ -8,11 +8,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import pytest
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 from multi_streams import (
     StreamType,
     StreamID,
+    StreamSource,
     StreamDef,
     StreamConfig,
     MultiStreamConfig,
@@ -158,6 +159,7 @@ class TestMultiStreamBuilder:
                 StreamDef(
                     name=StreamID(StreamType.STRUCTURAL),
                     read_only=True,
+                    source=StreamSource.COMPONENTS,
                     components=[
                         SinCosPositionComponent(num_freqs=8),
                         DocBoundaryComponent(bos_id=1, num_freqs=1),
@@ -190,6 +192,7 @@ class TestMultiStreamBuilder:
                 StreamDef(
                     name=StreamID(StreamType.STRUCTURAL),
                     read_only=True,
+                    source=StreamSource.COMPONENTS,
                     components=[
                         SinCosPositionComponent(num_freqs=4),
                     ],
@@ -215,6 +218,7 @@ class TestMultiStreamBuilder:
                 StreamDef(
                     name=StreamID(StreamType.STRUCTURAL),
                     read_only=True,
+                    source=StreamSource.COMPONENTS,
                     components=[
                         SinCosPositionComponent(),
                     ],
@@ -225,3 +229,53 @@ class TestMultiStreamBuilder:
         writable = torch.randn(1, 5, 16)
         streams, _, _ = builder(ids, logit=writable)
         assert torch.equal(streams[StreamID(StreamType.LOGIT)], writable)
+
+    @torch.no_grad()
+    def test_embedding_source(self):
+        """EMBEDDING source creates nn.Embedding and produces correct output."""
+        builder = MultiStreamBuilder(
+            stream_defs=[
+                StreamDef(
+                    name=StreamID(StreamType.CONTEXT),
+                    source=StreamSource.EMBEDDING,
+                    dim=32,
+                ),
+            ],
+            vocab_size=256,
+        )
+        assert "context" in builder.embeddings
+        assert isinstance(builder.embeddings["context"], nn.Embedding)
+        assert builder.embeddings["context"].num_embeddings == 256
+        assert builder.embeddings["context"].embedding_dim == 32
+
+        ids = torch.randint(0, 256, (2, 10))
+        streams, _, _ = builder(ids, dtype=torch.float32)
+        assert streams[StreamID(StreamType.CONTEXT)].shape == (2, 10, 32)
+
+    @torch.no_grad()
+    def test_embedding_requires_vocab_size(self):
+        """EMBEDDING source without vocab_size raises ValueError."""
+        with pytest.raises(ValueError, match="vocab_size"):
+            MultiStreamBuilder(
+                stream_defs=[
+                    StreamDef(
+                        name=StreamID(StreamType.CONTEXT),
+                        source=StreamSource.EMBEDDING,
+                        dim=32,
+                    ),
+                ],
+            )
+
+    @torch.no_grad()
+    def test_embedding_requires_dim(self):
+        """EMBEDDING source without dim raises ValueError."""
+        with pytest.raises(ValueError, match="dim"):
+            MultiStreamBuilder(
+                stream_defs=[
+                    StreamDef(
+                        name=StreamID(StreamType.CONTEXT),
+                        source=StreamSource.EMBEDDING,
+                    ),
+                ],
+                vocab_size=256,
+            )

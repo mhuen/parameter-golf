@@ -34,6 +34,16 @@ class StreamType(StrEnum):
     STRUCTURAL = "structural"
 
 
+class StreamSource(StrEnum):
+    """How a stream tensor is produced in :class:`MultiStreamBuilder`."""
+
+    PROVIDED = "provided"
+    ZEROS = "zeros"
+    ONE_HOT = "one_hot"
+    COMPONENTS = "components"
+    EMBEDDING = "embedding"
+
+
 @dataclass(frozen=True)
 class StreamID:
     """Hashable stream identifier supporting multiple streams of the same type.
@@ -77,20 +87,25 @@ class MultiStreamConfig:
 class StreamDef:
     """Definition for a single stream in MultiStreamBuilder.
 
-    Exactly one of these must determine the dimension:
-    - ``dim``: explicit dimension (for externally-provided or auto-zeros streams)
-    - ``components``: list of nn.Module components (dim auto-computed)
-    - ``auto_onehot``: True to auto-create one-hot from input_ids (requires vocab_size)
+    The ``source`` field determines how the stream tensor is produced:
+    - ``PROVIDED``: caller passes the tensor in ``forward(**provided_streams)``
+    - ``ZEROS``: ``torch.zeros(B, S, dim)``
+    - ``ONE_HOT``: ``F.one_hot(input_ids, vocab_size)``
+    - ``COMPONENTS``: built from composable ``nn.Module`` components
+    - ``EMBEDDING``: ``nn.Embedding(vocab_size, dim)(input_ids)``
+
+    ``dim`` is required for PROVIDED, ZEROS, and EMBEDDING sources.
+    For COMPONENTS, dim is auto-computed from the component list.
+    For ONE_HOT, dim is auto-derived from vocab_size.
     """
 
     name: StreamID
+    source: StreamSource = StreamSource.PROVIDED
     read_only: bool = False
     norm_type: type[nn.Module] | None = None
     input_norm_types: list[type[nn.Module]] | None = None
     dim: int | None = None
     components: list[nn.Module] | None = None
-    auto_zeros: bool = False
-    auto_onehot: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -232,23 +247,20 @@ class CompositeStream(nn.Module):
 class MultiStreamBuilder(nn.Module):
     """Constructs the full stream dict from input_ids and optional provided streams.
 
-    Each stream is defined by a ``StreamDef`` specifying how it is constructed:
-    - External input: caller provides the tensor in ``forward(**provided_streams)``
-    - Components: built automatically from composable ``nn.Module`` components
-    - Auto one-hot: one-hot encoding of ``input_ids``
-    - Auto zeros: zero-initialized tensor
+    Each stream is defined by a ``StreamDef`` whose ``source`` field selects
+    the production method (see :class:`StreamSource`).
 
-    Usage:
+    Usage::
+
         builder = MultiStreamBuilder([
-            StreamDef(Stream.LOGIT, dim=vocab_size),              # caller provides
-            StreamDef(Stream.TOKENS, auto_onehot=True, read_only=True),
-            StreamDef(Stream.STRUCTURAL, read_only=True, components=[hash_comp, ...]),
-            StreamDef(Stream.CONTEXT, dim=32, auto_zeros=True),   # writable scratch
+            StreamDef(Stream.LOGIT, source=StreamSource.ZEROS, dim=vocab_size),
+            StreamDef(Stream.TOKENS, source=StreamSource.ONE_HOT, read_only=True),
+            StreamDef(Stream.STRUCTURAL, source=StreamSource.COMPONENTS,
+                      read_only=True, components=[pos_comp, doc_comp]),
+            StreamDef(Stream.CONTEXT, source=StreamSource.EMBEDDING, dim=32),
         ], vocab_size=vocab_size)
 
-        attn = CausalMultiStreamAttention(..., stream_config=builder.config)
-        streams, compressed, views = builder(input_ids, logit=one_hot_tensor)
-        out = attn(streams)
+        streams, compressed, views = builder(input_ids)
     """
 
     def __init__(
@@ -267,12 +279,26 @@ class MultiStreamBuilder(nn.Module):
                 self.register_module(f"_comp_{k}", v)
         self._compress_stream_ids = compress_streams or []
 
-        # Build CompositeStreams for component-based defs
+        # Validate source/components consistency and build modules
         composites: dict[str, CompositeStream] = {}
+        embeddings: dict[str, nn.Embedding] = {}
         stream_configs: list[StreamConfig] = []
+        resolved_dims: dict[str, int] = {}
 
         for sd in self._defs:
+            if sd.source == StreamSource.COMPONENTS and sd.components is None:
+                raise ValueError(
+                    f"Stream {sd.name}: source=COMPONENTS requires components list"
+                )
+            if sd.components is not None and sd.source != StreamSource.COMPONENTS:
+                raise ValueError(
+                    f"Stream {sd.name}: components provided but source={sd.source}, "
+                    f"expected source=COMPONENTS"
+                )
+
             dim = self._resolve_dim(sd)
+            key = str(sd.name)
+            resolved_dims[key] = dim
             stream_configs.append(
                 StreamConfig(
                     sd.name,
@@ -282,34 +308,49 @@ class MultiStreamBuilder(nn.Module):
                     input_norm_types=sd.input_norm_types,
                 )
             )
-            if sd.components is not None:
-                composites[str(sd.name)] = CompositeStream(sd.components)
+            if sd.source == StreamSource.COMPONENTS:
+                composites[key] = CompositeStream(sd.components)
+            elif sd.source == StreamSource.EMBEDDING:
+                embeddings[key] = nn.Embedding(self.vocab_size, dim)
 
+        self._resolved_dims = resolved_dims
         self.composites = nn.ModuleDict(composites)
+        self.embeddings = nn.ModuleDict(embeddings)
         self._config = MultiStreamConfig(streams=stream_configs)
 
     def _resolve_dim(self, sd: StreamDef) -> int:
         """Compute and validate the dimension for a StreamDef."""
-        if sd.auto_onehot:
+        if sd.source == StreamSource.ONE_HOT:
             if self.vocab_size is None:
                 raise ValueError(
-                    f"Stream {sd.name} has auto_onehot=True but vocab_size not provided"
+                    f"Stream {sd.name}: source=ONE_HOT requires vocab_size"
                 )
             if sd.dim is not None and sd.dim != self.vocab_size:
                 raise ValueError(
                     f"Stream {sd.name}: dim={sd.dim} conflicts with vocab_size={self.vocab_size}"
                 )
             return self.vocab_size
-        if sd.components is not None:
+        if sd.source == StreamSource.COMPONENTS:
             comp_dim = sum(c.dim for c in sd.components)
             if sd.dim is not None and sd.dim != comp_dim:
                 raise ValueError(
                     f"Stream {sd.name}: dim={sd.dim} conflicts with components dim={comp_dim}"
                 )
             return comp_dim
+        if sd.source == StreamSource.EMBEDDING:
+            if self.vocab_size is None:
+                raise ValueError(
+                    f"Stream {sd.name}: source=EMBEDDING requires vocab_size"
+                )
+            if sd.dim is None:
+                raise ValueError(
+                    f"Stream {sd.name}: source=EMBEDDING requires dim"
+                )
+            return sd.dim
+        # PROVIDED and ZEROS both require explicit dim
         if sd.dim is None:
             raise ValueError(
-                f"Stream {sd.name}: must specify dim, components, or auto_onehot"
+                f"Stream {sd.name}: source={sd.source} requires dim"
             )
         return sd.dim
 
@@ -333,8 +374,7 @@ class MultiStreamBuilder(nn.Module):
             input_ids: (B, S) token IDs.
             dtype: dtype for auto-constructed streams.
             **provided_streams: tensors keyed by stream name string
-                (e.g. ``logit=tensor``). Required for streams without
-                auto_onehot, auto_zeros, or components.
+                (e.g. ``logit=tensor``). Required for ``PROVIDED`` streams.
 
         Returns:
             Tuple of:
@@ -348,17 +388,19 @@ class MultiStreamBuilder(nn.Module):
 
         for sd in self._defs:
             key = str(sd.name)
-            if sd.components is not None:
+            if sd.source == StreamSource.COMPONENTS:
                 streams[sd.name] = self.composites[key](input_ids, dtype)
-            elif sd.auto_onehot:
+            elif sd.source == StreamSource.ONE_HOT:
                 streams[sd.name] = F.one_hot(input_ids, self.vocab_size).to(dtype=dtype)
-            elif sd.auto_zeros:
-                dim = self._resolve_dim(sd)
+            elif sd.source == StreamSource.ZEROS:
+                dim = self._resolved_dims[key]
                 streams[sd.name] = torch.zeros(
                     B, S, dim, dtype=dtype, device=input_ids.device
                 )
+            elif sd.source == StreamSource.EMBEDDING:
+                streams[sd.name] = self.embeddings[key](input_ids).to(dtype=dtype)
             else:
-                # Try exact key first, then fall back to type value
+                # PROVIDED: try exact key first, then fall back to type value
                 # (kwargs are Python identifiers, so "logit" not "logit:NAME")
                 if key in provided_streams:
                     streams[sd.name] = provided_streams[key]

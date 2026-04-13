@@ -37,6 +37,7 @@ from multi_streams import (
     StreamType,
     StreamID,
     StreamDef,
+    StreamSource,
     SinCosPositionComponent,
     CompressionType,
 )
@@ -290,10 +291,11 @@ def make_stream_defs_basic(tok: EfficientByteTokenizer) -> list[StreamDef]:
     """Basic multi-stream: logit + tokens + structural hash (no digit compute)."""
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, source=StreamSource.ONE_HOT),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 SinCosPositionComponent(num_freqs=32),  # 12d
                 DigitSequenceComponent(tok=tok, id_freqs=5),
@@ -313,10 +315,11 @@ def make_stream_defs_digit_compute(tok: EfficientByteTokenizer) -> list[StreamDe
     """Multi-stream with DigitComputeComponent in structural stream."""
     return [
         StreamDef(name=StreamID(StreamType.LOGIT), dim=tok.vocab_size),
-        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, auto_onehot=True),
+        StreamDef(name=StreamID(StreamType.TOKENS), read_only=True, source=StreamSource.ONE_HOT),
         StreamDef(
             name=StreamID(StreamType.STRUCTURAL),
             read_only=True,
+            source=StreamSource.COMPONENTS,
             components=[
                 SinCosPositionComponent(num_freqs=32),  # 12d
                 DigitSequenceComponent(tok=tok, id_freqs=5),
