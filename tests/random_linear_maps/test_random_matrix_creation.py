@@ -279,6 +279,130 @@ def find_best_seed(
     return best_seed, best_mse, best_vector
 
 
+@torch.no_grad()
+def find_best_seed_affine(
+    target: torch.Tensor,
+    generator: SeededVectorGenerator,
+    n_seeds: int,
+    chunk_size: int | None = None,
+    seed_offset: int = 0,
+    verbose: bool = True,
+) -> tuple[int, float, float, float, torch.Tensor]:
+    """Search for seed + optimal affine transform (scale, shift).
+
+    Reconstruction: ``vector = gen(seed, n) * scale + shift``
+
+    For each candidate seed the optimal ``(scale, shift)`` are solved in
+    closed form via least-squares, so the brute-force only iterates over
+    seeds.  The optimal residual MSE is computed without materialising the
+    fitted tensor::
+
+        MSE_opt = var(target) - cov(g, target)² / var(g)
+
+    which keeps the inner loop to three cheap reductions per chunk.
+
+    Args:
+        target:      Tensor of any shape (will be flattened internally).
+        generator:   A :class:`SeededVectorGenerator` instance.
+        n_seeds:     Total number of seeds to try.
+        chunk_size:  Batch size per iteration; auto-computed from free memory when *None*.
+        seed_offset: First seed value.
+        verbose:     Print progress lines.
+
+    Returns:
+        ``(best_seed, scale, shift, best_mse, best_vector)``
+    """
+    device = target.device
+    orig_shape = target.shape
+    target_flat = target.reshape(1, -1).float()  # [1, n]
+    n = target_flat.shape[1]
+
+    # Pre-compute target statistics (constant across all candidates)
+    t_mean = target_flat.mean()
+    var_t = target_flat.var(correction=0)
+
+    if chunk_size is None:
+        chunk_size = _auto_chunk_size(n, device)
+    chunk_size = min(chunk_size, n_seeds)
+
+    if verbose:
+        print(
+            f"  Searching {n_seeds:,} seeds (affine) in chunks of "
+            f"{chunk_size:,} ({n:,} params)"
+        )
+
+    # Compile a fresh module for this element count
+    gen_c = torch.compile(
+        SeededVectorGenerator().to(device), fullgraph=True, dynamic=False,
+    )
+    _ws = torch.zeros(min(chunk_size, 8), device=device, dtype=torch.int64)
+    gen_c(_ws, n)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    best_mse = float("inf")
+    best_seed = -1
+    t_start = time.perf_counter()
+    seeds_done = 0
+
+    for start in range(0, n_seeds, chunk_size):
+        end = min(start + chunk_size, n_seeds)
+
+        seeds = torch.arange(
+            seed_offset + start, seed_offset + end,
+            device=device, dtype=torch.int64,
+        )
+
+        g = gen_c(seeds, n)                                     # [chunk, n]
+
+        # Sufficient statistics — three reductions, no extra [chunk, n] alloc
+        g_mean = g.mean(dim=1)                                   # [chunk]
+        gt_mean = (g * target_flat).mean(dim=1)                  # [chunk]
+        g_sq_mean = (g * g).mean(dim=1)                          # [chunk]
+
+        cov = gt_mean - g_mean * t_mean                          # [chunk]
+        var_g = (g_sq_mean - g_mean * g_mean).clamp(min=1e-20)   # [chunk]
+
+        # Optimal residual MSE (closed-form, no fitted tensor needed)
+        mse_vals = (var_t - cov * cov / var_g).clamp(min=0)      # [chunk]
+
+        chunk_best_idx = mse_vals.argmin()
+        chunk_best_mse = mse_vals[chunk_best_idx].item()
+
+        if chunk_best_mse < best_mse:
+            best_mse = chunk_best_mse
+            best_seed = seed_offset + start + chunk_best_idx.item()
+
+        seeds_done += end - start
+
+        if verbose and (
+            seeds_done % max(chunk_size * 10, 1) < (end - start)
+            or end == n_seeds
+        ):
+            elapsed = time.perf_counter() - t_start
+            rate = seeds_done / max(elapsed, 1e-9)
+            eta = (n_seeds - seeds_done) / max(rate, 1)
+            print(
+                f"    {seeds_done:>12,}/{n_seeds:,} seeds | "
+                f"best MSE={best_mse:.6f} | "
+                f"{rate:,.0f} seeds/s | "
+                f"ETA {eta:.1f}s"
+            )
+
+    # Recover scale & shift for the winning seed
+    best_seed_t = torch.tensor([best_seed], device=device, dtype=torch.int64)
+    g_best = generator(best_seed_t, n).squeeze(0).float()
+    g_best_mean = g_best.mean()
+    cov_best = ((g_best - g_best_mean) * (target_flat.squeeze(0) - t_mean)).mean()
+    var_g_best = ((g_best - g_best_mean) ** 2).mean().clamp(min=1e-20)
+    best_scale = (cov_best / var_g_best).item()
+    best_shift = (t_mean - best_scale * g_best_mean).item()
+
+    best_vector = (g_best * best_scale + best_shift).view(orig_shape)
+
+    return best_seed, best_scale, best_shift, best_mse, best_vector
+
+
 # ---------------------------------------------------------------------------
 # Part 4: Evaluation across parameter counts
 # ---------------------------------------------------------------------------
@@ -286,27 +410,46 @@ def find_best_seed(
 _DEFAULT_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144]
 
 
+def _metrics(target: torch.Tensor, approx: torch.Tensor) -> tuple[float, float]:
+    """Return (relative_l2_error, cosine_similarity) for two flat tensors."""
+    t = target.float()
+    a = approx.float()
+    rel_l2 = (torch.norm(a - t) / torch.norm(t)).item()
+    cos = (
+        F.cosine_similarity(t.unsqueeze(0), a.unsqueeze(0)).item()
+        if t.numel() > 1
+        else float("nan")
+    )
+    return rel_l2, cos
+
+
 def evaluate_compression(
     device: torch.device,
     n_seeds: int = 10_000_000,
     sizes: list[int] | None = None,
 ) -> list[dict]:
-    """Evaluate seed-based compression quality for many parameter counts."""
+    """Evaluate seed-based compression: raw (1 param) vs affine (3 params)."""
     if sizes is None:
         sizes = list(_DEFAULT_SIZES)
 
     gen = SeededVectorGenerator().to(device)
 
-    sep = "=" * 100
+    sep = "=" * 115
     print(f"\n{sep}")
     print("EVALUATION: Seed-Based Vector Compression")
     print(f"Device: {device} | Base seed budget: {n_seeds:,}")
     print(sep)
     print(
-        f"{'Params':>8} {'Seeds':>12} "
-        f"{'Best MSE':>12} {'Rel L2 Err':>12} {'Cos Sim':>10} {'Time (s)':>10}"
+        f"{'Params':>8} {'Seeds':>12}  "
+        f"{'--- Raw (1 int) ---':^28s}  "
+        f"{'--- Affine (seed+scale+shift) ---':^34s}"
     )
-    print("-" * 100)
+    print(
+        f"{'':>8} {'':>12}  "
+        f"{'MSE':>10} {'Rel L2':>10} {'CosSim':>8}  "
+        f"{'MSE':>10} {'Rel L2':>10} {'CosSim':>8} {'Time':>8}"
+    )
+    print("-" * 115)
 
     results: list[dict] = []
     torch.manual_seed(42)  # reproducible targets
@@ -317,46 +460,50 @@ def evaluate_compression(
             n_seeds, max(100_000, n_seeds // max(1, n_params // 64))
         )
 
-        # Random target (normal distribution, as typical weight init)
         target = torch.randn(n_params, device=device)
 
+        # --- Raw search (1 param: seed) ---
         t0 = time.perf_counter()
-        best_seed, best_mse, best_vector = find_best_seed(
+        raw_seed, raw_mse, raw_vec = find_best_seed(
             target, gen, scaled_seeds, verbose=False,
         )
-        elapsed = time.perf_counter() - t0
+        raw_time = time.perf_counter() - t0
+        raw_rl2, raw_cos = _metrics(target, raw_vec)
 
-        # Metrics
-        t_flat = target.float()
-        b_flat = best_vector.float()
+        # --- Affine search (3 params: seed + scale + shift) ---
+        t0 = time.perf_counter()
+        aff_seed, aff_scale, aff_shift, aff_mse, aff_vec = find_best_seed_affine(
+            target, gen, scaled_seeds, verbose=False,
+        )
+        aff_time = time.perf_counter() - t0
+        aff_rl2, aff_cos = _metrics(target, aff_vec)
 
-        rel_l2 = (torch.norm(b_flat - t_flat) / torch.norm(t_flat)).item()
-        cos_sim = F.cosine_similarity(
-            t_flat.unsqueeze(0), b_flat.unsqueeze(0),
-        ).item() if n_params > 1 else float("nan")
+        total_time = raw_time + aff_time
 
         print(
-            f"{n_params:>8,} {scaled_seeds:>12,} "
-            f"{best_mse:>12.6f} {rel_l2:>12.6f} {cos_sim:>10.4f} {elapsed:>10.1f}"
+            f"{n_params:>8,} {scaled_seeds:>12,}  "
+            f"{raw_mse:>10.6f} {raw_rl2:>10.6f} {raw_cos:>8.4f}  "
+            f"{aff_mse:>10.6f} {aff_rl2:>10.6f} {aff_cos:>8.4f} {total_time:>7.1f}s"
         )
 
         results.append(dict(
             n_params=n_params,
             n_seeds_searched=scaled_seeds,
-            best_seed=best_seed,
-            best_mse=best_mse,
-            rel_l2=rel_l2,
-            cos_sim=cos_sim,
-            time_s=elapsed,
+            raw=dict(seed=raw_seed, mse=raw_mse, rel_l2=raw_rl2, cos_sim=raw_cos),
+            affine=dict(
+                seed=aff_seed, scale=aff_scale, shift=aff_shift,
+                mse=aff_mse, rel_l2=aff_rl2, cos_sim=aff_cos,
+            ),
+            time_s=total_time,
         ))
 
-        # Verify deterministic reproduction
+        # Verify affine reproduction
         repro = gen(
-            torch.tensor([best_seed], device=device, dtype=torch.int64), n_params,
-        ).squeeze(0)
-        max_diff = (repro - best_vector).abs().max().item()
-        if max_diff > 0:
-            print(f"  WARNING: reproduction mismatch  max|diff| = {max_diff}")
+            torch.tensor([aff_seed], device=device, dtype=torch.int64), n_params,
+        ).squeeze(0) * aff_scale + aff_shift
+        max_diff = (repro - aff_vec).abs().max().item()
+        if max_diff > 1e-5:
+            print(f"  WARNING: affine reproduction mismatch  max|diff| = {max_diff}")
 
     print(sep)
     return results
