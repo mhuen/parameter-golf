@@ -87,8 +87,6 @@ def benchmark_generation(device: torch.device) -> None:
     """Benchmark seeded matrix generation: compiled vs. uncompiled."""
     gen = SeededMatrixGenerator().to(device)
 
-    gen_compiled = torch.compile(gen, fullgraph=True, dynamic=False)
-
     configs = [
         # (batch, rows, cols, label)
         (1_000, 16, 16, "1K x 16x16"),
@@ -100,6 +98,16 @@ def benchmark_generation(device: torch.device) -> None:
         (1_000, 512, 512, "1K x 512x512"),
         (5_000, 512, 512, "5K x 512x512"),
     ]
+
+    # Pre-compile one fresh module per distinct (rows, cols) shape so we never
+    # exceed the dynamo recompile limit on a single module instance.
+    distinct_shapes = sorted({(r, c) for _, r, c, _ in configs})
+    compiled_by_shape: dict[tuple[int, int], nn.Module] = {}
+    for rows, cols in distinct_shapes:
+        m = SeededMatrixGenerator().to(device)
+        compiled_by_shape[(rows, cols)] = torch.compile(
+            m, fullgraph=True, dynamic=False,
+        )
 
     print("\n" + "=" * 94)
     print("BENCHMARK: Seeded Matrix Generation")
@@ -126,6 +134,7 @@ def benchmark_generation(device: torch.device) -> None:
                 continue
 
         seeds = torch.arange(batch, device=device, dtype=torch.int64)
+        gen_compiled = compiled_by_shape[(rows, cols)]
 
         # ---- Eager ----
         for _ in range(n_warmup):
@@ -226,8 +235,11 @@ def find_best_seed(
             f"(matrix {rows}x{cols} = {n_elements:,} params)"
         )
 
-    # Compile the generator once for the shape we will use throughout
-    gen_c = torch.compile(generator, fullgraph=True, dynamic=False)
+    # Compile a *fresh* module so each (rows, cols) shape gets its own dynamo
+    # cache and we never hit the recompile limit across successive calls.
+    gen_c = torch.compile(
+        SeededMatrixGenerator().to(device), fullgraph=True, dynamic=False,
+    )
     # Warmup compilation
     _ws = torch.zeros(min(chunk_size, 8), device=device, dtype=torch.int64)
     gen_c(_ws, rows, cols)
