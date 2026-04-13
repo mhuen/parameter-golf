@@ -172,13 +172,13 @@ def build_multi_stream_components(
             read_only=False,
             norm_type=CenterLastDim,
             # input_norm_types=[CenterLastDim, RMSNorm],
-            input_norm_types=[CenterLastDim],
+            input_norm_types=[RMSNorm],
             dim=vocab_size,
         ),
-        StreamDef(tokens_id, source=StreamSource.ONE_HOT, read_only=True),
+        # StreamDef(tokens_id, source=StreamSource.ONE_HOT, read_only=True),
         StreamDef(
             context_id,
-            source=StreamSource.ZEROS,
+            source=StreamSource.EMBEDDING,
             read_only=False,
             norm_type=RMSNorm,
             input_norm_types=[RMSNorm],
@@ -450,7 +450,7 @@ class MultiStreamGPT(nn.Module):
         # Output
         logit_softcap: float = 30.0,
         value_softcap: float | None = 30.0,
-        logit_stream_normalization_factor: float = 10.0,
+        logit_stream_normalization_factor: float = 1.0,
         # Priors
         include_bigram_prior: bool = True,
         include_utf8_prior: bool = True,

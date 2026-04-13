@@ -225,7 +225,10 @@ class CompositeStream(nn.Module):
 
     @torch.no_grad()
     def calibrate(
-        self, input_ids: Tensor, batch_size: int = 64, compile: bool = False,
+        self,
+        input_ids: Tensor,
+        batch_size: int = 64,
+        compile: bool = False,
     ) -> None:
         """Calibrate all components, then collect into combined buffers."""
         for c in self.components:
@@ -343,15 +346,11 @@ class MultiStreamBuilder(nn.Module):
                     f"Stream {sd.name}: source=EMBEDDING requires vocab_size"
                 )
             if sd.dim is None:
-                raise ValueError(
-                    f"Stream {sd.name}: source=EMBEDDING requires dim"
-                )
+                raise ValueError(f"Stream {sd.name}: source=EMBEDDING requires dim")
             return sd.dim
         # PROVIDED and ZEROS both require explicit dim
         if sd.dim is None:
-            raise ValueError(
-                f"Stream {sd.name}: source={sd.source} requires dim"
-            )
+            raise ValueError(f"Stream {sd.name}: source={sd.source} requires dim")
         return sd.dim
 
     @property
