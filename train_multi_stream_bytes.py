@@ -106,6 +106,7 @@ class Hyperparameters:
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    lr_warmup_steps = int(os.environ.get("LR_WARMUP_STEPS", 0))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -1005,8 +1006,15 @@ def main():
     )
 
     def lr_mul(step, elapsed_ms):
+        # Linear LR warmup
+        warmup_mul = (
+            min(step / max(args.lr_warmup_steps, 1), 1.0)
+            if args.lr_warmup_steps > 0
+            else 1.0
+        )
+        # Warmdown
         if args.warmdown_iters <= 0:
-            return 1.0
+            return warmup_mul
         warmdown_start = max(args.iterations - args.warmdown_iters, 0)
         step_mul = (
             max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
@@ -1022,8 +1030,8 @@ def main():
                 if remaining_ms <= warmdown_ms
                 else 1.0
             )
-            return min(step_mul, time_mul)
-        return step_mul
+            return warmup_mul * min(step_mul, time_mul)
+        return warmup_mul * step_mul
 
     # --- Warmup ---
     if args.warmup_steps > 0:
