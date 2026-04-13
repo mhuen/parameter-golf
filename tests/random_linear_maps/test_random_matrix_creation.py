@@ -51,7 +51,17 @@ class SeededVectorGenerator(nn.Module):
     The output is a flat ``[batch, n]`` tensor.  Callers can reshape to any
     matrix layout afterwards — the hash only depends on the total element
     count, not on any 2-D shape.
+
+    Args:
+        normal: If *True*, map the uniform output through the inverse normal
+                CDF (``erfinv``) to produce approximately N(0, 1) values.
+                This matches the distribution of typical weight initialisers
+                and eliminates the range-mismatch plateau in raw seed search.
     """
+
+    def __init__(self, normal: bool = False) -> None:
+        super().__init__()
+        self.normal = normal
 
     def forward(self, seeds: torch.Tensor, n: int) -> torch.Tensor:
         """
@@ -60,7 +70,8 @@ class SeededVectorGenerator(nn.Module):
             n:     number of elements per vector.
 
         Returns:
-            ``[batch, n]`` float32 tensor with values in [-1, 1).
+            ``[batch, n]`` float32 tensor.  Uniform in [-1, 1) when
+            ``normal=False``; approximately N(0, 1) when ``normal=True``.
         """
         idx = torch.arange(n, device=seeds.device, dtype=torch.int64)
 
@@ -74,7 +85,16 @@ class SeededVectorGenerator(nn.Module):
 
         # Extract lower 32 random bits → float in [-1, 1)
         # (avoids int64-sign issues; 32 bits > float32's 23-bit mantissa)
-        return (x & 0xFFFFFFFF).float() * (1.0 / 2147483648.0) - 1.0
+        u = (x & 0xFFFFFFFF).float() * (1.0 / 2147483648.0) - 1.0
+
+        if not self.normal:
+            return u
+
+        # Inverse normal CDF via erfinv:  Φ⁻¹(p) = √2 · erfinv(2p − 1)
+        # Our u ∈ [-1, 1).  erfinv needs input in (-1, 1), so clamp the
+        # extreme tails to avoid ±inf.
+        u = u.clamp(-0.9999, 0.9999)
+        return 1.4142135623730951 * torch.erfinv(u)  # sqrt(2)
 
 
 # ---------------------------------------------------------------------------
@@ -225,9 +245,9 @@ def find_best_seed(
             f"  Searching {n_seeds:,} seeds in chunks of {chunk_size:,} ({n:,} params)"
         )
 
-    # Compile a fresh module for this element count
+    # Compile a fresh module with the same config for this element count
     gen_c = torch.compile(
-        SeededVectorGenerator().to(device),
+        SeededVectorGenerator(normal=generator.normal).to(device),
         fullgraph=True,
         dynamic=False,
     )
@@ -337,9 +357,9 @@ def find_best_seed_affine(
             f"{chunk_size:,} ({n:,} params)"
         )
 
-    # Compile a fresh module for this element count
+    # Compile a fresh module with the same config for this element count
     gen_c = torch.compile(
-        SeededVectorGenerator().to(device),
+        SeededVectorGenerator(normal=generator.normal).to(device),
         fullgraph=True,
         dynamic=False,
     )
@@ -438,28 +458,31 @@ def evaluate_compression(
     n_seeds: int = 10_000_000,
     sizes: list[int] | None = None,
 ) -> list[dict]:
-    """Evaluate seed-based compression: raw (1 param) vs affine (3 params)."""
+    """Evaluate seed-based compression: uniform raw, normal raw, and affine."""
     if sizes is None:
         sizes = list(_DEFAULT_SIZES)
 
-    gen = SeededVectorGenerator().to(device)
+    gen_u = SeededVectorGenerator(normal=False).to(device)
+    gen_n = SeededVectorGenerator(normal=True).to(device)
 
-    sep = "=" * 115
+    sep = "=" * 130
     print(f"\n{sep}")
     print("EVALUATION: Seed-Based Vector Compression")
     print(f"Device: {device} | Base seed budget: {n_seeds:,}")
     print(sep)
     print(
         f"{'Params':>8} {'Seeds':>12}  "
-        f"{'--- Raw (1 int) ---':^28s}  "
-        f"{'--- Affine (seed+scale+shift) ---':^34s}"
+        f"{'- Uniform raw -':^20s}  "
+        f"{'- Normal raw -':^20s}  "
+        f"{'- Uniform+Affine -':^24s}"
     )
     print(
         f"{'':>8} {'':>12}  "
-        f"{'MSE':>10} {'Rel L2':>10} {'CosSim':>8}  "
-        f"{'MSE':>10} {'Rel L2':>10} {'CosSim':>8} {'Time':>8}"
+        f"{'MSE':>10} {'CosSim':>8}  "
+        f"{'MSE':>10} {'CosSim':>8}  "
+        f"{'MSE':>10} {'CosSim':>8} {'Time':>8}"
     )
-    print("-" * 115)
+    print("-" * 130)
 
     results: list[dict] = []
     torch.manual_seed(42)  # reproducible targets
@@ -470,65 +493,55 @@ def evaluate_compression(
 
         target = torch.randn(n_params, device=device)
 
-        # --- Raw search (1 param: seed) ---
+        # --- Uniform raw (1 param: seed, output in [-1,1)) ---
         t0 = time.perf_counter()
-        raw_seed, raw_mse, raw_vec = find_best_seed(
-            target,
-            gen,
-            scaled_seeds,
-            verbose=False,
+        u_seed, u_mse, u_vec = find_best_seed(
+            target, gen_u, scaled_seeds, verbose=False,
         )
-        raw_time = time.perf_counter() - t0
-        raw_rl2, raw_cos = _metrics(target, raw_vec)
+        u_time = time.perf_counter() - t0
+        _, u_cos = _metrics(target, u_vec)
 
-        # --- Affine search (3 params: seed + scale + shift) ---
+        # --- Normal raw (1 param: seed, output ~ N(0,1)) ---
         t0 = time.perf_counter()
-        aff_seed, aff_scale, aff_shift, aff_mse, aff_vec = find_best_seed_affine(
-            target,
-            gen,
-            scaled_seeds,
-            verbose=False,
+        n_seed, n_mse, n_vec = find_best_seed(
+            target, gen_n, scaled_seeds, verbose=False,
         )
-        aff_time = time.perf_counter() - t0
-        aff_rl2, aff_cos = _metrics(target, aff_vec)
+        n_time = time.perf_counter() - t0
+        _, n_cos = _metrics(target, n_vec)
 
-        total_time = raw_time + aff_time
+        # --- Uniform + Affine (3 params: seed + scale + shift) ---
+        t0 = time.perf_counter()
+        a_seed, a_scale, a_shift, a_mse, a_vec = find_best_seed_affine(
+            target, gen_u, scaled_seeds, verbose=False,
+        )
+        a_time = time.perf_counter() - t0
+        _, a_cos = _metrics(target, a_vec)
+
+        total_time = u_time + n_time + a_time
+
+        def _cs(c: float) -> str:
+            return f"{c:>8.4f}" if n_params > 1 else f"{'n/a':>8s}"
 
         print(
             f"{n_params:>8,} {scaled_seeds:>12,}  "
-            f"{raw_mse:>10.6f} {raw_rl2:>10.6f} {raw_cos:>8.4f}  "
-            f"{aff_mse:>10.6f} {aff_rl2:>10.6f} {aff_cos:>8.4f} {total_time:>7.1f}s"
+            f"{u_mse:>10.6f} {_cs(u_cos)}  "
+            f"{n_mse:>10.6f} {_cs(n_cos)}  "
+            f"{a_mse:>10.6f} {_cs(a_cos)} {total_time:>7.1f}s"
         )
 
         results.append(
             dict(
                 n_params=n_params,
                 n_seeds_searched=scaled_seeds,
-                raw=dict(seed=raw_seed, mse=raw_mse, rel_l2=raw_rl2, cos_sim=raw_cos),
+                uniform_raw=dict(seed=u_seed, mse=u_mse, cos_sim=u_cos),
+                normal_raw=dict(seed=n_seed, mse=n_mse, cos_sim=n_cos),
                 affine=dict(
-                    seed=aff_seed,
-                    scale=aff_scale,
-                    shift=aff_shift,
-                    mse=aff_mse,
-                    rel_l2=aff_rl2,
-                    cos_sim=aff_cos,
+                    seed=a_seed, scale=a_scale, shift=a_shift,
+                    mse=a_mse, cos_sim=a_cos,
                 ),
                 time_s=total_time,
             )
         )
-
-        # Verify affine reproduction
-        repro = (
-            gen(
-                torch.tensor([aff_seed], device=device, dtype=torch.int64),
-                n_params,
-            ).squeeze(0)
-            * aff_scale
-            + aff_shift
-        )
-        max_diff = (repro - aff_vec).abs().max().item()
-        if max_diff > 1e-5:
-            print(f"  WARNING: affine reproduction mismatch  max|diff| = {max_diff}")
 
     print(sep)
     return results
@@ -577,11 +590,12 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
 
     # Quick determinism sanity check
-    gen = SeededVectorGenerator()
     seeds = torch.tensor([0, 1, 42, 12345], dtype=torch.int64)
-    m1 = gen(seeds, 16)
-    m2 = gen(seeds, 16)
-    print(f"Determinism check: max|diff| = {(m1 - m2).abs().max().item()}")
+    gen_u = SeededVectorGenerator(normal=False)
+    gen_n = SeededVectorGenerator(normal=True)
+    diff_u = (gen_u(seeds, 16) - gen_u(seeds, 16)).abs().max().item()
+    diff_n = (gen_n(seeds, 16) - gen_n(seeds, 16)).abs().max().item()
+    print(f"Determinism check: uniform max|diff|={diff_u}, normal max|diff|={diff_n}")
 
     do_bench = not args.evaluate_only
     do_eval = not args.benchmark_only
