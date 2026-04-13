@@ -94,30 +94,15 @@ class MultiStreamComponents:
 # ---------------------------------------------------------------------------
 
 
-def build_multi_stream_components(
+def build_structural_stream(
     tok: EfficientByteTokenizer,
-    vocab_size: int,
-    context_dim: int = 64,
-    n_max: int = 32,
-    logit_softcap: float = 30.0,
-    structured_output_logits: bool = True,
-) -> MultiStreamComponents:
-    """Build the default multi-stream setup with all byte-stream components.
+) -> CompositeStream:
+    """Build the structural stream: deterministic byte-level features (~159 dims).
 
-    Creates four streams:
-    - **LOGIT** (writable, dim=vocab_size): starts as zeros (uniform prior).
-    - **TOKENS** (read-only, dim=vocab_size): one-hot of input_ids.
-    - **CONTEXT** (writable, dim=context_dim): zero-initialized scratch.
-    - **STRUCTURAL** (read-only, dim~158): precomputed byte-level features.
-
-    Also configures number-position compression via ``NumberExtractor``.
-
-    Returns:
-        A :class:`MultiStreamComponents` dataclass with builder, hierarchy,
-        and UTF-8 prior ready to be passed to :class:`MultiStreamGPT`.
+    Returns a :class:`CompositeStream` wrapping all structural components.
+    Call ``.calibrate(tokens)`` before training to standardise feature statistics.
     """
-    # -- STRUCTURAL stream components (~158 dims total) --
-    structural_components: list[nn.Module] = [
+    components: list[nn.Module] = [
         DocBoundaryComponent(bos_id=tok.bos_id, num_freqs=2),  # 4
         SinCosPositionComponent(num_freqs=10),  # 20
         ByteCategoryComponent(tok=tok),  # 2
@@ -158,6 +143,33 @@ def build_multi_stream_components(
             para_id_freqs=2,
         ),  # 28
     ]
+    return CompositeStream(components)
+
+
+def build_multi_stream_components(
+    tok: EfficientByteTokenizer,
+    vocab_size: int,
+    context_dim: int = 64,
+    n_max: int = 32,
+    logit_softcap: float = 30.0,
+    structured_output_logits: bool = True,
+) -> MultiStreamComponents:
+    """Build the default multi-stream setup with all byte-stream components.
+
+    Creates four streams:
+    - **LOGIT** (writable, dim=vocab_size): starts as zeros (uniform prior).
+    - **TOKENS** (read-only, dim=vocab_size): one-hot of input_ids.
+    - **CONTEXT** (writable, dim=context_dim): zero-initialized scratch.
+    - **STRUCTURAL** (read-only, dim~158): precomputed byte-level features.
+
+    Also configures number-position compression via ``NumberExtractor``.
+
+    Returns:
+        A :class:`MultiStreamComponents` dataclass with builder, hierarchy,
+        and UTF-8 prior ready to be passed to :class:`MultiStreamGPT`.
+    """
+    structural_composite = build_structural_stream(tok)
+    structural_components = list(structural_composite.components)
 
     # -- Stream definitions --
     logit_id = StreamID(StreamType.LOGIT)

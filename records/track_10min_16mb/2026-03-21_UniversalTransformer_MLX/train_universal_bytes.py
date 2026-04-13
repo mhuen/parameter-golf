@@ -77,6 +77,8 @@ from byte_modules import (  # noqa: E402
     StructuredOutputHead,
     NUM_BYTE_CATEGORIES,
 )
+from multi_stream_gpt import build_structural_stream, load_calibration_tokens  # noqa: E402
+from multi_streams import CompositeStream  # noqa: E402
 
 
 # -----------------------------
@@ -209,6 +211,10 @@ class Hyperparameters:
     muon_optimize_conv = bool(
         int(os.environ.get("MUON_OPTIMIZE_CONV", "0"))
     )  # non-depthwise only
+
+    # Structural stream: concatenate deterministic byte features with embedding
+    structural_stream = bool(int(os.environ.get("STRUCTURAL_STREAM", "0")))
+    structural_calibration_seqs = int(os.environ.get("STRUCTURAL_CALIBRATION_SEQS", 500))
 
     # Byte tokenizer config
     discard_unused_bytes = bool(int(os.environ.get("DISCARD_UNUSED_BYTES", "1")))
@@ -1206,6 +1212,7 @@ class GPT(nn.Module):
         linear_mode_attn="",
         linear_mode_mlp="",
         linear_kwargs=None,
+        structural_stream=None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1219,7 +1226,11 @@ class GPT(nn.Module):
         self.dist_bias_mode = dist_bias_mode
         self.sem_rope_configs = sem_rope_configs or []
         self.sem_rope_types = sem_rope_types or []  # "word", "sent", "para"
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.structural_stream = structural_stream
+        embed_dim = model_dim
+        if structural_stream is not None:
+            embed_dim = model_dim - structural_stream.dim
+        self.tok_emb = nn.Embedding(vocab_size, embed_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1528,6 +1539,9 @@ class GPT(nn.Module):
 
     def forward(self, input_ids, target_ids, doc_mask=None):
         x = self.tok_emb(input_ids)
+        if self.structural_stream is not None:
+            struct = self.structural_stream(input_ids, x.dtype)
+            x = torch.cat([x, struct], dim=-1)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips = []
@@ -1822,12 +1836,45 @@ def main():
             f"scale_init={args.ngram_scale_init}"
         )
 
+    # Build structural stream (if enabled)
+    structural_stream_mod = None
+    if args.structural_stream:
+        if args.tie_embeddings:
+            args.tie_embeddings = False
+            log0("structural_stream: forcing tie_embeddings=False")
+        structural_stream_mod = build_structural_stream(tok)
+        s_dim = structural_stream_mod.dim
+        e_dim = args.model_dim - s_dim
+        if e_dim <= 0:
+            raise ValueError(
+                f"model_dim ({args.model_dim}) must be > structural_dim ({s_dim}). "
+                f"Increase MODEL_DIM to at least {s_dim + 1}."
+            )
+        if e_dim < 64:
+            log0(
+                f"WARNING: embed_dim={e_dim} is small (< 64). "
+                f"Consider increasing MODEL_DIM."
+            )
+        log0(
+            f"structural_stream: dim={s_dim} embed_dim={e_dim} "
+            f"components={len(structural_stream_mod.components)}"
+        )
+        cal_tokens = load_calibration_tokens(
+            train_pattern=args.train_files,
+            tok=tok,
+            seq_len=args.train_seq_len,
+            n_sequences=args.structural_calibration_seqs,
+        )
+        structural_stream_mod.calibrate(cal_tokens)
+        log0("structural_stream: calibration done")
+
     _needs_tok = (
         args.structured_output_logits
         or args.utf8_prior
         or args.catmask_mode != "off"
         or args.struct_bias_mode != "off"
         or bool(sem_rope_configs)
+        or args.structural_stream
     )
     base_model = (
         GPT(
@@ -1874,6 +1921,7 @@ def main():
                 "kronecker_terms": args.kronecker_terms,
                 "monarch_nblocks": args.monarch_nblocks,
             },
+            structural_stream=structural_stream_mod,
         )
         .to(device)
         .bfloat16()
