@@ -40,6 +40,7 @@ _MIX2: int = -7723592293110705685
 # Part 1: Seeded Vector Generator
 # ---------------------------------------------------------------------------
 
+
 class SeededVectorGenerator(nn.Module):
     """Deterministic random vector generation from integer seeds.
 
@@ -80,6 +81,7 @@ class SeededVectorGenerator(nn.Module):
 # Part 2: Benchmark
 # ---------------------------------------------------------------------------
 
+
 def _estimate_peak_bytes(batch: int, n_elements: int) -> int:
     """Conservative peak-memory estimate for one generation call.
 
@@ -95,12 +97,12 @@ def benchmark_generation(device: torch.device) -> None:
 
     configs = [
         # (batch, n_elements, label)
-        (1_000,     256, "1K x 256"),
-        (10_000,    256, "10K x 256"),
-        (100_000,   256, "100K x 256"),
+        (1_000, 256, "1K x 256"),
+        (10_000, 256, "10K x 256"),
+        (100_000, 256, "100K x 256"),
         (1_000_000, 256, "1M x 256"),
-        (10_000,   1024, "10K x 1024"),
-        (100_000,  1024, "100K x 1024"),
+        (10_000, 1024, "10K x 1024"),
+        (100_000, 1024, "100K x 1024"),
         (1_000, 262_144, "1K x 262144"),
         (5_000, 262_144, "5K x 262144"),
     ]
@@ -171,8 +173,10 @@ def benchmark_generation(device: torch.device) -> None:
 # Part 3: Seed search
 # ---------------------------------------------------------------------------
 
-def _auto_chunk_size(n_elements: int, device: torch.device,
-                     fraction: float = 0.5) -> int:
+
+def _auto_chunk_size(
+    n_elements: int, device: torch.device, fraction: float = 0.5
+) -> int:
     """Pick the largest batch that fits in *fraction* of free GPU memory."""
     if device.type == "cuda":
         free = torch.cuda.mem_get_info(device)[0]
@@ -218,13 +222,14 @@ def find_best_seed(
 
     if verbose:
         print(
-            f"  Searching {n_seeds:,} seeds in chunks of {chunk_size:,} "
-            f"({n:,} params)"
+            f"  Searching {n_seeds:,} seeds in chunks of {chunk_size:,} ({n:,} params)"
         )
 
     # Compile a fresh module for this element count
     gen_c = torch.compile(
-        SeededVectorGenerator().to(device), fullgraph=True, dynamic=False,
+        SeededVectorGenerator().to(device),
+        fullgraph=True,
+        dynamic=False,
     )
     # Warmup compilation
     _ws = torch.zeros(min(chunk_size, 8), device=device, dtype=torch.int64)
@@ -241,13 +246,15 @@ def find_best_seed(
         end = min(start + chunk_size, n_seeds)
 
         seeds = torch.arange(
-            seed_offset + start, seed_offset + end,
-            device=device, dtype=torch.int64,
+            seed_offset + start,
+            seed_offset + end,
+            device=device,
+            dtype=torch.int64,
         )
 
-        candidates = gen_c(seeds, n)                        # [chunk, n]
-        diff = candidates - target_flat                      # [chunk, n]
-        mse_vals = (diff * diff).mean(dim=1)                 # [chunk]
+        candidates = gen_c(seeds, n)  # [chunk, n]
+        diff = candidates - target_flat  # [chunk, n]
+        mse_vals = (diff * diff).mean(dim=1)  # [chunk]
 
         chunk_best_idx = mse_vals.argmin()
         chunk_best_mse = mse_vals[chunk_best_idx].item()
@@ -259,8 +266,7 @@ def find_best_seed(
         seeds_done += end - start
 
         if verbose and (
-            seeds_done % max(chunk_size * 10, 1) < (end - start)
-            or end == n_seeds
+            seeds_done % max(chunk_size * 10, 1) < (end - start) or end == n_seeds
         ):
             elapsed = time.perf_counter() - t_start
             rate = seeds_done / max(elapsed, 1e-9)
@@ -333,7 +339,9 @@ def find_best_seed_affine(
 
     # Compile a fresh module for this element count
     gen_c = torch.compile(
-        SeededVectorGenerator().to(device), fullgraph=True, dynamic=False,
+        SeededVectorGenerator().to(device),
+        fullgraph=True,
+        dynamic=False,
     )
     _ws = torch.zeros(min(chunk_size, 8), device=device, dtype=torch.int64)
     gen_c(_ws, n)
@@ -349,22 +357,24 @@ def find_best_seed_affine(
         end = min(start + chunk_size, n_seeds)
 
         seeds = torch.arange(
-            seed_offset + start, seed_offset + end,
-            device=device, dtype=torch.int64,
+            seed_offset + start,
+            seed_offset + end,
+            device=device,
+            dtype=torch.int64,
         )
 
-        g = gen_c(seeds, n)                                     # [chunk, n]
+        g = gen_c(seeds, n)  # [chunk, n]
 
         # Sufficient statistics — three reductions, no extra [chunk, n] alloc
-        g_mean = g.mean(dim=1)                                   # [chunk]
-        gt_mean = (g * target_flat).mean(dim=1)                  # [chunk]
-        g_sq_mean = (g * g).mean(dim=1)                          # [chunk]
+        g_mean = g.mean(dim=1)  # [chunk]
+        gt_mean = (g * target_flat).mean(dim=1)  # [chunk]
+        g_sq_mean = (g * g).mean(dim=1)  # [chunk]
 
-        cov = gt_mean - g_mean * t_mean                          # [chunk]
-        var_g = (g_sq_mean - g_mean * g_mean).clamp(min=1e-20)   # [chunk]
+        cov = gt_mean - g_mean * t_mean  # [chunk]
+        var_g = (g_sq_mean - g_mean * g_mean).clamp(min=1e-20)  # [chunk]
 
         # Optimal residual MSE (closed-form, no fitted tensor needed)
-        mse_vals = (var_t - cov * cov / var_g).clamp(min=0)      # [chunk]
+        mse_vals = (var_t - cov * cov / var_g).clamp(min=0)  # [chunk]
 
         chunk_best_idx = mse_vals.argmin()
         chunk_best_mse = mse_vals[chunk_best_idx].item()
@@ -376,8 +386,7 @@ def find_best_seed_affine(
         seeds_done += end - start
 
         if verbose and (
-            seeds_done % max(chunk_size * 10, 1) < (end - start)
-            or end == n_seeds
+            seeds_done % max(chunk_size * 10, 1) < (end - start) or end == n_seeds
         ):
             elapsed = time.perf_counter() - t_start
             rate = seeds_done / max(elapsed, 1e-9)
@@ -407,7 +416,8 @@ def find_best_seed_affine(
 # Part 4: Evaluation across parameter counts
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144]
+# _DEFAULT_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144]
+_DEFAULT_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 
 def _metrics(target: torch.Tensor, approx: torch.Tensor) -> tuple[float, float]:
@@ -456,16 +466,17 @@ def evaluate_compression(
 
     for n_params in sizes:
         # Scale search budget down for bigger vectors (memory + time)
-        scaled_seeds = min(
-            n_seeds, max(100_000, n_seeds // max(1, n_params // 64))
-        )
+        scaled_seeds = min(n_seeds, max(100_000, n_seeds // max(1, n_params // 64)))
 
         target = torch.randn(n_params, device=device)
 
         # --- Raw search (1 param: seed) ---
         t0 = time.perf_counter()
         raw_seed, raw_mse, raw_vec = find_best_seed(
-            target, gen, scaled_seeds, verbose=False,
+            target,
+            gen,
+            scaled_seeds,
+            verbose=False,
         )
         raw_time = time.perf_counter() - t0
         raw_rl2, raw_cos = _metrics(target, raw_vec)
@@ -473,7 +484,10 @@ def evaluate_compression(
         # --- Affine search (3 params: seed + scale + shift) ---
         t0 = time.perf_counter()
         aff_seed, aff_scale, aff_shift, aff_mse, aff_vec = find_best_seed_affine(
-            target, gen, scaled_seeds, verbose=False,
+            target,
+            gen,
+            scaled_seeds,
+            verbose=False,
         )
         aff_time = time.perf_counter() - t0
         aff_rl2, aff_cos = _metrics(target, aff_vec)
@@ -486,21 +500,32 @@ def evaluate_compression(
             f"{aff_mse:>10.6f} {aff_rl2:>10.6f} {aff_cos:>8.4f} {total_time:>7.1f}s"
         )
 
-        results.append(dict(
-            n_params=n_params,
-            n_seeds_searched=scaled_seeds,
-            raw=dict(seed=raw_seed, mse=raw_mse, rel_l2=raw_rl2, cos_sim=raw_cos),
-            affine=dict(
-                seed=aff_seed, scale=aff_scale, shift=aff_shift,
-                mse=aff_mse, rel_l2=aff_rl2, cos_sim=aff_cos,
-            ),
-            time_s=total_time,
-        ))
+        results.append(
+            dict(
+                n_params=n_params,
+                n_seeds_searched=scaled_seeds,
+                raw=dict(seed=raw_seed, mse=raw_mse, rel_l2=raw_rl2, cos_sim=raw_cos),
+                affine=dict(
+                    seed=aff_seed,
+                    scale=aff_scale,
+                    shift=aff_shift,
+                    mse=aff_mse,
+                    rel_l2=aff_rl2,
+                    cos_sim=aff_cos,
+                ),
+                time_s=total_time,
+            )
+        )
 
         # Verify affine reproduction
-        repro = gen(
-            torch.tensor([aff_seed], device=device, dtype=torch.int64), n_params,
-        ).squeeze(0) * aff_scale + aff_shift
+        repro = (
+            gen(
+                torch.tensor([aff_seed], device=device, dtype=torch.int64),
+                n_params,
+            ).squeeze(0)
+            * aff_scale
+            + aff_shift
+        )
         max_diff = (repro - aff_vec).abs().max().item()
         if max_diff > 1e-5:
             print(f"  WARNING: affine reproduction mismatch  max|diff| = {max_diff}")
@@ -513,22 +538,30 @@ def evaluate_compression(
 # Part 5: Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Seeded random-vector generation & compression experiment",
     )
     ap.add_argument(
-        "--device", type=str, default=None,
+        "--device",
+        type=str,
+        default=None,
         help="Device (default: cuda if available, else cpu)",
     )
     ap.add_argument("--benchmark-only", action="store_true")
     ap.add_argument("--evaluate-only", action="store_true")
     ap.add_argument(
-        "--n-seeds", type=int, default=10_000_000,
+        "--n-seeds",
+        type=int,
+        default=10_000_000,
         help="Base seed budget for evaluation (default 10 M)",
     )
     ap.add_argument(
-        "--sizes", type=int, nargs="+", default=None,
+        "--sizes",
+        type=int,
+        nargs="+",
+        default=None,
         help="Parameter counts to evaluate (default: 1..262144)",
     )
     args = ap.parse_args()
