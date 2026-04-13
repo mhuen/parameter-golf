@@ -188,6 +188,7 @@ def build_multi_stream_components(
             structural_id,
             source=StreamSource.COMPONENTS,
             read_only=True,
+            norm_type=RMSNorm,
             components=structural_components,
         ),
     ]
